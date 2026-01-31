@@ -63,11 +63,11 @@ DeepSentry 内置了基于大语言模型（LLM）的决策大脑，能够理解
 1. **逻辑拆解**: 检查文件存在性 -> `grep` 筛选时间与失败字段 -> `awk/sort` 统计 Top 10 -> `curl` 调用 IP 库查询归属地。
 2. **执行结果 (自动生成)**:
 
-<!-- 这是一张图片，ocr 内容为： -->
-![](https://cdn.nlark.com/yuque/0/2026/png/12839102/1769764344214-2b656e83-ef15-4c81-b455-5835309d90d4.png)
 
-<!-- 这是一张图片，ocr 内容为： -->
-![](https://cdn.nlark.com/yuque/0/2026/png/12839102/1769764357369-1e0e6491-1ac3-48c5-8a85-c3a0b7d1cbc5.png)
+<img  alt="image" src="https://github.com/user-attachments/assets/af8f4070-85af-4d19-90b7-081b447fd386" />
+
+<img  alt="image" src="https://github.com/user-attachments/assets/7040dc4a-5050-4d2f-a8e8-438232a0fe48" />
+
 
 
 
