@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🛡️ DeepSentry
+# 🛡️ DeepSentry - 深海哨兵
 
 <h3>"让 AI 成为你的红蓝对抗伙伴与运维专家。"</h3>
 
@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/AI-DeepSeek%20V3-blueviolet?style=flat-square" alt="AI">
 </p>
 
-[功能特性](#features) • [实战案例](#cases) • [快速开始](#quick-start) • [架构解析](#structure)
+[功能特性](#features) • [实战案例](#cases) • [快速开始](#quick-start) • [架构解析](#structure) • [安全说明](#safe)
 
 </div>
 
@@ -27,7 +27,7 @@
 ---
 
 ## 📖 项目简介
-**DeepSentry** 是由 **Hx0 Team** 研发的一款智能化安全排查与运维 Agent。
+**DeepSentry** 是由 **Hx0 战队** 研发的一款智能化安全排查与运维 Agent。
 
 它不仅仅是一个自动化脚本，更是一个**具备逻辑推理能力的“数字队友”**。
 
@@ -49,7 +49,7 @@ DeepSentry 内置了基于大语言模型（LLM）的决策大脑，能够理解
 
 ---
 
-## <span id="cases">⚡️ 实战案例 (Real-world Scenarios)</span>
+## <span id="cases">⚡️ 实战案例</span>
 以下案例均来自 **DeepSentry 真实运行日志**，展示了 AI 如何处理复杂的安全需求。
 
 ### 场景一：日志取证与威胁情报关联
@@ -94,7 +94,7 @@ DeepSentry 内置了基于大语言模型（LLM）的决策大脑，能够理解
 > **💡 价值**: **一句话替代繁琐的基线核查脚本**。AI 不仅能机械地列出信息，还能根据安全常识自动判断“风险等级”，并关联账户与网络状态，直接给出运维视角的整改建议。
 >
 
-### 场景三：CTF 辅助与跨平台协同 (Bridge & Solve)
+### 场景三：CTF 辅助与跨平台协同
 **需求**：将本地文件上传至靶机并自动解题。
 
 > **User**: "帮我把本机的flag.txt上传到服务器的/tmp目录下并进行解出这道题目"
@@ -114,7 +114,7 @@ DeepSentry 内置了基于大语言模型（LLM）的决策大脑，能够理解
 
 
 
-### 场景四：Webshell 隐蔽后门狩猎 (Web Hunt)
+### 场景四：Webshell 隐蔽后门狩猎 
 **需求**：在 Web 目录中寻找可能被攻击者植入的混淆后门，并进行自动化处置。
 
 **User**: "在 /var/www/html 目录帮我分析里面有没有可疑的webshell文件。"
@@ -148,7 +148,7 @@ DeepSentry 内置了基于大语言模型（LLM）的决策大脑，能够理解
 
 ---
 
-## <span id="quick-start">🚀 快速开始 (Quick Start)</span>
+## <span id="quick-start">🚀 快速开始</span>
 ### 1. 下载与安装
 确保您的机器已安装 [Go 1.20+](https://golang.org/dl/) 环境。
 
@@ -171,7 +171,7 @@ go build -o deepsentry cmd/main.go
 # go build -o deepsentry.exe cmd/main.go
 ```
 
-### 2. 初始化配置 (Wizard Mode)
+### 2. 初始化配置 
 首次运行，DeepSentry 会启动交互式向导，引导您配置 API 和连接信息：
 
 ```bash
@@ -243,7 +243,7 @@ DeepSentry/
 
 ---
 
-## ⚠️ 安全说明
+## <span id="safe">⚠️ 安全说明</span>
 1. **风险控制**: 默认开启风险拦截。高危操作（如删除文件、停止服务）需要您输入 `y` 确认。
 2. **自我保护**: AI 被禁止删除自身的配置文件及报告目录。
 3. **敏感数据**: 您的 API Key 仅保存在本地 `config.yaml` 中，不会上传至任何第三方服务器。
