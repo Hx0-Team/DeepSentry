@@ -54,7 +54,7 @@ func PortListen(rt Runtime) (string, error) {
 // RouteTable 路由表（/proc/net/route）
 func RouteTable(rt Runtime) (string, error) {
 	if rt.IsWindows {
-		return "", fmt.Errorf("Windows 路由表暂未 Go 原生实现，请使用 execute route print")
+		return "", fmt.Errorf("当前 Windows 路由表暂未 Go 原生实现，请使用 execute route print")
 	}
 	data, err := readTarget("/proc/net/route")
 	if err != nil {
@@ -77,7 +77,7 @@ func RouteTable(rt Runtime) (string, error) {
 // ARPTable ARP 缓存（/proc/net/arp）
 func ARPTable(rt Runtime) (string, error) {
 	if rt.IsWindows {
-		return "", fmt.Errorf("Windows ARP 暂未 Go 原生实现")
+		return "", fmt.Errorf("当前 Windows ARP 暂未 Go 原生实现")
 	}
 	data, err := readTarget("/proc/net/arp")
 	if err != nil {
@@ -99,7 +99,7 @@ func ARPTable(rt Runtime) (string, error) {
 // MemInfo 内存信息（/proc/meminfo）
 func MemInfo(rt Runtime) (string, error) {
 	if rt.IsWindows {
-		return "", fmt.Errorf("Windows 请使用 execute wmic OS get FreePhysicalMemory")
+		return "", fmt.Errorf("当前 Windows 请使用 execute wmic OS get FreePhysicalMemory")
 	}
 	data, err := readTarget("/proc/meminfo")
 	if err != nil {

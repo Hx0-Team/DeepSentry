@@ -60,6 +60,12 @@ func RunFleet(targets []config.TargetConfig, selector, command string, concurren
 }
 
 func RunFleetWithProgress(targets []config.TargetConfig, selector, command string, concurrency int, onProgress func(FleetProgress)) []FleetResult {
+	return RunFleetWithProgressAndStop(targets, selector, command, concurrency, onProgress, nil)
+}
+
+// RunFleetWithProgressAndStop propagates an interactive stop request both to
+// queued targets and to executors that are already running.
+func RunFleetWithProgressAndStop(targets []config.TargetConfig, selector, command string, concurrency int, onProgress func(FleetProgress), stop <-chan struct{}) []FleetResult {
 	selected := MatchTargets(targets, selector)
 	if concurrency <= 0 {
 		concurrency = 5
@@ -71,13 +77,35 @@ func RunFleetWithProgress(targets []config.TargetConfig, selector, command strin
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, concurrency)
+	recordCanceled := func(target config.TargetConfig) {
+		res := FleetResult{Target: target, Error: "已按用户请求取消"}
+		if onProgress != nil {
+			onProgress(FleetProgress{Target: target, Status: "canceled", Error: res.Error})
+		}
+		mu.Lock()
+		results = append(results, res)
+		mu.Unlock()
+	}
 	for _, target := range selected {
 		target := target
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
+			if isStopped(stop) {
+				recordCanceled(target)
+				return
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-stop:
+				recordCanceled(target)
+				return
+			}
 			defer func() { <-sem }()
+			if isStopped(stop) {
+				recordCanceled(target)
+				return
+			}
 			start := time.Now()
 			if onProgress != nil {
 				onProgress(FleetProgress{Target: target, Status: "running"})
@@ -87,7 +115,7 @@ func RunFleetWithProgress(targets []config.TargetConfig, selector, command strin
 			if strings.EqualFold(target.Protocol, "ftp") {
 				err = fmt.Errorf("FTP 目标不支持 shell 命令，请使用 fleet_file")
 			} else {
-				out, err = RunOnTarget(target, command)
+				out, err = RunOnTargetWithStop(target, command, stop)
 			}
 			res := FleetResult{Target: target, Success: err == nil, Output: out, Duration: time.Since(start)}
 			if err != nil {
@@ -97,6 +125,9 @@ func RunFleetWithProgress(targets []config.TargetConfig, selector, command strin
 				status := "ok"
 				if err != nil {
 					status = "error"
+					if isStopped(stop) {
+						status = "canceled"
+					}
 				}
 				onProgress(FleetProgress{Target: target, Status: status, Output: out, Error: res.Error})
 			}
@@ -111,12 +142,53 @@ func RunFleetWithProgress(targets []config.TargetConfig, selector, command strin
 }
 
 func RunOnTarget(target config.TargetConfig, command string) (string, error) {
+	return RunOnTargetWithStop(target, command, nil)
+}
+
+func RunOnTargetWithStop(target config.TargetConfig, command string, stop <-chan struct{}) (string, error) {
 	exe, err := NewEphemeralExecutor(target)
 	if err != nil {
 		return "", err
 	}
 	defer exe.Close()
+	if stoppable, ok := exe.(StoppableStreamingExecutor); ok {
+		return stoppable.RunWithStreamingAndStop(command, nil, stop)
+	}
+	if stop != nil {
+		type runResult struct {
+			out string
+			err error
+		}
+		done := make(chan runResult, 1)
+		go func() {
+			out, runErr := exe.Run(command)
+			done <- runResult{out: out, err: runErr}
+		}()
+		select {
+		case result := <-done:
+			return result.out, result.err
+		case <-stop:
+			exe.Close()
+			result := <-done
+			if result.err != nil {
+				return result.out, fmt.Errorf("已按用户请求取消: %w", result.err)
+			}
+			return result.out, fmt.Errorf("已按用户请求取消")
+		}
+	}
 	return exe.Run(command)
+}
+
+func isStopped(stop <-chan struct{}) bool {
+	if stop == nil {
+		return false
+	}
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
 }
 
 func NewEphemeralExecutor(target config.TargetConfig) (Executor, error) {

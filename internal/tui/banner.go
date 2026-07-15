@@ -1,8 +1,9 @@
 package tui
 
 import (
+	"crypto/rand"
 	"fmt"
-	"math/rand/v2"
+	"math/big"
 	"strings"
 	"time"
 
@@ -61,8 +62,9 @@ var (
 const brandTagline = "深海哨兵 · AI 驱动的安全应急与智能运维 Agent"
 
 func renderWelcomeBanner(info StartupInfo, width int) string {
+	width = max(4, width)
 	if width < 80 {
-		width = 80
+		return renderCompactWelcomeBanner(info, width)
 	}
 	innerW := width - 2
 	leftW := innerW * 40 / 100
@@ -76,6 +78,41 @@ func renderWelcomeBanner(info StartupInfo, width int) string {
 	return renderChromeBox(rows, width, styleBannerBorder)
 }
 
+func renderCompactWelcomeBanner(info StartupInfo, width int) string {
+	innerW := max(1, width-2)
+	rows := []string{
+		centerStyledLine(brandTitleLine(info.Version), innerW),
+	}
+	for _, line := range wrapPlain(brandTagline, innerW) {
+		rows = append(rows, centerStyledLine(styleBannerTagline.Render(line), innerW))
+	}
+	rows = append(rows,
+		compactBannerSection("模型", firstNonEmpty(info.ModelInfo, "-"), innerW),
+		compactBannerSection("连接", firstNonEmpty(info.ConnInfo, "本地模式"), innerW),
+		compactBannerSection("小技巧", firstNonEmpty(info.Tip, "Tab 聚焦输入框"), innerW),
+		compactBannerSection("就绪", compactReadyText(info), innerW),
+	)
+	return renderChromeBox(rows, width, styleBannerBorder)
+}
+
+func compactReadyText(info StartupInfo) string {
+	if info.SessionID != "" {
+		return "已恢复 checkpoint · 可继续追问"
+	}
+	if info.AwaitGoal {
+		return "描述任务后 Enter 开始"
+	}
+	return "Enter 发送 · /help 查看命令"
+}
+
+func compactBannerSection(title, value string, width int) string {
+	title = sanitizeTUIText(title)
+	value = sanitizeTUIText(value)
+	prefix := styleBannerHeading.Render(title) + styleBannerLabel.Render(" · ")
+	valueW := max(1, width-lipgloss.Width(prefix))
+	return fitStyledLine(prefix+styleBannerText.Render(truncateStr(value, valueW)), width)
+}
+
 func buildBannerLeft(info StartupInfo, colW int) []string {
 	var lines []string
 	for _, line := range robotLogoLines() {
@@ -85,7 +122,7 @@ func buildBannerLeft(info StartupInfo, colW int) []string {
 	for _, line := range wrapPlain(brandTagline, colW) {
 		lines = append(lines, centerStyledLine(styleBannerTagline.Render(line), colW))
 	}
-	meta := fmt.Sprintf("Build · %s · Hx0 Team", firstNonEmpty(info.BuildTime, "dev"))
+	meta := fmt.Sprintf("Build · %s · Hx0 Team", sanitizeTUIText(firstNonEmpty(info.BuildTime, "dev")))
 	lines = append(lines, centerStyledLine(styleBannerLabel.Render(meta), colW))
 	return lines
 }
@@ -113,7 +150,7 @@ func robotLogoLines() []string {
 
 func brandTitleLine(version string) string {
 	title := styleBannerBrand.Render("DeepSentry")
-	badge := styleBannerBadge.Render(firstNonEmpty(version, "2.0"))
+	badge := styleBannerBadge.Render(sanitizeTUIText(firstNonEmpty(version, "2.0.1")))
 	return title + " " + badge
 }
 
@@ -195,8 +232,8 @@ func buildBannerRight(info StartupInfo, width int, tip string) []string {
 		ready = "描述安全任务后 Enter 开始"
 	}
 
-	lines := []string{
-		bannerSection("小技巧", tip, width),
+	lines := bannerTipLines(tip, width)
+	lines = append(lines,
 		bannerSection("环境", runtime, width),
 		bannerSection("主机", firstNonEmpty(info.Hostname, "-"), width),
 		bannerSection("连接", conn, width),
@@ -207,13 +244,36 @@ func buildBannerRight(info StartupInfo, width int, tip string) []string {
 		bannerSection("目录", truncatePath(info.WorkDir, width), width),
 		bannerSection("报告", truncatePath(info.ReportPath, width), width),
 		bannerSection("就绪", ready, width),
-		bannerSection("按键", "Tab输入 · /help · e展开 · Y/N确认 · q退出", width),
-	}
+		bannerSection("按键", "Tab输入 · /help · e全展/全折 · Y/N确认 · q空闲退出", width),
+	)
 	if sid := truncateStr(info.SessionID, 24); sid != "" {
 		lines = append(lines, bannerSection("会话", sid, width))
 	}
 	if note := firstNotice(info.Notices); note != "" {
 		lines = append(lines, bannerSection("提示", note, width))
+	}
+	return lines
+}
+
+// bannerTipLines 给更长的新功能提示预留两行，避免启动页只显示前半句。
+// 第二行与值列对齐，保持“小技巧 ·”标签和右侧信息列的视觉节奏。
+func bannerTipLines(value string, width int) []string {
+	value = sanitizeTUIText(value)
+	label := styleBannerHeading.Render("小技巧")
+	sep := styleBannerLabel.Render(" · ")
+	prefixW := lipgloss.Width(label) + lipgloss.Width(sep)
+	valueW := max(1, width-prefixW)
+	wrapped := wrapPlain(value, valueW)
+	if len(wrapped) == 0 {
+		wrapped = []string{""}
+	}
+	if len(wrapped) > 2 {
+		wrapped[1] = truncateStr(strings.Join(wrapped[1:], ""), valueW)
+		wrapped = wrapped[:2]
+	}
+	lines := []string{label + sep + styleBannerText.Render(wrapped[0])}
+	if len(wrapped) == 2 {
+		lines = append(lines, strings.Repeat(" ", prefixW)+styleBannerText.Render(wrapped[1]))
 	}
 	return lines
 }
@@ -229,12 +289,12 @@ func firstNotice(notices []string) string {
 }
 
 func bannerSection(title, value string, width int) string {
+	title = sanitizeTUIText(title)
+	value = sanitizeTUIText(value)
 	label := styleBannerHeading.Render(title)
 	sep := styleBannerLabel.Render(" · ")
 	valW := width - lipgloss.Width(label) - lipgloss.Width(sep)
-	if valW < 8 {
-		valW = 8
-	}
+	valW = max(1, valW)
 	return label + sep + styleBannerText.Render(truncateStr(value, valW))
 }
 
@@ -298,7 +358,11 @@ func randomUsageTip() string {
 	if len(bannerTips) == 0 {
 		return "Tab 聚焦输入框开始任务"
 	}
-	return bannerTips[rand.IntN(len(bannerTips))]
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(len(bannerTips))))
+	if err != nil {
+		return bannerTips[0]
+	}
+	return bannerTips[n.Int64()]
 }
 
 func shortenModeLine(line string) string {

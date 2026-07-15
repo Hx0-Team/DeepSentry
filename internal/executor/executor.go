@@ -5,8 +5,11 @@ import (
 	"ai-edr/internal/ui"
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,9 +19,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 )
@@ -46,7 +51,7 @@ func (c *outputCollector) appendLine(line string) {
 	if c.buf.Len()+len(line) > c.maxBytes {
 		c.truncated = true
 		if remain := c.maxBytes - c.buf.Len(); remain > 0 {
-			c.buf.WriteString(line[:remain])
+			c.buf.WriteString(safeUTF8BytePrefix(line, remain))
 		}
 		return
 	}
@@ -68,7 +73,21 @@ func truncateOutput(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
 		return s
 	}
-	return strings.TrimSpace(s[:maxBytes]) + fmt.Sprintf(truncationNoticeFmt, maxBytes)
+	return strings.TrimSpace(safeUTF8BytePrefix(s, maxBytes)) + fmt.Sprintf(truncationNoticeFmt, maxBytes)
+}
+
+func safeUTF8BytePrefix(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	end := maxBytes
+	for end > 0 && !utf8.ValidString(s[:end]) {
+		end--
+	}
+	return s[:end]
 }
 
 func effectiveMaxOutputBytes() int {
@@ -86,6 +105,10 @@ type Executor interface {
 
 type StreamingExecutor interface {
 	RunWithStreaming(cmd string, onLine func(string)) (string, error)
+}
+
+type StoppableStreamingExecutor interface {
+	RunWithStreamingAndStop(cmd string, onLine func(string), stop <-chan struct{}) (string, error)
 }
 
 type ModeReporter interface {
@@ -154,24 +177,24 @@ func Init(cfg config.Config) error {
 			return err
 		}
 		Current = e
-		emitModeSwitch("\r🔌 [模式切换] 已连接至远程主机 (SSH): %s@%s\n", cfg.SSHUser, cfg.SSHHost)
+		emitModeSwitch("🔌 [模式切换] 已连接至远程主机 (SSH): %s@%s\n", cfg.SSHUser, cfg.SSHHost)
 	case "telnet":
 		e, err := newTelnetExecutor(cfg)
 		if err != nil {
 			return err
 		}
 		Current = e
-		emitModeSwitch("\r🔌 [模式切换] 已连接至远程主机 (Telnet): %s@%s\n", cfg.TelnetUser, cfg.TelnetHost)
+		emitModeSwitch("🔌 [模式切换] 已连接至远程主机 (Telnet): %s@%s\n", cfg.TelnetUser, cfg.TelnetHost)
 	case "ftp":
 		e, err := newFTPExecutor(cfg)
 		if err != nil {
 			return err
 		}
 		Current = e
-		emitModeSwitch("\r🔌 [模式切换] 已连接至远程主机 (FTP): %s@%s\n", cfg.FTPUser, cfg.FTPHost)
+		emitModeSwitch("🔌 [模式切换] 已连接至远程主机 (FTP): %s@%s\n", cfg.FTPUser, cfg.FTPHost)
 	case "local":
 		Current = &LocalExecutor{}
-		emitModeSwitch("\r🔌 [模式切换] 本地执行模式\n")
+		emitModeSwitch("🔌 [模式切换] 本地执行模式\n")
 	default:
 		return fmt.Errorf("不支持的 target_protocol: %s", mode)
 	}
@@ -189,11 +212,18 @@ func (l *LocalExecutor) Run(cmdStr string) (string, error) {
 }
 
 func (l *LocalExecutor) RunWithStreaming(cmdStr string, onLine func(string)) (string, error) {
+	return l.RunWithStreamingAndStop(cmdStr, onLine, nil)
+}
+
+func (l *LocalExecutor) RunWithStreamingAndStop(cmdStr string, onLine func(string), stop <-chan struct{}) (string, error) {
 	// 1. 清洗 local_run 标记
 	if strings.Contains(cmdStr, "local_run ") {
 		cmdStr = strings.ReplaceAll(cmdStr, "local_run ", "")
 	}
 	cmdStr = strings.TrimSpace(cmdStr)
+	if CommandUsesSudo(cmdStr) {
+		cmdStr = ForceNonInteractiveSudo(cmdStr)
+	}
 
 	// 2. 拦截 download/upload
 	if strings.HasPrefix(cmdStr, "download ") || strings.HasPrefix(cmdStr, "upload ") {
@@ -209,7 +239,7 @@ func (l *LocalExecutor) RunWithStreaming(cmdStr string, onLine func(string)) (st
 		return guidance, nil
 	}
 
-	outputStr, err := runLocalShellCommand(cmdStr, onLine)
+	outputStr, err := runLocalShellCommandWithStop(cmdStr, onLine, stop)
 
 	if outputStr == "" && err == nil {
 		outputStr = "(执行成功，无输出)"
@@ -484,7 +514,22 @@ func expandLocalPath(path string) string {
 	return path
 }
 
-func runLocalShellCommand(cmdStr string, onLine func(string)) (string, error) {
+func runLocalShellCommandWithStop(cmdStr string, onLine func(string), stop <-chan struct{}) (string, error) {
+	ctx := context.Background()
+	cancel := func() {}
+	if stop != nil {
+		var cancelContext context.CancelFunc
+		ctx, cancelContext = context.WithCancel(ctx)
+		cancel = cancelContext
+		go func() {
+			select {
+			case <-stop:
+				cancelContext()
+			case <-ctx.Done():
+			}
+		}()
+	}
+	defer cancel()
 	var cmd *exec.Cmd
 
 	lowerCmd := strings.ToLower(cmdStr)
@@ -493,12 +538,19 @@ func runLocalShellCommand(cmdStr string, onLine func(string)) (string, error) {
 	if runtime.GOOS == "windows" {
 		if isPowerShell {
 			shell, script := parsePowerShellCommand(cmdStr)
-			cmd = exec.Command(shell, "-NoProfile", "-NonInteractive", "-Command", script)
+			cmd = exec.CommandContext(ctx, shell, "-NoProfile", "-NonInteractive", "-Command", script)
 		} else {
-			cmd = exec.Command("cmd", "/c", cmdStr)
+			cmd = exec.CommandContext(ctx, "cmd", "/c", cmdStr)
 		}
 	} else {
-		cmd = exec.Command("sh", "-c", cmdStr)
+		cmd = exec.CommandContext(ctx, "sh", "-c", cmdStr)
+	}
+	configureCommandProcessGroup(cmd)
+	if stop != nil {
+		cmd.Cancel = func() error {
+			killCommandProcessGroup(cmd)
+			return nil
+		}
 	}
 
 	stdout, err := cmd.StdoutPipe()
@@ -539,6 +591,9 @@ func runLocalShellCommand(cmdStr string, onLine func(string)) (string, error) {
 	}
 
 	err = cmd.Wait()
+	if ctx.Err() != nil {
+		return strings.TrimSpace(collector.result()), fmt.Errorf("命令已按用户请求中断")
+	}
 	return strings.TrimSpace(collector.result()), err
 }
 
@@ -651,7 +706,7 @@ func copyLocalFile(src, dst string) (string, error) {
 		return "", fmt.Errorf("创建目录失败: %v", err)
 	}
 
-	destFile, err := os.Create(dst)
+	destFile, err := createPrivateOutputFile(dst)
 	if err != nil {
 		return "", fmt.Errorf("创建目标文件失败: %v", err)
 	}
@@ -662,6 +717,18 @@ func copyLocalFile(src, dst string) (string, error) {
 		return "", fmt.Errorf("复制失败: %v", err)
 	}
 	return fmt.Sprintf("%s文件传输成功 (Bytes: %d): %s -> %s", ui.Prefix("✅", "[OK]"), n, src, dst), nil
+}
+
+func createPrivateOutputFile(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
 }
 
 // ==========================================
@@ -677,6 +744,8 @@ type SSHExecutor struct {
 	mu         sync.Mutex
 }
 
+var knownHostsMu sync.Mutex
+
 func normalizeSSHHost(host string) string {
 	host = strings.TrimSpace(host)
 	if host == "" {
@@ -686,6 +755,99 @@ func normalizeSSHHost(host string) string {
 		return host
 	}
 	return host + ":22"
+}
+
+func resolveKnownHostsPath(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = "~/.deepsentry/known_hosts"
+	}
+	if raw == "~" || strings.HasPrefix(raw, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("无法定位用户主目录: %w", err)
+		}
+		if raw == "~" {
+			raw = home
+		} else {
+			raw = filepath.Join(home, strings.TrimPrefix(raw, "~/"))
+		}
+	}
+	return filepath.Clean(raw), nil
+}
+
+func ensureKnownHostsFile(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func sshHostKeyCallback(cfg config.Config) (ssh.HostKeyCallback, error) {
+	policy := strings.ToLower(strings.TrimSpace(cfg.SSHHostKeyPolicy))
+	if policy == "" {
+		policy = "accept-new"
+	}
+	if policy == "insecure" {
+		return ssh.InsecureIgnoreHostKey(), nil
+	}
+	if policy != "strict" && policy != "accept-new" {
+		return nil, fmt.Errorf("ssh_host_key_policy 不支持 %q，请使用 strict|accept-new|insecure", policy)
+	}
+
+	path, err := resolveKnownHostsPath(cfg.SSHKnownHostsPath)
+	if err != nil {
+		return nil, err
+	}
+	if policy == "accept-new" {
+		if err := ensureKnownHostsFile(path); err != nil {
+			return nil, fmt.Errorf("创建 SSH known_hosts 失败: %w", err)
+		}
+	} else if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("SSH strict 模式需要已存在的 known_hosts %s: %w", path, err)
+	}
+
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		knownHostsMu.Lock()
+		defer knownHostsMu.Unlock()
+
+		check, err := knownhosts.New(path)
+		if err != nil {
+			return fmt.Errorf("读取 SSH known_hosts 失败: %w", err)
+		}
+		if err = check(hostname, remote, key); err == nil {
+			return nil
+		}
+		var keyErr *knownhosts.KeyError
+		if policy != "accept-new" || !errors.As(err, &keyErr) || len(keyErr.Want) > 0 {
+			return fmt.Errorf("SSH 主机密钥校验失败（%s）: %w", hostname, err)
+		}
+
+		line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key) + "\n"
+		f, openErr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if openErr != nil {
+			return fmt.Errorf("写入 SSH known_hosts 失败: %w", openErr)
+		}
+		_, writeErr := f.WriteString(line)
+		if syncErr := f.Sync(); writeErr == nil {
+			writeErr = syncErr
+		}
+		if closeErr := f.Close(); writeErr == nil {
+			writeErr = closeErr
+		}
+		if writeErr != nil {
+			return fmt.Errorf("写入 SSH known_hosts 失败: %w", writeErr)
+		}
+		return nil
+	}, nil
 }
 
 func newSSHExecutor(cfg config.Config) (*SSHExecutor, error) {
@@ -704,10 +866,14 @@ func newSSHExecutor(cfg config.Config) (*SSHExecutor, error) {
 		authMethods = append(authMethods, ssh.Password(cfg.SSHPassword))
 	}
 
+	hostKeyCallback, err := sshHostKeyCallback(cfg)
+	if err != nil {
+		return nil, err
+	}
 	sshConfig := &ssh.ClientConfig{
 		User:            cfg.SSHUser,
 		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeyCallback,
 		Timeout:         10 * time.Second,
 	}
 
@@ -726,7 +892,7 @@ func newSSHExecutor(cfg config.Config) (*SSHExecutor, error) {
 	if err != nil {
 		sftpClient.Close()
 		client.Close()
-		return nil, fmt.Errorf("Session 创建失败: %v", err)
+		return nil, fmt.Errorf("创建 Session 失败: %v", err)
 	}
 
 	stdin, err := session.StdinPipe()
@@ -759,22 +925,29 @@ func newSSHExecutor(cfg config.Config) (*SSHExecutor, error) {
 }
 
 func (s *SSHExecutor) Run(cmdStr string) (string, error) {
-	return s.run(cmdStr, true, nil)
+	return s.run(cmdStr, true, nil, nil)
 }
 
 func (s *SSHExecutor) RunWithStreaming(cmdStr string, onLine func(string)) (string, error) {
-	return s.run(cmdStr, true, onLine)
+	return s.run(cmdStr, true, onLine, nil)
 }
 
-func (s *SSHExecutor) run(cmdStr string, retryOnWriteFailure bool, onLine func(string)) (string, error) {
+func (s *SSHExecutor) RunWithStreamingAndStop(cmdStr string, onLine func(string), stop <-chan struct{}) (string, error) {
+	return s.run(cmdStr, true, onLine, stop)
+}
+
+func (s *SSHExecutor) run(cmdStr string, retryOnWriteFailure bool, onLine func(string), stop <-chan struct{}) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	cmdStr = normalizeRemoteCommand(cmdStr)
+	if CommandUsesSudo(cmdStr) {
+		cmdStr = ForceNonInteractiveSudo(cmdStr)
+	}
 
 	if strings.Contains(cmdStr, "local_run ") {
 		realCmd := strings.ReplaceAll(cmdStr, "local_run ", "")
-		outputStr, err := runLocalShellCommand(realCmd, onLine)
+		outputStr, err := runLocalShellCommandWithStop(realCmd, onLine, stop)
 
 		if err != nil {
 			return fmt.Sprintf("%s[Local Exec Error]: %v\nOutput:\n%s", ui.Prefix("💻", "[CMD]"), err, outputStr), nil
@@ -807,7 +980,7 @@ func (s *SSHExecutor) run(cmdStr string, retryOnWriteFailure bool, onLine func(s
 				return "", fmt.Errorf("写入命令失败: %v；自动重连失败: %v", err, reconnectErr)
 			}
 			if next, ok := Current.(*SSHExecutor); ok && next != s {
-				return next.run(cmdStr, false, onLine)
+				return next.run(cmdStr, false, onLine, stop)
 			}
 			return "", fmt.Errorf("写入命令失败: %v；已尝试自动重连但未获得新的 SSH 执行器", err)
 		}
@@ -852,6 +1025,12 @@ func (s *SSHExecutor) run(cmdStr string, retryOnWriteFailure bool, onLine func(s
 			return "", fmt.Errorf("SSH 命令超时 (%v)，且重连失败: %v", timeout, reconnectErr)
 		}
 		return "", fmt.Errorf("SSH 命令超时 (%v)，已重建远程 shell，后续命令可继续执行", timeout)
+	case <-stop:
+		reconnectErr := reconnectSSHExecutor(s)
+		if reconnectErr != nil {
+			return "", fmt.Errorf("SSH 命令已按用户请求中断，但远程 shell 重连失败: %v", reconnectErr)
+		}
+		return "", fmt.Errorf("SSH 命令已按用户请求中断，远程 shell 已重建")
 	}
 }
 
@@ -937,7 +1116,7 @@ func (s *SSHExecutor) downloadFile(remotePath, localPath string) (string, error)
 		return "", fmt.Errorf("创建本地目录失败: %v", err)
 	}
 
-	dstFile, err := os.Create(localPath)
+	dstFile, err := createPrivateOutputFile(localPath)
 	if err != nil {
 		return "", fmt.Errorf("无法创建本地文件: %v", err)
 	}

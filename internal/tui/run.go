@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"fmt"
+
 	"ai-edr/internal/analyzer"
 	"ai-edr/internal/collector"
 	"ai-edr/internal/config"
@@ -31,9 +33,13 @@ type SessionConfig struct {
 
 // Run 启动全屏 Agent TUI（支持多轮 follow-up）
 func Run(cfg SessionConfig) error {
+	if err := prepareSessionConfig(&cfg); err != nil {
+		return err
+	}
 	ctrl := newSessionController(cfg)
-	defer ctrl.Sink().Close()
 	defer ui.ResetTerminalState()
+	defer cancelInputCursorAnchor()
+	defer ctrl.Sink().Close()
 
 	title := cfg.ModelInfo
 	if title == "" {
@@ -45,6 +51,8 @@ func Run(cfg SessionConfig) error {
 	}
 
 	m := NewAgentModel(ctrl, title, status, cfg.MaxSteps, cfg.AwaitGoal, !cfg.AwaitGoal && len(*cfg.History) > 0, cfg.Startup)
+	m.restoreConversationHistory(*cfg.History)
+	m.refreshViewport()
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseAllMotion())
 	ctrl.SetProgram(p)
 
@@ -52,4 +60,21 @@ func Run(cfg SessionConfig) error {
 
 	_, err := p.Run()
 	return err
+}
+
+func prepareSessionConfig(cfg *SessionConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("TUI 会话配置不能为空")
+	}
+	if cfg.Agent == nil {
+		return fmt.Errorf("TUI 会话缺少 Agent")
+	}
+	if cfg.History == nil {
+		history := []analyzer.Message{}
+		cfg.History = &history
+	}
+	if cfg.MaxSteps <= 0 {
+		cfg.MaxSteps = 30
+	}
+	return nil
 }

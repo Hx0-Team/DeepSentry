@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,6 +58,7 @@ type Entry struct {
 
 // Store 跨会话记忆存储（对标 deepagents MemoryMiddleware + store backend）
 type Store struct {
+	mu       sync.RWMutex
 	filePath string
 	scope    string // 当前会话作用域
 	entries  map[string]*Entry
@@ -75,9 +79,10 @@ func NewStore(scope string) (*Store, error) {
 	}
 
 	memDir := filepath.Join(home, ".deepsentry", "memory")
-	if err := os.MkdirAll(memDir, 0755); err != nil {
+	if err := os.MkdirAll(memDir, 0o700); err != nil {
 		return nil, fmt.Errorf("创建 memory 目录失败: %w", err)
 	}
+	_ = os.Chmod(memDir, 0o700)
 
 	s := &Store{
 		filePath: filepath.Join(memDir, "store.json"),
@@ -143,6 +148,12 @@ func (s *Store) loadAgentsMD() {
 
 // Save 持久化到磁盘
 func (s *Store) Save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
+func (s *Store) saveLocked() error {
 	if !s.dirty {
 		return nil
 	}
@@ -151,25 +162,58 @@ func (s *Store) Save() error {
 	for _, e := range s.entries {
 		entries = append(entries, *e)
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Scope == entries[j].Scope {
+			return entries[i].Key < entries[j].Key
+		}
+		return entries[i].Scope < entries[j].Scope
+	})
 
 	data, err := json.MarshalIndent(PersistedData{Entries: entries}, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	tmp := s.filePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	tmpFile, err := os.CreateTemp(filepath.Dir(s.filePath), "memory-*.tmp")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, s.filePath); err != nil {
+	tmp := tmpFile.Name()
+	defer os.Remove(tmp)
+	if err := tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := replaceMemoryFile(tmp, s.filePath); err != nil {
 		return err
 	}
 	s.dirty = false
 	return nil
 }
 
+func replaceMemoryFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	} else if runtime.GOOS != "windows" {
+		return err
+	}
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Rename(src, dst)
+}
+
 // Set 写入记忆（当前作用域）
 func (s *Store) Set(key, value, source string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return fmt.Errorf("memory key 不能为空")
@@ -187,11 +231,13 @@ func (s *Store) Set(key, value, source string) error {
 		Source:    source,
 	}
 	s.dirty = true
-	return s.Save()
+	return s.saveLocked()
 }
 
 // SetGlobal 写入全局记忆
 func (s *Store) SetGlobal(key, value, source string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return fmt.Errorf("memory key 不能为空")
@@ -209,33 +255,39 @@ func (s *Store) SetGlobal(key, value, source string) error {
 		Source:    source,
 	}
 	s.dirty = true
-	return s.Save()
+	return s.saveLocked()
 }
 
 // Delete 删除当前作用域的记忆
 func (s *Store) Delete(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	id := entryID(s.scope, key)
 	if _, ok := s.entries[id]; !ok {
 		return fmt.Errorf("未找到记忆: %s", key)
 	}
 	delete(s.entries, id)
 	s.dirty = true
-	return s.Save()
+	return s.saveLocked()
 }
 
 // DeleteGlobal 删除全局记忆
 func (s *Store) DeleteGlobal(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	id := entryID(ScopeGlobal, key)
 	if _, ok := s.entries[id]; !ok {
 		return fmt.Errorf("未找到全局记忆: %s", key)
 	}
 	delete(s.entries, id)
 	s.dirty = true
-	return s.Save()
+	return s.saveLocked()
 }
 
 // Clear 删除结构化记忆。scope 支持 all/global/target(local/current)。
 func (s *Store) Clear(scope string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	scope = strings.ToLower(strings.TrimSpace(scope))
 	if scope == "" {
 		scope = "all"
@@ -262,57 +314,54 @@ func (s *Store) Clear(scope string) (int, error) {
 		return 0, nil
 	}
 	s.dirty = true
-	return removed, s.Save()
+	return removed, s.saveLocked()
 }
 
 // ActiveEntries 返回当前会话可见的记忆（global + 当前 scope）
 func (s *Store) ActiveEntries() []Entry {
-	var result []Entry
-	seen := make(map[string]bool)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.activeEntriesLocked()
+}
 
+func (s *Store) activeEntriesLocked() []Entry {
+	selected := make(map[string]Entry)
 	for _, e := range s.entries {
-		if e.Scope != ScopeGlobal && e.Scope != s.scope {
-			continue
+		if e.Scope == ScopeGlobal {
+			selected[e.Key] = *e
 		}
-		if seen[e.Key] && e.Scope != s.scope {
-			continue
+	}
+	// Target-specific memory always overrides a global value with the same key.
+	for _, e := range s.entries {
+		if e.Scope == s.scope {
+			selected[e.Key] = *e
 		}
-		seen[e.Key] = true
-		result = append(result, *e)
+	}
+	keys := make([]string, 0, len(selected))
+	for key := range selected {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]Entry, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, selected[key])
 	}
 	return result
 }
 
 // FormatPrompt 生成注入 system prompt 的记忆片段
 func (s *Store) FormatPrompt() string {
-	var b strings.Builder
+	return s.FormatPromptBudget(24000)
+}
 
-	if len(s.agentsMD) > 0 {
-		b.WriteString("\n【Agent 持久记忆 (AGENTS.md)】\n")
-		b.WriteString("以下是从 AGENTS.md 加载的项目/用户上下文，跨会话有效。\n\n")
-		for path, content := range s.agentsMD {
-			b.WriteString(fmt.Sprintf("--- %s ---\n%s\n\n", path, content))
-		}
+// FormatPromptBudget 按固定预算注入长期记忆，避免 AGENTS.md/KV 无限挤占任务上下文。
+func (s *Store) FormatPromptBudget(maxChars int) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if maxChars < 4000 {
+		maxChars = 4000
 	}
-
-	entries := s.ActiveEntries()
-	if len(entries) > 0 {
-		b.WriteString("\n【结构化记忆 (跨会话 KV)】\n")
-		b.WriteString("以下是从历史会话中保存的关键信息。\n\n")
-		for _, e := range entries {
-			scopeTag := e.Scope
-			if e.Scope == s.scope {
-				scopeTag = "当前目标"
-			}
-			b.WriteString(fmt.Sprintf("- [%s] **%s**: %s\n", scopeTag, e.Key, e.Value))
-		}
-	}
-
-	if b.Len() == 0 {
-		return ""
-	}
-
-	b.WriteString(`
+	policy := `
 【记忆管理 — 跨会话持久化】
 使用以下 action 保存/删除记忆（自动写入 ~/.deepsentry/memory/）:
 - remember: {"action":"remember","memory_key":"键名","memory_value":"内容","memory_scope":"target|global"}
@@ -322,8 +371,80 @@ func (s *Store) FormatPrompt() string {
 禁止保存: API Key、密码、Token 等凭证。
 有温度的记忆点: 可保存稳定的沟通偏好、协作节奏、报告风格和反复出现的产品体验要求；保持简短、尊重、可执行。
 AGENTS.md 不要求用户手动维护。AGENTS.md 用途: 长期稳定规则、跨会话协作偏好、项目/目标长期上下文；不必完全手写，用户明确要求永久记住或多轮对话形成稳定偏好时，可通过 write_file/edit_file 维护 ~/.deepsentry/AGENTS.md。
-`)
+`
+	contentBudget := maxChars - len(policy)
+	var b strings.Builder
+
+	if len(s.agentsMD) > 0 {
+		b.WriteString("\n【Agent 持久记忆 (AGENTS.md)】\n")
+		b.WriteString("以下是从 AGENTS.md 加载的项目/用户上下文，跨会话有效。\n\n")
+		paths := make([]string, 0, len(s.agentsMD))
+		for path := range s.agentsMD {
+			paths = append(paths, path)
+		}
+		sort.Slice(paths, func(i, j int) bool {
+			if paths[i] == BuiltinAgentsMDPath {
+				return true
+			}
+			if paths[j] == BuiltinAgentsMDPath {
+				return false
+			}
+			return paths[i] < paths[j]
+		})
+		for _, path := range paths {
+			content := s.agentsMD[path]
+			block := fmt.Sprintf("--- %s ---\n%s\n\n", path, truncateMemoryPrompt(content, 6000))
+			if b.Len()+len(block) > contentBudget {
+				b.WriteString("--- 其余 AGENTS.md 已因上下文预算省略 ---\n")
+				break
+			}
+			b.WriteString(block)
+		}
+	}
+
+	entries := s.activeEntriesLocked()
+	if len(entries) > 0 {
+		sort.SliceStable(entries, func(i, j int) bool {
+			iTarget := entries[i].Scope == s.scope
+			jTarget := entries[j].Scope == s.scope
+			if iTarget != jTarget {
+				return iTarget
+			}
+			if !entries[i].UpdatedAt.Equal(entries[j].UpdatedAt) {
+				return entries[i].UpdatedAt.After(entries[j].UpdatedAt)
+			}
+			return entries[i].Key < entries[j].Key
+		})
+		b.WriteString("\n【结构化记忆 (跨会话 KV)】\n")
+		b.WriteString("以下是从历史会话中保存的关键信息。\n\n")
+		for _, e := range entries {
+			scopeTag := e.Scope
+			if e.Scope == s.scope {
+				scopeTag = "当前目标"
+			}
+			line := fmt.Sprintf("- [%s] **%s**: %s\n", scopeTag, e.Key, truncateMemoryPrompt(e.Value, 1200))
+			if b.Len()+len(line) > contentBudget {
+				b.WriteString("- ...(其余结构化记忆已因上下文预算省略)\n")
+				break
+			}
+			b.WriteString(line)
+		}
+	}
+
+	if b.Len() == 0 {
+		return ""
+	}
+
+	b.WriteString(policy)
 	return b.String()
+}
+
+func truncateMemoryPrompt(s string, maxRunes int) string {
+	runes := []rune(strings.TrimSpace(s))
+	if maxRunes <= 0 || len(runes) <= maxRunes {
+		return strings.TrimSpace(s)
+	}
+	return string(runes[:maxRunes]) + "\n...(该记忆源已按预算截断)..."
 }
 
 // Count 返回当前可见记忆条数
@@ -333,11 +454,15 @@ func (s *Store) Count() int {
 
 // HasContent 是否有任何可注入的记忆内容
 func (s *Store) HasContent() bool {
-	return len(s.ActiveEntries()) > 0 || len(s.agentsMD) > 0
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.activeEntriesLocked()) > 0 || len(s.agentsMD) > 0
 }
 
 // AgentsMDCount 已加载的 AGENTS.md 文件数
 func (s *Store) AgentsMDCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.agentsMD)
 }
 
@@ -438,6 +563,8 @@ func IsAgentsMDPath(path string) bool {
 
 // UpdateAgentsMD 热更新 AGENTS.md 内容（write_file/edit_file 写回后调用）
 func (s *Store) UpdateAgentsMD(path, content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	path = expandPath(path)
 	content = stripHTMLComments(content)
 	if strings.TrimSpace(content) == "" {
@@ -449,6 +576,8 @@ func (s *Store) UpdateAgentsMD(path, content string) {
 
 // ReloadAgentsMD 从磁盘重新加载 AGENTS.md
 func (s *Store) ReloadAgentsMD() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.agentsMD = make(map[string]string)
 	s.loadAgentsMD()
 }

@@ -2,12 +2,17 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ExternalTool MCP 发现的外部工具
@@ -33,6 +38,21 @@ var globalRegistry = &Registry{
 	handlers: make(map[string]ToolHandler),
 }
 
+type stdioConnection struct {
+	mu          sync.Mutex
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	reader      *bufio.Reader
+	serverName  string
+	fingerprint string
+	nextID      int
+}
+
+var stdioConnections = struct {
+	sync.Mutex
+	byName map[string]*stdioConnection
+}{byName: make(map[string]*stdioConnection)}
+
 // Global 返回全局 MCP 注册表
 func Global() *Registry {
 	return globalRegistry
@@ -44,6 +64,17 @@ func (r *Registry) RegisterHandler(name string, tool ExternalTool, handler ToolH
 	defer r.mu.Unlock()
 	r.tools[name] = &tool
 	r.handlers[name] = handler
+}
+
+func (r *Registry) unregisterServer(server string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name, tool := range r.tools {
+		if tool != nil && tool.Server == server {
+			delete(r.tools, name)
+			delete(r.handlers, name)
+		}
+	}
 }
 
 // Get 获取 MCP 工具
@@ -63,6 +94,7 @@ func (r *Registry) ListNames() []string {
 	for n := range r.tools {
 		names = append(names, n)
 	}
+	sort.Strings(names)
 	return names
 }
 
@@ -76,7 +108,13 @@ func (r *Registry) FormatPrompt() string {
 	var b strings.Builder
 	b.WriteString("\n【MCP 扩展工具】\n")
 	b.WriteString("格式: {\"action\":\"tool\",\"tool_name\":\"mcp:<name>\",\"tool_args\":{...}}\n\n")
-	for name, t := range r.tools {
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		t := r.tools[name]
 		b.WriteString(fmt.Sprintf("- **mcp:%s** (%s): %s\n", name, t.Server, t.Description))
 	}
 	return b.String()
@@ -114,11 +152,26 @@ func ConnectStdio(cfg ServerConfig) error {
 	if cfg.Command == "" {
 		return fmt.Errorf("MCP server command 不能为空")
 	}
-	cmd := exec.Command(cfg.Command, cfg.Args...)
-	cmd.Env = os.Environ()
-	for k, v := range cfg.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
+	serverName := strings.TrimSpace(cfg.Name)
+	if serverName == "" {
+		serverName = cfg.Command
 	}
+	fingerprintRaw, _ := json.Marshal(cfg)
+	fingerprint := string(fingerprintRaw)
+
+	stdioConnections.Lock()
+	defer stdioConnections.Unlock()
+	if existing := stdioConnections.byName[serverName]; existing != nil {
+		if existing.fingerprint == fingerprint {
+			return nil
+		}
+		existing.close()
+		delete(stdioConnections.byName, serverName)
+		globalRegistry.unregisterServer(serverName)
+	}
+
+	cmd := exec.Command(cfg.Command, cfg.Args...)
+	cmd.Env = mcpProcessEnvironment(os.Environ(), cfg.Env)
 	if strings.TrimSpace(cfg.CWD) != "" {
 		cmd.Dir = cfg.CWD
 	}
@@ -134,6 +187,20 @@ func ConnectStdio(cfg ServerConfig) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动 MCP 服务器 %s 失败: %w", cfg.Name, err)
 	}
+	conn := &stdioConnection{
+		cmd:         cmd,
+		stdin:       stdin,
+		reader:      bufio.NewReader(stdout),
+		serverName:  serverName,
+		fingerprint: fingerprint,
+		nextID:      2,
+	}
+	connected := false
+	defer func() {
+		if !connected {
+			conn.close()
+		}
+	}()
 
 	// initialize
 	initReq := map[string]interface{}{
@@ -149,8 +216,20 @@ func ConnectStdio(cfg ServerConfig) error {
 	if err := writeJSONRPC(stdin, initReq); err != nil {
 		return err
 	}
-	reader := bufio.NewReader(stdout)
-	_, _ = readJSONRPCLine(reader)
+	initRaw, err := readJSONRPCResponse(conn.reader, 1, 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("MCP server %s initialize 失败: %w", serverName, err)
+	}
+	if err := jsonRPCResponseError(initRaw); err != nil {
+		return fmt.Errorf("MCP server %s initialize 失败: %w", serverName, err)
+	}
+	if err := writeJSONRPC(stdin, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+		"params":  map[string]interface{}{},
+	}); err != nil {
+		return err
+	}
 
 	// tools/list
 	listReq := map[string]interface{}{
@@ -162,9 +241,12 @@ func ConnectStdio(cfg ServerConfig) error {
 	if err := writeJSONRPC(stdin, listReq); err != nil {
 		return err
 	}
-	respRaw, err := readJSONRPCLine(reader)
+	respRaw, err := readJSONRPCResponse(conn.reader, 2, 15*time.Second)
 	if err != nil {
 		return err
+	}
+	if err := jsonRPCResponseError(respRaw); err != nil {
+		return fmt.Errorf("MCP server %s tools/list 失败: %w", serverName, err)
 	}
 
 	var listResp struct {
@@ -180,11 +262,6 @@ func ConnectStdio(cfg ServerConfig) error {
 		return fmt.Errorf("解析 MCP tools/list 失败: %w", err)
 	}
 
-	serverName := cfg.Name
-	if serverName == "" {
-		serverName = cfg.Command
-	}
-
 	for _, t := range listResp.Result.Tools {
 		toolName := t.Name
 		desc := t.Description
@@ -194,29 +271,81 @@ func ConnectStdio(cfg ServerConfig) error {
 			Description: desc,
 			Server:      serverName,
 			InputSchema: schema,
-		}, makeStdioHandler(cmd, stdin, reader, toolName))
+		}, makeStdioHandler(conn, toolName, schema))
 	}
 
-	go func() { _ = cmd.Wait() }()
+	stdioConnections.byName[serverName] = conn
+	connected = true
+	go monitorStdioConnection(conn, cmd)
 	return nil
 }
 
-func makeStdioHandler(cmd *exec.Cmd, stdin interface{ Write([]byte) (int, error) }, reader *bufio.Reader, toolName string) ToolHandler {
+// mcpProcessEnvironment applies least privilege to third-party MCP servers.
+// Credentials are never inherited implicitly; a server receives secrets only
+// when the user explicitly places them in that server's env configuration.
+func mcpProcessEnvironment(parent []string, explicit map[string]string) []string {
+	allowed := map[string]bool{
+		"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "SHELL": true,
+		"TMPDIR": true, "TMP": true, "TEMP": true, "LANG": true, "TZ": true,
+		"SYSTEMROOT": true, "WINDIR": true, "COMSPEC": true, "PATHEXT": true,
+		"APPDATA": true, "LOCALAPPDATA": true, "PROGRAMDATA": true,
+	}
+	values := make(map[string]string, len(allowed)+len(explicit))
+	for _, item := range parent {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		upper := strings.ToUpper(key)
+		if allowed[upper] || strings.HasPrefix(upper, "LC_") || strings.HasPrefix(upper, "XDG_") {
+			values[key] = value
+		}
+	}
+	for key, value := range explicit {
+		if strings.TrimSpace(key) != "" && !strings.ContainsAny(key, "=\x00") && !strings.ContainsRune(value, '\x00') {
+			values[key] = value
+		}
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, key+"="+values[key])
+	}
+	return out
+}
+
+func makeStdioHandler(conn *stdioConnection, toolName string, schema map[string]interface{}) ToolHandler {
 	return func(args map[string]string) (string, error) {
+		coerced, err := validateAndCoerceMCPArgs(schema, args)
+		if err != nil {
+			return "", fmt.Errorf("MCP 工具 %s 参数无效: %w", toolName, err)
+		}
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		if conn.cmd == nil || conn.cmd.Process == nil {
+			return "", fmt.Errorf("MCP server %s 已断开", conn.serverName)
+		}
+		conn.nextID++
 		callReq := map[string]interface{}{
 			"jsonrpc": "2.0",
-			"id":      3,
+			"id":      conn.nextID,
 			"method":  "tools/call",
 			"params": map[string]interface{}{
 				"name":      toolName,
-				"arguments": args,
+				"arguments": coerced,
 			},
 		}
-		if err := writeJSONRPC(stdin, callReq); err != nil {
+		if err := writeJSONRPC(conn.stdin, callReq); err != nil {
+			conn.closeLocked()
 			return "", err
 		}
-		raw, err := readJSONRPCLine(reader)
+		raw, err := readJSONRPCResponse(conn.reader, conn.nextID, 10*time.Minute)
 		if err != nil {
+			conn.closeLocked()
 			return "", err
 		}
 		var callResp struct {
@@ -249,6 +378,64 @@ func makeStdioHandler(cmd *exec.Cmd, stdin interface{ Write([]byte) (int, error)
 	}
 }
 
+func (c *stdioConnection) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeLocked()
+}
+
+func (c *stdioConnection) closeLocked() {
+	if c.stdin != nil {
+		_ = c.stdin.Close()
+		c.stdin = nil
+	}
+	if c.cmd != nil && c.cmd.Process != nil {
+		_ = c.cmd.Process.Kill()
+	}
+	c.cmd = nil
+}
+
+func monitorStdioConnection(conn *stdioConnection, cmd *exec.Cmd) {
+	_ = cmd.Wait()
+	stdioConnections.Lock()
+	defer stdioConnections.Unlock()
+	if stdioConnections.byName[conn.serverName] == conn {
+		delete(stdioConnections.byName, conn.serverName)
+		globalRegistry.unregisterServer(conn.serverName)
+	}
+}
+
+// CloseAll stops every stdio MCP child process. It is safe to call repeatedly.
+func CloseAll() {
+	stdioConnections.Lock()
+	connections := make([]*stdioConnection, 0, len(stdioConnections.byName))
+	for name, conn := range stdioConnections.byName {
+		connections = append(connections, conn)
+		delete(stdioConnections.byName, name)
+		globalRegistry.unregisterServer(name)
+	}
+	stdioConnections.Unlock()
+	for _, conn := range connections {
+		conn.close()
+	}
+}
+
+func jsonRPCResponseError(raw []byte) error {
+	var envelope struct {
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return fmt.Errorf("无效 JSON-RPC 响应: %w", err)
+	}
+	if envelope.Error != nil {
+		return fmt.Errorf("JSON-RPC %d: %s", envelope.Error.Code, envelope.Error.Message)
+	}
+	return nil
+}
+
 func writeJSONRPC(w interface{ Write([]byte) (int, error) }, payload map[string]interface{}) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -260,11 +447,152 @@ func writeJSONRPC(w interface{ Write([]byte) (int, error) }, payload map[string]
 }
 
 func readJSONRPCLine(r *bufio.Reader) ([]byte, error) {
-	line, err := r.ReadBytes('\n')
-	if err != nil {
-		return nil, err
+	const maxMCPMessageBytes = 16 << 20
+	var out bytes.Buffer
+	for {
+		part, err := r.ReadSlice('\n')
+		if out.Len()+len(part) > maxMCPMessageBytes {
+			return nil, fmt.Errorf("MCP JSON-RPC 消息超过上限 %d 字节", maxMCPMessageBytes)
+		}
+		_, _ = out.Write(part)
+		if err == nil {
+			return out.Bytes(), nil
+		}
+		if err != bufio.ErrBufferFull {
+			return nil, err
+		}
 	}
-	return line, nil
+}
+
+func validateAndCoerceMCPArgs(schema map[string]interface{}, args map[string]string) (map[string]interface{}, error) {
+	if args == nil {
+		args = map[string]string{}
+	}
+	properties, _ := schema["properties"].(map[string]interface{})
+	required, _ := schema["required"].([]interface{})
+	for _, item := range required {
+		name, _ := item.(string)
+		if name == "" {
+			continue
+		}
+		if _, ok := args[name]; !ok {
+			return nil, fmt.Errorf("缺少必填参数 %s", name)
+		}
+	}
+	if allow, ok := schema["additionalProperties"].(bool); ok && !allow {
+		for name := range args {
+			if _, exists := properties[name]; !exists {
+				return nil, fmt.Errorf("未知参数 %s", name)
+			}
+		}
+	}
+
+	out := make(map[string]interface{}, len(args))
+	for name, raw := range args {
+		spec, _ := properties[name].(map[string]interface{})
+		value, err := coerceMCPValue(raw, spec)
+		if err != nil {
+			return nil, fmt.Errorf("参数 %s: %w", name, err)
+		}
+		if enum, ok := spec["enum"].([]interface{}); ok && len(enum) > 0 {
+			matched := false
+			for _, allowed := range enum {
+				if fmt.Sprint(value) == fmt.Sprint(allowed) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return nil, fmt.Errorf("参数 %s=%q 不在 enum 可选值中", name, raw)
+			}
+		}
+		out[name] = value
+	}
+	return out, nil
+}
+
+func coerceMCPValue(raw string, spec map[string]interface{}) (interface{}, error) {
+	typeName, _ := spec["type"].(string)
+	switch typeName {
+	case "integer":
+		value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("需要 integer，收到 %q", raw)
+		}
+		return value, nil
+	case "number":
+		value, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil {
+			return nil, fmt.Errorf("需要 number，收到 %q", raw)
+		}
+		return value, nil
+	case "boolean":
+		value, err := strconv.ParseBool(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, fmt.Errorf("需要 boolean，收到 %q", raw)
+		}
+		return value, nil
+	case "array":
+		var value []interface{}
+		if err := json.Unmarshal([]byte(raw), &value); err != nil {
+			return nil, fmt.Errorf("需要 JSON array，收到 %q", raw)
+		}
+		return value, nil
+	case "object":
+		var value map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &value); err != nil {
+			return nil, fmt.Errorf("需要 JSON object，收到 %q", raw)
+		}
+		return value, nil
+	default:
+		return raw, nil
+	}
+}
+
+func readJSONRPCLineWithTimeout(r *bufio.Reader, timeout time.Duration) ([]byte, error) {
+	if timeout <= 0 {
+		return readJSONRPCLine(r)
+	}
+	type result struct {
+		raw []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		raw, err := readJSONRPCLine(r)
+		ch <- result{raw: raw, err: err}
+	}()
+	select {
+	case res := <-ch:
+		return res.raw, res.err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("等待 JSON-RPC 响应超时 (%s)", timeout)
+	}
+}
+
+func readJSONRPCResponse(r *bufio.Reader, wantID int, timeout time.Duration) ([]byte, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("等待 JSON-RPC id=%d 响应超时 (%s)", wantID, timeout)
+		}
+		raw, err := readJSONRPCLineWithTimeout(r, remaining)
+		if err != nil {
+			return nil, err
+		}
+		var envelope struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if json.Unmarshal(raw, &envelope) != nil || len(envelope.ID) == 0 || string(envelope.ID) == "null" {
+			// Servers may emit notifications/log messages between responses.
+			continue
+		}
+		var numericID int
+		if json.Unmarshal(envelope.ID, &numericID) == nil && numericID == wantID {
+			return raw, nil
+		}
+	}
 }
 
 // LoadServersFromConfig 从配置加载 MCP 服务器

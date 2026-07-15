@@ -30,7 +30,7 @@ func TestRegistryCount(t *testing.T) {
 
 func TestFormatCatalogDetail(t *testing.T) {
 	detail := FormatCatalogDetail("网络连通", "ping")
-	if !strings.Contains(detail, "ping") || !strings.Contains(detail, "host(必填)") {
+	if !strings.Contains(detail, "ping") || !strings.Contains(detail, "host (string, 必填)") {
 		t.Fatal("catalog detail should include matching tool args")
 	}
 	db := FormatCatalogDetail("数据库探测", "redis")
@@ -72,6 +72,89 @@ func TestFormatCatalogDetail(t *testing.T) {
 	doc := FormatCatalogDetail("文档解析", "")
 	if !strings.Contains(doc, "document_parse") || !strings.Contains(doc, "PDF") {
 		t.Fatal("catalog detail should include document_parse")
+	}
+	configSearch := FormatCatalogDetail("配置管理", "add ssh target config_manage")
+	if !strings.Contains(configSearch, "config_manage") || !strings.Contains(configSearch, "port (integer") {
+		t.Fatalf("multi-keyword search should find config_manage with structured help:\n%s", configSearch)
+	}
+}
+
+func TestToolContractsValidateCanonicalCalls(t *testing.T) {
+	valid := map[string]string{
+		"action":   "add_target",
+		"protocol": "ssh",
+		"host":     "10.0.0.8",
+		"port":     "2222",
+		"user":     "root",
+		"password": "secret",
+	}
+	if err := ValidateCall("config_manage", valid); err != nil {
+		t.Fatalf("canonical config call rejected: %v", err)
+	}
+	invalid := make(map[string]string, len(valid)+1)
+	for k, v := range valid {
+		invalid[k] = v
+	}
+	invalid["force"] = "true"
+	if err := ValidateCall("config_manage", invalid); err == nil || !strings.Contains(err.Error(), "未知参数: force") || !strings.Contains(err.Error(), "示例") {
+		t.Fatalf("unknown parameter should fail with executable help: %v", err)
+	}
+	invalidAction := map[string]string{"action": "list_targets", "force": "true"}
+	if err := ValidateCall("config_manage", invalidAction); err == nil || !strings.Contains(err.Error(), "fleet_inventory") {
+		t.Fatalf("hallucinated action should point to fleet_inventory: %v", err)
+	}
+}
+
+func TestWorkflowContractsRejectIncompleteOrWrongTypedCalls(t *testing.T) {
+	tests := []struct {
+		name string
+		args map[string]string
+		want string
+	}{
+		{"file_download", map[string]string{"remote_path": "/var/log/auth.log"}, "local_path"},
+		{"archive_extract", map[string]string{"source": "/tmp/a.zip"}, "dest"},
+		{"script_run", map[string]string{"language": "python"}, "content | path"},
+		{"fleet_file", map[string]string{"action": "download", "remote_path": "/tmp/a"}, "local_path"},
+		{"tcp_forward", map[string]string{"action": "start", "listen_port": "abc", "target_host": "127.0.0.1", "target_port": "80"}, "必须是整数"},
+		{"schedule_task", map[string]string{"action": "remove"}, "id"},
+		{"tsecbench", map[string]string{"action": "submit", "unique_code": "demo"}, "flag"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateCall(tt.name, tt.args)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected error containing %q, got %v", tt.want, err)
+			}
+		})
+	}
+
+	if err := ValidateCall("script_run", map[string]string{"language": "shell", "content": "echo ok", "timeout": "30"}); err != nil {
+		t.Fatalf("valid script_run rejected: %v", err)
+	}
+	schema := JSONSchema("script_run")
+	if _, ok := schema["anyOf"]; !ok {
+		t.Fatalf("script_run native schema must express content/path requirement: %#v", schema)
+	}
+}
+
+func TestEveryEnabledToolHasNativeJSONSchema(t *testing.T) {
+	for _, name := range ListNames() {
+		schema := JSONSchema(name)
+		if schema["type"] != "object" {
+			t.Fatalf("tool %s missing object schema: %#v", name, schema)
+		}
+		if _, ok := schema["additionalProperties"]; !ok {
+			t.Fatalf("tool %s schema does not declare unknown-arg behavior", name)
+		}
+		tool, _ := Get(name)
+		props, _ := schema["properties"].(map[string]interface{})
+		if tool.ArgsHint != "" && tool.ArgsHint != "无参数" && len(props) == 0 {
+			t.Fatalf("tool %s has documented args but empty native schema: %q", name, tool.ArgsHint)
+		}
+		help := FormatToolHelp(name)
+		if !strings.Contains(help, "示例:") {
+			t.Fatalf("tool %s should have an executable catalog example: %s", name, help)
+		}
 	}
 }
 

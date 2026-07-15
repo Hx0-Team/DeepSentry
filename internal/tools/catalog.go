@@ -45,10 +45,23 @@ DeepSentry 内置 Go 原生工具支持热插拔，当前启用 %d 个。
 只有当目标系统缺少常用命令、需要跨平台 /proc 解析、控制端网络探测、日志/取证辅助时，再按需调用工具。
 
 发现工具:
-{"action":"tool","tool_name":"tool_catalog","tool_args":{"category":"网络连通|连接审计|系统应急|取证分析|文档解析|端口扫描|内网发现|Web探测|抓包分析|协议探测|系统关联|协议指纹|数据库探测|数据库取证|配置取证|日志取证|脚本执行|文件传输|代理转发|自动化任务|配置管理|批量运维|比赛辅助|all","query":"可选关键词"}}
+{"action":"tool","tool_name":"tool_catalog","tool_args":{"name":"已知工具名，精确查看完整用法","category":"分类或all","query":"可选的空格分隔关键词"}}
+准备调用工具但不确定 action、参数名、格式或流程时，必须先用 name 精确查询；不要猜参数。工具报错返回的用法就是下一次调用的权威依据。
 
 已启用工具名概览: %s
 `, len(names), joinNames(names))
+}
+
+// FormatCompactCatalogPrompt keeps the discovery workflow but omits the full
+// 60-tool name list for small local models. Exact schemas arrive on demand.
+func FormatCompactCatalogPrompt() string {
+	return `
+【内置工具 — 按需发现】
+简单排查优先 Shell。需要专用工具时先调用:
+{"action":"tool","tool_name":"tool_catalog","tool_args":{"name":"已知工具名"}}
+不知道名称时使用 category/query 搜索。严格复制目录返回的参数、action 和示例，不要猜字段。
+常用入口: config_manage、fleet_inventory、fleet_exec、fleet_file、target_health_summary、read_log。
+`
 }
 
 // FormatCatalogDetail 生成按分类/关键词过滤后的详细工具目录。
@@ -58,6 +71,9 @@ func FormatCatalogDetail(category, query string) string {
 
 	category = strings.TrimSpace(category)
 	query = strings.ToLower(strings.TrimSpace(query))
+	queryTerms := strings.FieldsFunc(query, func(r rune) bool {
+		return r == ' ' || r == ',' || r == '，' || r == '/' || r == '|'
+	})
 	byCat := make(map[string][]*Tool)
 	catOrder := []string{"网络连通", "连接审计", "系统应急", "取证分析", "文档解析", "端口扫描", "内网发现", "Web探测", "抓包分析", "协议探测", "系统关联", "协议指纹", "数据库探测", "数据库取证", "配置取证", "日志取证", "脚本执行", "文件传输", "代理转发", "自动化任务", "配置管理", "批量运维", "比赛辅助"}
 
@@ -68,9 +84,16 @@ func FormatCatalogDetail(category, query string) string {
 		if category != "" && category != "all" && t.Category != category {
 			continue
 		}
-		if query != "" {
+		if len(queryTerms) > 0 {
 			haystack := strings.ToLower(t.Name + " " + t.Category + " " + t.Description + " " + t.ArgsHint)
-			if !strings.Contains(haystack, query) {
+			matched := strings.EqualFold(query, t.Name)
+			for _, term := range queryTerms {
+				if strings.Contains(haystack, term) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
 				continue
 			}
 		}
@@ -112,7 +135,14 @@ func FormatCatalogDetail(category, query string) string {
 				persIcon = "💻"
 				persLabel = "控制端"
 			}
-			b.WriteString(fmt.Sprintf("- %s %s**%s** [%s]: %s\n  参数: %s\n", riskIcon, persIcon, t.Name, persLabel, t.Description, t.ArgsHint))
+			b.WriteString(fmt.Sprintf("- %s %s**%s** [%s]: %s\n", riskIcon, persIcon, t.Name, persLabel, t.Description))
+			if help := FormatToolHelp(t.Name); help != "" {
+				for _, line := range strings.Split(help, "\n") {
+					b.WriteString("  " + line + "\n")
+				}
+			} else {
+				b.WriteString("  参数: 无参数\n")
+			}
 		}
 		b.WriteString("\n")
 	}

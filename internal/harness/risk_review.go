@@ -3,6 +3,7 @@ package harness
 import (
 	"ai-edr/internal/analyzer"
 	"ai-edr/internal/collector"
+	"ai-edr/internal/security"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -20,6 +21,9 @@ func reviewCommandRiskWithAI(sysCtx collector.SystemContext, command, ruleReason
 	if command == "" {
 		return "", "", false
 	}
+	// Risk review is an external model call. Preserve the command's structure
+	// for classification, but never send credentials to that secondary call.
+	command = security.RedactSensitiveText(command)
 
 	prompt := fmt.Sprintf(`请复核下面这条命令是否真的需要高风险确认。
 
@@ -27,10 +31,11 @@ func reviewCommandRiskWithAI(sysCtx collector.SystemContext, command, ruleReason
 - low：只读取、枚举、查看、统计信息，不写文件、不改配置、不启停服务、不删除、不提权、不持久化、不执行下载脚本。
 - high：会删除/覆盖/写入文件，修改权限/账号/服务/注册表/计划任务，启停系统或服务，执行远程脚本，扫描攻击，建立反连/隧道，或有明显副作用。
 - 如果命令链里只有 echo/hostname/whoami/cd/dir/ls/cat/grep/findstr/tasklist/netstat/ipconfig/ver 等观测动作，应为 low。
-- 不确定时返回 high。
+- 2>&1、1>&2 只是合并标准输出/错误，不是写文件。
+- 只有能明确确认整条命令链无副作用时才返回 low；不确定时返回 high。
 
 只输出 JSON，不要解释：
-{"risk":"low|high","reason":"一句话原因","confidence":0.0}
+{"risk":"low|high","reason":"一句话原因","confidence":0.95}
 
 系统: %s/%s user=%s host=%s
 规则命中原因: %s

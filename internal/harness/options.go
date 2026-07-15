@@ -7,10 +7,8 @@ import (
 
 // agentBuilder 内部构建器（对标 create_deep_agent 可扩展参数）
 type agentBuilder struct {
-	cfg           Config
-	middleware    []Middleware
-	extraSubAgents []interface{} // reserved
-	customTools   map[string]func(*StepContext, *AgentAction) (*ActionResult, error)
+	cfg        Config
+	middleware []Middleware
 }
 
 // Option DeepAgent 配置选项

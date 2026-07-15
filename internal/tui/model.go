@@ -1,11 +1,12 @@
 package tui
 
 import (
+	"ai-edr/internal/analyzer"
 	"encoding/json"
 	"fmt"
-	"os"
+	"os/exec"
+	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"ai-edr/internal/config"
@@ -14,19 +15,22 @@ import (
 	"ai-edr/internal/skills"
 	"ai-edr/internal/ui"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
-	"golang.org/x/term"
 )
 
 type logLine struct {
 	kind      string
 	content   string
 	raw       string
+	step      int
+	complete  bool
+	settled   bool
 	collapsed bool
 	group     int
 	groupHead bool
@@ -35,9 +39,10 @@ type logLine struct {
 }
 
 type confirmState struct {
-	action *harness.AgentAction
-	prompt string
-	respCh chan bool
+	action       *harness.AgentAction
+	prompt       string
+	respCh       chan bool
+	restoreInput bool
 }
 
 type askState struct {
@@ -68,11 +73,13 @@ var slashCommands = []slashCommand{
 	{Name: "cost", Description: "显示会话轮次、消息数和估算 token"},
 	{Name: "model", Description: "显示当前模型"},
 	{Name: "compact", Description: "折叠长输出并整理上下文"},
-	{Name: "memory", Description: "Memory 管理：/memory list|clear [all|target|global]"},
+	{Name: "memory", Description: "Memory 管理：/memory list|clues|clear [all|target|global]"},
 	{Name: "agents", Description: "AGENTS.md 管理：/agents status|clear"},
 	{Name: "sessions", Description: "列出可恢复 checkpoint"},
 	{Name: "resume", Description: "恢复 checkpoint：/resume <session_id> [补充说明]"},
+	{Name: "tsecbench", Description: "进入 TSecBench 跑分模式；可追加题目或目标说明"},
 	{Name: "config", Description: "显示连接与模型配置"},
+	{Name: "sudo", Description: "由系统安全验证/刷新本机 sudo 授权（密码不进入程序）"},
 	{Name: "mcp", Description: "MCP 管理：/mcp list|import|add|off|on"},
 	{Name: "skill", Description: "Skill 管理：/skill list|load|unload|add|off|on|remove"},
 	{Name: "exit", Description: "退出 TUI"},
@@ -82,10 +89,20 @@ var slashCommands = []slashCommand{
 type agentDoneMsg struct{}
 type confirmMsg confirmState
 type askMsg askState
+type sudoAuthMsg struct{ respCh chan bool }
+type sudoAuthResultMsg struct {
+	respCh chan bool
+	err    error
+}
+type sudoTerminalRestoredMsg struct {
+	respCh chan bool
+	ok     bool
+}
 type uiEventMsg harness.UIEvent
 type userMsgEvent struct{ text string }
 type agentStartMsg struct{ followUp bool }
 type streamRefreshMsg struct{}
+type commandOutputRefreshMsg struct{}
 type streamCollapseMsg struct{ id int }
 type cmdOutputCollapseMsg struct{ group int }
 type copyToastMsg struct {
@@ -93,12 +110,6 @@ type copyToastMsg struct {
 	err   string
 }
 type copyToastClearMsg struct{}
-
-var inputCursorAnchorSeq atomic.Uint64
-
-func cancelInputCursorAnchor() {
-	inputCursorAnchorSeq.Add(1)
-}
 
 // AgentModel 主 Agent TUI（多轮对话 + 子 Agent 面板）
 type AgentModel struct {
@@ -119,6 +130,7 @@ type AgentModel struct {
 	cmdOutputGroup int
 	activeCmdGroup int
 	streamTick     bool
+	commandTick    bool
 	running        bool
 	thinking       bool
 	currentStep    int
@@ -149,6 +161,7 @@ type AgentModel struct {
 	selActive     bool
 	copyToast     string
 	tokenUsage    tokenStats
+	trimmedLines  int
 }
 
 func NewAgentModel(ctrl *SessionController, title, status string, maxSteps int, awaitGoal, autoStart bool, startup StartupInfo) AgentModel {
@@ -161,7 +174,7 @@ func NewAgentModel(ctrl *SessionController, title, status string, maxSteps int, 
 	ti.Prompt = ""
 	ti.CharLimit = 256 * 1024
 	ti.Width = 70
-	_ = ti.SetCursorMode(textinput.CursorStatic)
+	_ = ti.Cursor.SetMode(cursor.CursorStatic)
 	if awaitGoal {
 		ti.Focus()
 	} else {
@@ -233,6 +246,9 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case uiEventMsg:
 		e := harness.UIEvent(msg)
+		if settlesCompletedStream(e.Kind) {
+			m.settleCompletedStreams()
+		}
 		m.applyEvent(e)
 		if msg.Kind != harness.EventThinking {
 			m.thinking = false
@@ -242,6 +258,14 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.streamTick {
 				m.streamTick = true
 				cmds = append(cmds, streamRefreshCmd())
+			}
+		} else if e.Kind == harness.EventCommandOutput {
+			// External tools can produce hundreds of lines per second. Rebuilding
+			// and repainting the entire viewport for every line causes visible
+			// tearing and can starve Bubble Tea's renderer, so coalesce repaints.
+			if !m.commandTick {
+				m.commandTick = true
+				cmds = append(cmds, commandOutputRefreshCmd())
 			}
 		} else {
 			m.refreshViewport()
@@ -273,7 +297,15 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case commandOutputRefreshMsg:
+		m.commandTick = false
+		m.refreshViewport()
+		return m, nil
+
 	case streamCollapseMsg:
+		if !m.autoScroll {
+			return m, nil
+		}
 		m.collapseStreamLine(msg.id)
 		m.refreshViewport()
 		if m.inputFocused() {
@@ -282,6 +314,13 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case cmdOutputCollapseMsg:
+		if !m.autoScroll {
+			return m, nil
+		}
+		lines, chars, _ := m.commandOutputGroupStats(msg.group)
+		if lines <= 8 && chars <= 1000 {
+			return m, nil
+		}
 		m.collapseCommandOutputGroup(msg.group)
 		m.refreshViewport()
 		if m.inputFocused() {
@@ -298,7 +337,13 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case confirmMsg:
-		m.pendingConfirm = &confirmState{action: msg.action, prompt: msg.prompt, respCh: msg.respCh}
+		restoreInput := m.inputFocused()
+		m.pendingConfirm = &confirmState{action: msg.action, prompt: msg.prompt, respCh: msg.respCh, restoreInput: restoreInput}
+		m.input.Blur()
+		cancelInputCursorAnchor()
+		m.appendConfirmLine(msg.prompt)
+		m.recalcLayout()
+		m.refreshViewport()
 		return m, nil
 
 	case askMsg:
@@ -307,8 +352,40 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.SetValue("")
 		m.pendingPaste = ""
 		m.appendAskLine(msg.prompt, msg.options)
+		m.recalcLayout()
 		m.refreshViewport()
 		m.scheduleInputCursorAnchor()
+		return m, nil
+
+	case sudoAuthMsg:
+		m.appendLine("info", "sudo 需要本机管理员授权：即将暂时退出全屏，由系统 sudo 隐藏读取密码；DeepSentry 不会接收或记录密码。", "sudo system validation")
+		m.refreshViewport()
+		return m, sudoValidationCmd(msg.respCh)
+
+	case sudoAuthResultMsg:
+		ok := msg.err == nil
+		if ok {
+			m.appendLine("info", "✓ sudo 授权验证成功；后续命令将使用非交互模式执行。", "sudo validated")
+		} else {
+			m.appendLine("error", "sudo 授权未完成，命令不会执行: "+msg.err.Error(), "sudo validation failed")
+		}
+		m.refreshViewport()
+		return m, restoreTerminalAfterSudoCmd(msg.respCh, ok)
+
+	case sudoTerminalRestoredMsg:
+		// tea.ExecProcess restores the alternate screen, but Bubble Tea v1.3.4
+		// does not restore the mouse mode enabled by WithMouseAllMotion. Finish
+		// the repaint first, then let the waiting Agent resume its command.
+		m.selecting = false
+		m.selActive = false
+		m.recalcLayout()
+		m.refreshViewport()
+		if msg.respCh != nil {
+			msg.respCh <- msg.ok
+		}
+		if m.inputFocused() {
+			m.scheduleInputCursorAnchor()
+		}
 		return m, nil
 
 	case agentDoneMsg:
@@ -324,6 +401,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingPaste = ""
 		m.input.Width = ChromeContentWidth(m.width) - 2
 		m.input.Focus()
+		m.recalcLayout()
 		m.refreshViewport()
 		m.scheduleInputCursorAnchor()
 		return m, nil
@@ -346,6 +424,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendLine("info", "▶ 开始执行...", "start")
 		}
 		m.autoStart = false
+		m.recalcLayout()
 		m.refreshViewport()
 		return m, nil
 
@@ -404,27 +483,46 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.pendingConfirm != nil {
 			switch {
-			case key == "y":
+			case key == "y" || key == "Y":
 				ch := m.pendingConfirm.respCh
+				restoreInput := m.pendingConfirm.restoreInput
 				m.pendingConfirm = nil
+				m.resolveLastConfirm(true)
 				if ch != nil {
 					ch <- true
 				}
-				m.appendLine("info", "✓ 已批准", "ok")
+				if restoreInput {
+					m.input.Focus()
+				}
+				m.recalcLayout()
 				m.refreshViewport()
-			case key == "n" || key == "esc":
+				if restoreInput {
+					m.scheduleInputCursorAnchor()
+				}
+			case key == "n" || key == "N" || key == "esc" || isSubmitKey(msg):
 				ch := m.pendingConfirm.respCh
+				restoreInput := m.pendingConfirm.restoreInput
 				m.pendingConfirm = nil
+				m.resolveLastConfirm(false)
 				if ch != nil {
 					ch <- false
 				}
-				m.appendLine("info", "✗ 已拒绝", "no")
+				if restoreInput {
+					m.input.Focus()
+				}
+				m.recalcLayout()
 				m.refreshViewport()
+				if restoreInput {
+					m.scheduleInputCursorAnchor()
+				}
 			case key == "ctrl+c":
 				if ch := m.pendingConfirm.respCh; ch != nil {
 					ch <- false
 				}
 				m.pendingConfirm = nil
+				if m.ctrl != nil {
+					m.ctrl.RequestStop()
+				}
 				m.quitting = true
 				cancelInputCursorAnchor()
 				return m, tea.Quit
@@ -441,6 +539,9 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendLine("info", "已暂停等待补充；可稍后直接输入追问继续。", "ask-cancel")
 			m.refreshViewport()
 			if key == "ctrl+c" {
+				if m.ctrl != nil {
+					m.ctrl.RequestStop()
+				}
 				m.quitting = true
 				cancelInputCursorAnchor()
 				return m, tea.Quit
@@ -477,6 +578,8 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.inputFocused() {
 				m.input.Blur()
 				cancelInputCursorAnchor()
+				m.recalcLayout()
+				m.refreshViewport()
 				return m, nil
 			}
 			if m.selActive {
@@ -571,6 +674,14 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.scheduleInputCursorAnchor()
 				return m, nil
+			case "ctrl+home":
+				m.autoScroll = false
+				m.viewport.GotoTop()
+				return m, nil
+			case "ctrl+end":
+				m.autoScroll = true
+				m.viewport.GotoBottom()
+				return m, nil
 			}
 			if m.pendingPaste != "" {
 				if msg.Type == tea.KeyRunes {
@@ -614,13 +725,13 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clearView()
 			return m, nil
 		case "q":
-			if m.done || m.awaitGoal || m.sessionLive || !m.running {
+			if !m.running {
 				m.quitting = true
 				cancelInputCursorAnchor()
 				return m, tea.Quit
 			}
 		case "e":
-			m.toggleLastCollapsible()
+			m.toggleAllCollapsible()
 			m.refreshViewport()
 			return m, nil
 		case "up", "k", "pgup":
@@ -645,9 +756,15 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.autoScroll = true
 			m.viewport.GotoBottom()
 			return m, nil
+		case "g", "home", "ctrl+home":
+			m.autoScroll = false
+			m.viewport.GotoTop()
+			return m, nil
 		case "tab":
 			if m.done || m.awaitGoal || m.sessionLive {
 				m.input.Focus()
+				m.recalcLayout()
+				m.refreshViewport()
 				m.scheduleInputCursorAnchor()
 				return m, nil
 			}
@@ -682,6 +799,7 @@ func (m *AgentModel) submitAskResponse() tea.Cmd {
 	m.input.Blur()
 	cancelInputCursorAnchor()
 	m.appendLine("user", "You: "+summarizeIfNeeded(text), text)
+	m.recalcLayout()
 	m.refreshViewport()
 	if ch != nil {
 		ch <- text
@@ -705,6 +823,7 @@ func (m *AgentModel) tryInterruptSubmit() tea.Cmd {
 	cancelInputCursorAnchor()
 	m.appendLine("user", "You: "+summarizeIfNeeded(text), text)
 	m.appendLine("info", "↳ 已注入新指令，当前轮停止后会按最新目标继续。", text)
+	m.recalcLayout()
 	m.refreshViewport()
 	m.scheduleInputCursorAnchor()
 	return nil
@@ -718,8 +837,8 @@ func summarizeIfNeeded(text string) string {
 }
 
 func normalizeAskAnswer(text string, options []string) string {
-	idx := 0
-	if _, err := fmt.Sscanf(strings.TrimSpace(text), "%d", &idx); err == nil && idx > 0 && idx <= len(options) {
+	idx, err := strconv.Atoi(strings.TrimSpace(text))
+	if err == nil && idx > 0 && idx <= len(options) {
 		if opt := strings.TrimSpace(options[idx-1]); opt != "" {
 			return opt
 		}
@@ -842,6 +961,7 @@ func (m *AgentModel) trySubmit() tea.Cmd {
 	m.awaitGoal = false
 	m.done = false
 	m.sessionLive = true
+	m.recalcLayout()
 	displayText := text
 	if pasted || strings.Count(text, "\n") >= 3 || runewidth.StringWidth(text) > 400 {
 		displayText = summarizeUserText(text)
@@ -873,6 +993,7 @@ func (m *AgentModel) trySubmit() tea.Cmd {
 			m.input.SetValue(pasteSummary(text))
 		}
 		m.appendLine("error", "Agent 仍在运行，请稍候", "busy")
+		m.recalcLayout()
 		m.refreshViewport()
 		m.scheduleInputCursorAnchor()
 		return nil
@@ -883,6 +1004,10 @@ func (m *AgentModel) trySubmit() tea.Cmd {
 
 func streamRefreshCmd() tea.Cmd {
 	return tea.Tick(80*time.Millisecond, func(time.Time) tea.Msg { return streamRefreshMsg{} })
+}
+
+func commandOutputRefreshCmd() tea.Cmd {
+	return tea.Tick(40*time.Millisecond, func(time.Time) tea.Msg { return commandOutputRefreshMsg{} })
 }
 
 func streamCollapseCmd(id int) tea.Cmd {
@@ -929,12 +1054,13 @@ func (m *AgentModel) recallInputHistory(delta int) {
 func (m *AgentModel) handleSlashCommand(text string) tea.Cmd {
 	cmd, arg := splitSlashCommand(text)
 	m.clearInputDraft()
+	m.recalcLayout()
 	switch {
 	case cmd == "clear":
 		m.clearView()
 		return nil
 	case cmd == "" || cmd == "help":
-		m.appendLine("info", "可用命令: "+slashCommandNames(), "help")
+		m.appendLine("info", "浏览: ↑↓/jk 逐行 · PgUp/PgDn 翻页 · g/Home 顶部 · G 底部 · e 全部展开/折叠\n可用命令: "+slashCommandNames(), "help")
 	case cmd == "new" || cmd == "restart":
 		return m.startNewSession(arg)
 	case cmd == "status":
@@ -966,14 +1092,27 @@ func (m *AgentModel) handleSlashCommand(text string) tea.Cmd {
 			break
 		}
 		var b strings.Builder
-		for _, s := range summaries {
-			b.WriteString(fmt.Sprintf("%s · step %d · %s\n", s.ID, s.StepNum, s.SavedAt.Format("01-02 15:04")))
+		// The viewport sticks to the bottom, so render oldest -> newest here.
+		// CLI/picker APIs remain newest-first.
+		for i := len(summaries) - 1; i >= 0; i-- {
+			s := summaries[i]
+			line := fmt.Sprintf("%s · step %d · %s", s.ID, s.StepNum, s.SavedAt.Format("01-02 15:04"))
+			if goal := strings.TrimSpace(s.Goal); goal != "" {
+				line += " · " + truncateStr(goal, 60)
+			}
+			b.WriteString(line + "\n")
 		}
 		m.appendLine("result", strings.TrimSpace(b.String()), b.String())
 	case cmd == "resume":
 		return m.resumeSessionSlash(arg)
+	case cmd == "tsecbench":
+		return m.startTSecBenchMode(arg)
 	case cmd == "config":
 		m.appendLine("info", fmt.Sprintf("连接: %s · 模型: %s · 最大步数: %d", m.statusLine, m.title, m.maxSteps), text)
+	case cmd == "sudo":
+		m.appendLine("info", "即将由系统 sudo 验证本机管理员权限；输入内容不会进入 DeepSentry。", "manual sudo validation")
+		m.refreshViewport()
+		return sudoValidationCmd(nil)
 	case cmd == "mcp":
 		m.handleMCPSlash(arg)
 	case cmd == "skill":
@@ -989,16 +1128,72 @@ func (m *AgentModel) handleSlashCommand(text string) tea.Cmd {
 	return nil
 }
 
-func (m *AgentModel) handleMemorySlash(arg string) {
-	store := m.currentMemoryStore()
-	if store == nil {
-		m.appendLine("error", "当前 Agent 没有可用 MemoryStore", arg)
-		return
+func sudoValidationCmd(respCh chan bool) tea.Cmd {
+	return tea.ExecProcess(exec.Command("sudo", "-v"), func(err error) tea.Msg {
+		return sudoAuthResultMsg{respCh: respCh, err: err}
+	})
+}
+
+func restoreTerminalAfterSudoCmd(respCh chan bool, ok bool) tea.Cmd {
+	return tea.Sequence(
+		tea.EnterAltScreen,
+		tea.EnableMouseAllMotion,
+		tea.ClearScreen,
+		func() tea.Msg { return sudoTerminalRestoredMsg{respCh: respCh, ok: ok} },
+	)
+}
+
+func (m *AgentModel) startTSecBenchMode(arg string) tea.Cmd {
+	arg = strings.TrimSpace(arg)
+	if strings.TrimSpace(config.GlobalConfig.BenchmarkBaseURL) == "" || strings.TrimSpace(config.GlobalConfig.BenchmarkToken) == "" {
+		m.appendLine("info", "未检测到完整 TSecBench 配置，Agent 会先引导填写 benchmark_base_url 和 benchmark_token，并通过 config_manage 保存。", "tsecbench missing config")
 	}
+	return m.startNewSession(tsecbenchModePrompt(arg))
+}
+
+func tsecbenchModePrompt(arg string) string {
+	arg = strings.TrimSpace(arg)
+	var b strings.Builder
+	b.WriteString("进入 TSecBench 跑分模式。优先使用内置工具 tsecbench，不要手写 curl。")
+	b.WriteString("先检查 benchmark_base_url/benchmark_token 配置是否存在；如果缺失，询问用户并使用 config_manage 安全写入。")
+	b.WriteString("配置存在后，先调用 tsecbench action=list/status 拉取题目和进度，再根据用户目标选择题目启动容器。")
+	b.WriteString("默认不要获取 hint，不要提交 flag，除非用户明确同意；提交后及时 close 容器释放资源。全程不要明文输出 benchmark_token。")
+	if arg != "" {
+		b.WriteString("用户补充目标：")
+		b.WriteString(arg)
+	}
+	return b.String()
+}
+
+func (m *AgentModel) handleMemorySlash(arg string) {
 	fields := strings.Fields(arg)
 	action := "list"
 	if len(fields) > 0 {
 		action = strings.ToLower(fields[0])
+	}
+	if action == "clues" || action == "clue" {
+		state := m.currentAgentState()
+		if state == nil {
+			m.appendLine("error", "当前 Agent 没有可用会话状态", arg)
+			return
+		}
+		if len(fields) > 1 && strings.EqualFold(fields[1], "clear") {
+			state.ReplaceCoreClues(nil)
+			m.appendLine("result", "已清空当前会话核心线索板（不会删除跨会话 Memory）", arg)
+			return
+		}
+		prompt := strings.TrimSpace(state.CoreCluesPrompt(12000))
+		if prompt == "" {
+			m.appendLine("info", "当前会话尚未提取到核心线索", arg)
+			return
+		}
+		m.appendLine("result", prompt, prompt)
+		return
+	}
+	store := m.currentMemoryStore()
+	if store == nil {
+		m.appendLine("error", "当前 Agent 没有可用 MemoryStore", arg)
+		return
 	}
 	switch action {
 	case "list", "status", "ls":
@@ -1024,7 +1219,7 @@ func (m *AgentModel) handleMemorySlash(arg string) {
 		}
 		m.appendLine("result", fmt.Sprintf("已清空结构化 Memory（范围: %s，删除 %d 条）", scope, n), arg)
 	default:
-		m.appendLine("info", "用法: /memory list | /memory clear [all|target|global]", arg)
+		m.appendLine("info", "用法: /memory list | /memory clues [clear] | /memory clear [all|target|global]", arg)
 	}
 }
 
@@ -1059,6 +1254,13 @@ func (m *AgentModel) currentMemoryStore() *memory.Store {
 		return nil
 	}
 	return m.ctrl.cfg.Agent.MemoryStore
+}
+
+func (m *AgentModel) currentAgentState() *harness.AgentState {
+	if m.ctrl == nil || m.ctrl.cfg.Agent == nil {
+		return nil
+	}
+	return m.ctrl.cfg.Agent.State
 }
 
 func (m *AgentModel) resumeSessionSlash(arg string) tea.Cmd {
@@ -1108,6 +1310,7 @@ func (m *AgentModel) resumeSessionSlash(arg string) tea.Cmd {
 	m.currentTarget = ""
 	m.copyToast = ""
 	m.tokenUsage = tokenStats{}
+	m.trimmedLines = 0
 	m.startupInfo.SessionID = sessionID
 	m.startupInfo.AwaitGoal = false
 	m.startupInfo.StartedAt = time.Now().Format("2006-01-02 15:04:05")
@@ -1117,10 +1320,10 @@ func (m *AgentModel) resumeSessionSlash(arg string) tea.Cmd {
 	cancelInputCursorAnchor()
 
 	m.input.Blur()
-	m.appendLine("info", fmt.Sprintf("已恢复会话 %s (step %d)，开始继续执行。", shortSessionID(sessionID), step), sessionID)
-	if supplement != "" {
-		m.appendLine("user", "用户补充: "+summarizeIfNeeded(supplement), supplement)
+	if m.ctrl.cfg.History != nil {
+		m.restoreConversationHistory(*m.ctrl.cfg.History)
 	}
+	m.appendLine("info", fmt.Sprintf("已恢复会话 %s (step %d)，开始继续执行。", shortSessionID(sessionID), step), sessionID)
 	m.refreshViewport()
 	if m.ctrl.beginRun() {
 		return agentStartCmd(true)
@@ -1335,6 +1538,7 @@ func (m *AgentModel) startNewSession(goal string) tea.Cmd {
 	m.currentTarget = ""
 	m.copyToast = ""
 	m.tokenUsage = tokenStats{}
+	m.trimmedLines = 0
 	m.startupInfo.SessionID = sessionID
 	m.startupInfo.AwaitGoal = !hasGoal
 	m.startupInfo.StartedAt = time.Now().Format("2006-01-02 15:04:05")
@@ -1369,6 +1573,7 @@ func (m *AgentModel) clearView() {
 	m.streamIdx = -1
 	m.cmdOutputGroup = 0
 	m.activeCmdGroup = 0
+	m.trimmedLines = 0
 	m.appendLine("info", "已清空当前视图", "clear")
 	m.refreshViewport()
 }
@@ -1438,21 +1643,60 @@ func isLargePaste(s string) bool {
 	return strings.Contains(s, "\n") || len([]rune(s)) > 300 || runewidth.StringWidth(s) > 300
 }
 
-func (m AgentModel) pendingConfirmActive() bool {
-	return m.pendingConfirm != nil
-}
+// toggleAllCollapsible treats e as a global two-state switch. If anything is
+// collapsed it expands everything; only when everything is already expanded
+// does it collapse everything. Command-output lines in one group count as one
+// logical item, and an active reasoning stream is intentionally left visible.
+func (m *AgentModel) toggleAllCollapsible() (count int, collapsed bool) {
+	seenGroups := make(map[int]struct{})
+	hasCollapsed := false
 
-func (m *AgentModel) toggleLastCollapsible() {
-	for i := len(m.lines) - 1; i >= 0; i-- {
-		if m.lines[i].kind == "cmdout" && m.lines[i].group > 0 {
-			m.toggleCommandOutputGroup(m.lines[i].group)
-			return
-		}
-		if m.lines[i].kind == "subagent_result" || m.lines[i].kind == "stream" {
-			m.lines[i].collapsed = !m.lines[i].collapsed
-			return
+	for i := range m.lines {
+		line := &m.lines[i]
+		switch {
+		case line.kind == "result" && line.raw != "" && line.raw != line.content:
+			count++
+			hasCollapsed = hasCollapsed || line.collapsed
+		case line.kind == "cmdout" && line.group > 0:
+			if _, seen := seenGroups[line.group]; !seen {
+				seenGroups[line.group] = struct{}{}
+				count++
+			}
+			hasCollapsed = hasCollapsed || line.collapsed
+		case line.kind == "subagent_result":
+			count++
+			hasCollapsed = hasCollapsed || line.collapsed
+		case line.kind == "stream" && line.settled:
+			count++
+			hasCollapsed = hasCollapsed || line.collapsed
 		}
 	}
+
+	if count == 0 {
+		return 0, false
+	}
+
+	collapsed = !hasCollapsed
+	for i := range m.lines {
+		line := &m.lines[i]
+		switch {
+		case line.kind == "result" && line.raw != "" && line.raw != line.content:
+			line.collapsed = collapsed
+		case line.kind == "cmdout" && line.group > 0:
+			line.collapsed = collapsed
+		case line.kind == "subagent_result":
+			line.collapsed = collapsed
+		case line.kind == "stream" && line.settled:
+			line.collapsed = collapsed
+		}
+	}
+	return count, collapsed
+}
+
+// toggleLastCollapsible is retained for package-level compatibility. The UI
+// now deliberately applies the global toggle behavior to every collapsible.
+func (m *AgentModel) toggleLastCollapsible() {
+	m.toggleAllCollapsible()
 }
 
 func (m *AgentModel) lastStreamLineID() int {
@@ -1462,6 +1706,30 @@ func (m *AgentModel) lastStreamLineID() int {
 		}
 	}
 	return 0
+}
+
+func settlesCompletedStream(kind harness.EventKind) bool {
+	switch kind {
+	case harness.EventStepStart, harness.EventThought, harness.EventAction, harness.EventResult,
+		harness.EventError, harness.EventFinish, harness.EventCheckpoint, harness.EventAwaitUser,
+		harness.EventSubAgentStart, harness.EventSubAgentStep, harness.EventSubAgentAction,
+		harness.EventSubAgentResult, harness.EventTargetStatus:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *AgentModel) settleCompletedStreams() {
+	for i := len(m.lines) - 1; i >= 0; i-- {
+		if m.lines[i].kind != "stream" {
+			continue
+		}
+		if m.lines[i].complete {
+			m.lines[i].settled = true
+		}
+		return
+	}
 }
 
 func (m *AgentModel) collapseCommandOutputGroup(group int) {
@@ -1478,29 +1746,6 @@ func (m *AgentModel) collapseCommandOutputGroup(group int) {
 			} else {
 				m.lines[i].groupHead = false
 			}
-		}
-	}
-}
-
-func (m *AgentModel) toggleCommandOutputGroup(group int) {
-	if group <= 0 {
-		return
-	}
-	collapsed := false
-	found := false
-	for _, line := range m.lines {
-		if line.kind == "cmdout" && line.group == group {
-			collapsed = line.collapsed
-			found = true
-			break
-		}
-	}
-	if !found {
-		return
-	}
-	for i := range m.lines {
-		if m.lines[i].kind == "cmdout" && m.lines[i].group == group {
-			m.lines[i].collapsed = !collapsed
 		}
 	}
 }
@@ -1608,12 +1853,10 @@ func (m *AgentModel) applyEvent(e harness.UIEvent) {
 		if strings.Contains(e.Detail, "子 Agent") || strings.Contains(e.Message, "子 Agent") {
 			m.appendLine("subagent_result", truncateLines(e.Message, 3), e.Detail)
 		} else {
-			m.appendLine("result", e.Message, e.Detail)
+			m.appendResultLine(e.Message, e.Detail)
 		}
 	case harness.EventCommandOutput:
-		if strings.TrimSpace(e.Message) != "" {
-			m.appendCommandOutputLine(strings.TrimRight(e.Message, "\r\n"), e.Message)
-		}
+		m.appendCommandOutput(e.Message)
 	case harness.EventError, harness.EventCheckpoint:
 		m.appendLine("error", e.Message, e.Message)
 	case harness.EventAwaitUser:
@@ -1688,7 +1931,7 @@ func (m *AgentModel) appendStreamDelta(delta string) {
 	}
 	if m.streamIdx < 0 || m.streamIdx >= len(m.lines) {
 		m.lineID++
-		m.lines = append(m.lines, logLine{kind: "stream", content: streamDisplay(delta, false), raw: delta, id: m.lineID, at: time.Now()})
+		m.lines = append(m.lines, logLine{kind: "stream", content: streamDisplay(delta, false), raw: delta, step: m.currentStep, id: m.lineID, at: time.Now()})
 		m.streamIdx = len(m.lines) - 1
 	} else {
 		ln := &m.lines[m.streamIdx]
@@ -1704,13 +1947,14 @@ func (m *AgentModel) finalizeStream(full string) {
 			ln.raw = full
 		}
 		ln.content = streamDisplay(ln.raw, true)
+		ln.complete = true
 	}
 	m.streamIdx = -1
 }
 
 func (m *AgentModel) collapseStreamLine(id int) {
 	for i := range m.lines {
-		if m.lines[i].id == id && m.lines[i].kind == "stream" {
+		if m.lines[i].id == id && m.lines[i].kind == "stream" && m.lines[i].settled {
 			m.lines[i].collapsed = true
 			return
 		}
@@ -1829,10 +2073,130 @@ func extractJSONStringField(raw, field string) string {
 
 func (m *AgentModel) appendLine(kind, display, raw string) {
 	m.lineID++
-	m.lines = append(m.lines, logLine{kind: kind, content: display, raw: raw, id: m.lineID, collapsed: kind == "subagent_result", at: time.Now()})
-	if len(m.lines) > 500 {
-		m.lines = m.lines[len(m.lines)-500:]
+	m.lines = append(m.lines, logLine{kind: kind, content: display, raw: raw, step: m.currentStep, id: m.lineID, collapsed: kind == "subagent_result", at: time.Now()})
+	m.trimLogLines()
+}
+
+func (m *AgentModel) restoreConversationHistory(history []analyzer.Message) {
+	if len(history) == 0 {
+		return
+	}
+	restored := 0
+	for _, message := range history {
+		content := strings.TrimSpace(message.Content)
+		switch message.Role {
+		case "user":
+			if !isRestorableUserMessage(content) {
+				continue
+			}
+			content = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(content, "需求："), "需求:"))
+			m.appendRestoredLine("user", "You: "+summarizeIfNeeded(content), content)
+			restored++
+		case "assistant":
+			var action harness.AgentAction
+			if json.Unmarshal([]byte(content), &action) != nil {
+				continue
+			}
+			switch {
+			case action.Type == harness.ActionFinish || action.IsFinished:
+				report := strings.TrimSpace(action.FinalReport)
+				if report == "" {
+					report = strings.TrimSpace(action.Thought)
+				}
+				if report != "" {
+					m.appendRestoredLine("success", report, report)
+					restored++
+				}
+			case action.Type == harness.ActionAskUser && strings.TrimSpace(action.Question) != "":
+				prompt := renderAskPrompt(action.Question, action.Options)
+				m.appendRestoredLine("ask", prompt, action.Question)
+				restored++
+			}
+		}
+	}
+	if restored > 0 {
+		m.lines = append([]logLine{{
+			kind:    "info",
+			content: fmt.Sprintf("↻ 已恢复 %d 条历史对话记录（工具回灌与系统控制消息已隐藏）", restored),
+			raw:     "restored conversation",
+			id:      0,
+		}}, m.lines...)
+	}
+}
+
+func isRestorableUserMessage(content string) bool {
+	if content == "" {
+		return false
+	}
+	for _, prefix := range []string{"Output:", "系统警告:", "【系统】", "上一步执行失败:", "用户拒绝执行"} {
+		if strings.HasPrefix(content, prefix) {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *AgentModel) appendRestoredLine(kind, display, raw string) {
+	m.lineID++
+	m.lines = append(m.lines, logLine{kind: kind, content: display, raw: raw, id: m.lineID})
+	m.trimLogLines()
+}
+
+func (m *AgentModel) trimLogLines() {
+	const maxLogLines = 1000
+	if len(m.lines) <= maxLogLines {
+		return
+	}
+	for len(m.lines) > maxLogLines {
+		removeAt := -1
+		for i := range m.lines {
+			if !preserveConversationLine(m.lines[i].kind) {
+				removeAt = i
+				break
+			}
+		}
+		// User dialogue is more valuable than a strict memory cap. If a very
+		// long session only contains conversational records, keep it intact.
+		if removeAt < 0 {
+			break
+		}
+		m.removeLogLine(removeAt)
+		m.trimmedLines++
+	}
+
+	// Trimming can remove the original head of a command-output group. Mark
+	// the first retained row as its new head so collapse/expand never makes a
+	// long tool result disappear completely.
+	seenGroups := make(map[int]bool)
+	for i := range m.lines {
+		if m.lines[i].kind != "cmdout" || m.lines[i].group <= 0 {
+			continue
+		}
+		m.lines[i].groupHead = !seenGroups[m.lines[i].group]
+		seenGroups[m.lines[i].group] = true
+	}
+}
+
+func preserveConversationLine(kind string) bool {
+	switch kind {
+	case "user", "ask", "success", "error", "confirm_result":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *AgentModel) removeLogLine(index int) {
+	if index < 0 || index >= len(m.lines) {
+		return
+	}
+	copy(m.lines[index:], m.lines[index+1:])
+	m.lines = m.lines[:len(m.lines)-1]
+	switch {
+	case m.streamIdx == index:
 		m.streamIdx = -1
+	case m.streamIdx > index:
+		m.streamIdx--
 	}
 }
 
@@ -1857,41 +2221,110 @@ func (m *AgentModel) appendCommandOutputLine(display, raw string) {
 		}
 	}
 	m.lineID++
-	m.lines = append(m.lines, logLine{kind: "cmdout", content: display, raw: raw, id: m.lineID, group: group, groupHead: head, at: time.Now()})
-	if len(m.lines) > 500 {
-		m.lines = m.lines[len(m.lines)-500:]
-		m.streamIdx = -1
+	m.lines = append(m.lines, logLine{kind: "cmdout", content: display, raw: raw, step: m.currentStep, id: m.lineID, group: group, groupHead: head, at: time.Now()})
+	m.trimLogLines()
+}
+
+func (m *AgentModel) appendCommandOutput(raw string) {
+	clean := strings.TrimRight(sanitizeTUIText(raw), "\n")
+	if strings.TrimSpace(clean) == "" {
+		return
+	}
+	for _, line := range strings.Split(clean, "\n") {
+		// Preserve meaningful indentation, but do not fill the viewport with
+		// empty progress frames emitted by interactive CLI tools.
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		m.appendCommandOutputLine(line, line)
+	}
+}
+
+func (m *AgentModel) appendResultLine(display, detail string) {
+	display = strings.TrimSpace(sanitizeTUIText(display))
+	detail = strings.TrimSpace(sanitizeTUIText(detail))
+	if detail == "" {
+		detail = display
+	}
+	m.appendLine("result", display, detail)
+	if detail != display && (strings.Count(detail, "\n") >= 8 || runewidth.StringWidth(detail) > 500) {
+		m.lines[len(m.lines)-1].collapsed = true
 	}
 }
 
 func (m *AgentModel) appendAskLine(prompt string, options []string) {
-	prompt = strings.TrimSpace(prompt)
+	prompt = strings.TrimSpace(sanitizeTUIText(prompt))
 	if prompt == "" {
 		return
 	}
+	rendered := renderAskPrompt(prompt, options)
+	now := time.Now()
+	for i := len(m.lines) - 1; i >= 0; i-- {
+		line := m.lines[i]
+		if line.kind != "ask" || strings.TrimSpace(line.raw) != prompt {
+			continue
+		}
+		sameStep := line.step == m.currentStep
+		recentDuplicate := !line.at.IsZero() && now.Sub(line.at) <= 5*time.Second
+		if !sameStep && !recentDuplicate {
+			continue
+		}
+		// EventAwaitUser and askMsg travel through different queues. Coalesce
+		// them even when a thought event lands between them, then keep the single
+		// question at the end immediately above its answer input.
+		line.content = rendered
+		line.step = m.currentStep
+		m.removeLogLine(i)
+		m.lines = append(m.lines, line)
+		return
+	}
+	m.appendLine("ask", rendered, prompt)
+}
+
+func (m *AgentModel) appendConfirmLine(prompt string) {
+	prompt = strings.TrimSpace(sanitizeTUIText(prompt))
+	if prompt == "" {
+		prompt = "请确认是否执行此操作。"
+	}
 	if len(m.lines) > 0 {
 		last := m.lines[len(m.lines)-1]
-		if last.kind == "ask" && strings.TrimSpace(last.raw) == prompt {
+		if last.kind == "confirm" && strings.TrimSpace(last.raw) == prompt {
 			return
 		}
 	}
-	m.appendLine("ask", renderAskPrompt(prompt, options), prompt)
+	m.appendLine("confirm", prompt, prompt)
+}
+
+func (m *AgentModel) resolveLastConfirm(approved bool) {
+	for i := len(m.lines) - 1; i >= 0; i-- {
+		if m.lines[i].kind != "confirm" {
+			continue
+		}
+		m.lines[i].kind = "confirm_result"
+		m.lines[i].content = "✗ 已拒绝高风险操作"
+		if approved {
+			m.lines[i].content = "✓ 已批准高风险操作"
+		}
+		return
+	}
 }
 
 func renderAskPrompt(prompt string, options []string) string {
-	prompt = strings.TrimSpace(prompt)
+	prompt = strings.TrimSpace(sanitizeTUIText(prompt))
 	if len(options) == 0 {
 		return prompt
 	}
 	var b strings.Builder
 	b.WriteString(prompt)
+	wroteHeading := false
 	for i, opt := range options {
-		opt = strings.TrimSpace(opt)
+		opt = strings.TrimSpace(sanitizeTUIText(opt))
 		if opt == "" {
 			continue
 		}
-		if i == 0 {
-			b.WriteString("\n")
+		if !wroteHeading {
+			b.WriteString("\n\n### 可选项")
+			wroteHeading = true
 		}
 		b.WriteString(fmt.Sprintf("\n%d. %s", i+1, opt))
 	}
@@ -1901,9 +2334,13 @@ func renderAskPrompt(prompt string, options []string) string {
 func (m *AgentModel) refreshViewport() {
 	shouldStick := m.autoScroll || m.viewport.AtBottom()
 	var b strings.Builder
-	contentW := max(20, m.viewport.Width)
+	contentW := max(4, m.viewport.Width)
 	if !m.startupInfo.isEmpty() {
 		b.WriteString(m.cachedWelcomeBanner(contentW))
+	}
+	if m.trimmedLines > 0 {
+		notice := fmt.Sprintf("… 已精简 %d 条旧工具/思考日志，用户对话、询问和最终结论已保留", m.trimmedLines)
+		b.WriteString(renderWrapped(styleInfo, notice, contentW) + "\n\n")
 	}
 	for _, ln := range m.lines {
 		ts := lineTimestampPlain(ln)
@@ -1917,9 +2354,11 @@ func (m *AgentModel) refreshViewport() {
 		case "stream":
 			body := ln.content
 			if ln.collapsed {
-				body = "AI 思考已完成  [e 展开]"
+				body = "AI 思考已完成  [e 全部展开]"
+			} else if ln.settled && strings.TrimSpace(body) != "" {
+				body += "\n[e 全部折叠]"
 			}
-			b.WriteString(renderWrapped(styleStream, ts+"▸ "+truncateLines(body, 6), contentW) + "\n\n")
+			b.WriteString(renderWrapped(styleStream, ts+"▸ "+body, contentW) + "\n\n")
 		case "todo":
 			b.WriteString(renderWrapped(styleTodoBox, ts+ln.content, contentW) + "\n\n")
 		case "tool":
@@ -1931,11 +2370,24 @@ func (m *AgentModel) refreshViewport() {
 		case "subagent_result":
 			body := ln.raw
 			if ln.collapsed {
-				body = ln.content + "  [e 展开]"
+				body = ln.content + "  [e 全部展开]"
+			} else {
+				body += "\n[e 全部折叠]"
 			}
-			b.WriteString(renderWrapped(styleSubAgentResult, ts+"📦 "+truncateLines(body, 12), contentW) + "\n\n")
+			b.WriteString(renderWrapped(styleSubAgentResult, ts+"📦 "+body, contentW) + "\n\n")
 		case "result":
-			b.WriteString(renderWrapped(styleResult, ts+"└ "+truncateLines(ln.content, 8), contentW) + "\n\n")
+			body := ln.raw
+			if body == "" {
+				body = ln.content
+			}
+			if ln.raw != "" && ln.raw != ln.content {
+				if ln.collapsed {
+					body = ln.content + "  [e 全部展开完整结果]"
+				} else {
+					body += "\n[e 全部折叠]"
+				}
+			}
+			b.WriteString(renderWrapped(styleResult, ts+"└ "+body, contentW) + "\n\n")
 		case "cmdout":
 			if ln.collapsed {
 				if !ln.groupHead {
@@ -1946,12 +2398,20 @@ func (m *AgentModel) refreshViewport() {
 				if first != "" {
 					summary += " · " + truncateStr(first, min(80, contentW/2))
 				}
-				b.WriteString(renderWrapped(styleResult, ts+"└ "+summary+"  [e 展开]", contentW) + "\n\n")
+				b.WriteString(renderWrapped(styleResult, ts+"└ "+summary+"  [e 全部展开]", contentW) + "\n\n")
 			} else {
 				b.WriteString(renderWrapped(styleResult, ts+"└ "+ln.content, contentW) + "\n")
 			}
 		case "ask":
-			b.WriteString(renderWrapped(styleToolBox, ts+"? "+ln.content, contentW) + "\n\n")
+			b.WriteString(renderMarkdownAsk(ln.content, ts, contentW) + "\n\n")
+		case "confirm":
+			b.WriteString(renderMarkdownConfirm(ln.content, ts, contentW) + "\n\n")
+		case "confirm_result":
+			style := styleError
+			if strings.HasPrefix(ln.content, "✓") {
+				style = styleSuccess
+			}
+			b.WriteString(renderWrapped(style, ts+ln.content, contentW) + "\n\n")
 		case "error":
 			b.WriteString(renderWrapped(styleError, ts+"✗ "+ln.content, contentW) + "\n")
 		case "success":
@@ -1979,22 +2439,23 @@ func lineTimestampPlain(ln logLine) string {
 }
 
 func (m AgentModel) renderHeader(w int) string {
-	contentW := max(10, w-2)
-	left := fmt.Sprintf("DeepSentry Agent  │  %s", m.title)
+	contentW := max(1, w-styleHeader.GetHorizontalFrameSize())
+	left := sanitizeTUIText(fmt.Sprintf("DeepSentry Agent  │  %s", m.title))
+	if contentW < 48 {
+		return styleHeader.Width(w).Render(runewidth.Truncate(left, contentW, "…"))
+	}
 	rightMax := max(18, contentW/2)
 	if contentW >= 100 {
 		rightMax = min(contentW-24, (contentW*2)/3)
 	}
-	right := m.headerStatsText(rightMax)
+	right := sanitizeTUIText(m.headerStatsText(rightMax))
 	if right == "" {
 		return styleHeader.Width(w).Render(runewidth.Truncate(left, contentW, "…"))
 	}
 
 	right = runewidth.Truncate(right, rightMax, "…")
 	leftW := contentW - lipgloss.Width(right) - 1
-	if leftW < 12 {
-		leftW = 12
-	}
+	leftW = max(1, leftW)
 	left = runewidth.Truncate(left, leftW, "…")
 	gap := contentW - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
@@ -2140,12 +2601,17 @@ func (m AgentModel) View() string {
 	if h <= 0 {
 		h = 24
 	}
+	renderW := TerminalRenderWidth(w)
+	if w < 8 || h < 6 {
+		text := runewidth.Truncate("DeepSentry · 窗口过小", renderW, "")
+		return styleApp.Width(renderW).Height(h).MaxHeight(h).Render(text)
+	}
 	bodyH := m.viewport.Height
 	if bodyH <= 0 {
 		bodyH = max(4, h-6)
 	}
 
-	header := m.renderHeader(w)
+	header := m.renderHeader(renderW)
 	stepInfo := ""
 	if m.currentStep > 0 {
 		stepInfo = fmt.Sprintf("Step %d/%d", m.currentStep, m.maxSteps)
@@ -2160,16 +2626,24 @@ func (m AgentModel) View() string {
 	} else {
 		help = m.footerHelpText()
 	}
-	status := styleStatusBar.Width(w).Render(
-		fmt.Sprintf("%s  │  %s  │  %s  │  %s", m.statusLine, m.statusContextText(), stepInfo, time.Now().Format("15:04:05")),
-	)
+	statusW := max(1, renderW-styleStatusBar.GetHorizontalFrameSize())
+	statusParts := []string{m.statusLine, m.statusContextText()}
+	if stepInfo != "" {
+		statusParts = append(statusParts, stepInfo)
+	}
+	if scroll := m.scrollPositionText(); scroll != "" {
+		statusParts = append(statusParts, scroll)
+	}
+	statusParts = append(statusParts, time.Now().Format("15:04:05"))
+	statusText := strings.Join(statusParts, "  │  ")
+	status := styleStatusBar.Width(renderW).Render(runewidth.Truncate(sanitizeTUIText(statusText), statusW, "…"))
 	body := lipgloss.NewStyle().
-		Width(w).
+		Width(renderW).
 		Height(bodyH).
 		Padding(0, 1).
 		Render(m.viewportView())
 	inputLine := lipgloss.NewStyle().PaddingLeft(1).Render(m.renderInputLine())
-	helpW := ChromeContentWidth(w)
+	helpW := max(1, renderW-2)
 	helpText := runewidth.Truncate(help, helpW, "…")
 	var helpLine string
 	if m.copyToast != "" {
@@ -2184,14 +2658,20 @@ func (m AgentModel) View() string {
 	footerParts = append(footerParts, status, inputLine, helpLine)
 	footer := lipgloss.JoinVertical(lipgloss.Left, footerParts...)
 	main := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
-	if m.pendingConfirm != nil {
-		main = main + "\n" + m.renderConfirm()
-	}
-	return styleApp.Width(w).Height(h).Render(main)
+	return styleApp.Width(renderW).Height(h).Render(main)
 }
 
-func (m *AgentModel) renderConfirm() string {
-	return styleConfirmBox.Render(ui.TerminalText("⚠️  需要确认\n\n" + m.pendingConfirm.prompt + "\n\nY 批准 · N 拒绝 · Enter 不执行"))
+func (m AgentModel) scrollPositionText() string {
+	if m.viewport.TotalLineCount() <= m.viewport.VisibleLineCount() {
+		return ""
+	}
+	if m.viewport.YOffset <= 0 {
+		return "滚动 顶部"
+	}
+	if m.viewport.AtBottom() {
+		return "滚动 底部"
+	}
+	return fmt.Sprintf("滚动 %.0f%%", m.viewport.ScrollPercent()*100)
 }
 
 func (m *AgentModel) recalcLayout() {
@@ -2205,9 +2685,9 @@ func (m *AgentModel) recalcLayout() {
 	// header(1) + status(1) + input box(content rows + 2) + help(1) + optional slash suggestions.
 	inputRows := m.inputContentRowCount(ChromeContentWidth(w) - 2)
 	chromeLines := inputRows + 5 + m.slashSuggestionLineCount()
-	m.viewport.Width = max(0, w-2)
-	m.viewport.Height = max(4, h-chromeLines)
-	m.input.Width = ChromeContentWidth(w) - 2
+	m.viewport.Width = max(1, TerminalRenderWidth(w)-2)
+	m.viewport.Height = max(1, h-chromeLines)
+	m.input.Width = clampInputWidth(ChromeContentWidth(w) - 2)
 }
 
 func (m AgentModel) slashSuggestionLineCount() int {
@@ -2220,18 +2700,18 @@ func (m AgentModel) slashSuggestionLineCount() int {
 
 func (m AgentModel) footerHelpText() string {
 	if m.pendingAsk != nil {
-		return "输入补充内容或选项编号 · Enter 继续 · Shift+Enter 换行 · Ctrl+U 清空"
+		return "输入补充内容或选项编号 · Enter 继续 · PgUp 翻阅 · Ctrl+Home 顶部 · Ctrl+End 底部"
 	}
 	if m.inputFocused() {
 		if m.running {
 			return "Esc 中断任务 · Enter 发送 · Shift+Enter 换行 · ↑↓ 历史 · Ctrl+U 清空 · Esc 退出输入 · Tab 浏览"
 		}
-		return "Enter 发送 · Shift+Enter 换行 · ↑↓ 历史 · Ctrl+U 清空 · Ctrl+L 清屏 · Esc 退出输入 · Tab 浏览 · /help 命令"
+		return "Enter 发送 · Shift+Enter 换行 · ↑↓ 历史 · PgUp 翻阅 · Ctrl+Home 顶部 · Ctrl+End 底部 · Esc 退出输入 · /help"
 	}
 	if m.running {
-		return "Tab 输入新指令并 Enter 可中途打断 · Esc 停止 · 鼠标拖选 · ↑↓/jk 滚动 · e 展开 · Y/N 确认"
+		return "Tab 输入新指令并 Enter 可中途打断 · Esc 停止 · ↑↓/jk 滚动 · g/Home 顶部 · G 底部 · e 全展/全折 · Y/N 确认"
 	}
-	return "Tab 输入 · 鼠标拖选 · Ctrl+C 复制 · ↑↓/jk 滚动 · PgUp/PgDn · e 展开 · G 底部 · Ctrl+L 清屏 · q 退出 · /help"
+	return "Tab 输入 · 鼠标拖选 · Ctrl+C 复制 · ↑↓/jk 滚动 · g/Home 顶部 · G 底部 · e 全展/全折 · q 退出 · /help"
 }
 
 func (m AgentModel) inputHintText() string {
@@ -2271,7 +2751,7 @@ func (m AgentModel) renderInputLine() string {
 	m.input.Width = innerW
 	m.input.Placeholder = m.inputPlaceholderText()
 
-	rows := []string{}
+	var rows []string
 	switch {
 	case m.inputFocused():
 		rows, _, _ = m.focusedInputRows(innerW)
@@ -2301,8 +2781,16 @@ func (m AgentModel) renderInputLine() string {
 
 func (m AgentModel) visibleSlashSuggestions() []slashCommand {
 	suggestions := m.slashSuggestions()
-	if len(suggestions) > 5 {
-		return suggestions[:5]
+	limit := 5
+	if m.height > 0 {
+		// Keep at least one viewport row plus header/status/input/help chrome.
+		limit = min(limit, max(0, m.height-11))
+	}
+	if limit == 0 {
+		return nil
+	}
+	if len(suggestions) > limit {
+		return suggestions[:limit]
 	}
 	return suggestions
 }
@@ -2473,6 +2961,9 @@ func (m AgentModel) inputCursorAnchor() (row, col int, ok bool) {
 	if h <= 0 {
 		h = 24
 	}
+	if w < 8 || h < 6 {
+		return 0, 0, false
+	}
 	bodyH := m.viewport.Height
 	if bodyH <= 0 {
 		bodyH = max(4, h-6)
@@ -2489,27 +2980,6 @@ func (m AgentModel) inputCursorAnchor() (row, col int, ok bool) {
 	row = 1 + bodyH + m.slashSuggestionLineCount() + 1 + 1 + cursorRow + 1
 	col = 1 + 1 + cursorCol + 1
 	return row, col, true
-}
-
-func (m AgentModel) scheduleInputCursorAnchor() {
-	if !term.IsTerminal(int(os.Stdout.Fd())) {
-		return
-	}
-	row, col, ok := m.inputCursorAnchor()
-	if !ok {
-		cancelInputCursorAnchor()
-		return
-	}
-	seq := inputCursorAnchorSeq.Add(1)
-	go func() {
-		for _, d := range []time.Duration{4 * time.Millisecond, 16 * time.Millisecond, 36 * time.Millisecond} {
-			time.Sleep(d)
-			if inputCursorAnchorSeq.Load() != seq {
-				return
-			}
-			fmt.Fprintf(os.Stdout, "\x1b[%d;%dH", row, col)
-		}
-	}()
 }
 
 func clampInputWidth(w int) int {
@@ -2571,10 +3041,13 @@ func truncateLines(s string, maxLines int) string {
 
 func truncateStr(s string, n int) string {
 	s = strings.TrimSpace(s)
-	if runewidth.StringWidth(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	if displayWidth(s) <= n {
 		return s
 	}
-	return runewidth.Truncate(s, n, "...")
+	return truncateDisplay(s, n, "…")
 }
 
 func pasteSummary(s string) string {
@@ -2598,13 +3071,13 @@ func renderWrapped(style lipgloss.Style, text string, width int) string {
 	if width <= 0 {
 		width = 80
 	}
-	text = ui.TerminalText(text)
+	text = sanitizeTUIText(ui.TerminalText(text))
 	innerW := width - style.GetHorizontalFrameSize()
 	if innerW < 1 {
 		innerW = 1
 	}
 	wrapped := wrapDisplay(text, innerW)
-	return style.Width(innerW).Render(wrapped)
+	return style.Width(styleRenderWidth(style, width)).Render(wrapped)
 }
 
 func wrapDisplay(s string, width int) string {
@@ -2613,7 +3086,7 @@ func wrapDisplay(s string, width int) string {
 	}
 	parts := strings.Split(s, "\n")
 	for i, part := range parts {
-		parts[i] = runewidth.Wrap(part, width)
+		parts[i] = wrapDisplayClusters(part, width)
 	}
 	return strings.Join(parts, "\n")
 }

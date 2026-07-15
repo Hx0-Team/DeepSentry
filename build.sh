@@ -1,36 +1,24 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # DeepSentry 一键交叉编译
 
-set -e
+set -euo pipefail
 
 APP_NAME="deepsentry"
 OUTPUT_DIR="build"
-APP_VERSION="2.0"
+APP_VERSION="$(tr -d '[:space:]' < VERSION)"
 BUILD_TIME="$(date '+%Y-%m-%d')"
 LDFLAGS="-s -w -X 'ai-edr/internal/ui.Version=${APP_VERSION}' -X 'ai-edr/internal/ui.BuildTime=${BUILD_TIME}'"
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-echo "🧹 清理旧产物（保留 config.yaml / reports / .env）..."
-PRESERVE_DIR=$(mktemp -d)
-if [[ -d "$OUTPUT_DIR" ]]; then
-  for item in config.yaml reports .env; do
-    [[ -e "$OUTPUT_DIR/$item" ]] && cp -a "$OUTPUT_DIR/$item" "$PRESERVE_DIR/"
-  done
-fi
-rm -rf "$OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR/bin"
-if [[ -d "$PRESERVE_DIR" ]]; then
-  for item in config.yaml reports .env; do
-    [[ -e "$PRESERVE_DIR/$item" ]] && cp -a "$PRESERVE_DIR/$item" "$OUTPUT_DIR/"
-  done
-  rm -rf "$PRESERVE_DIR"
-fi
+STAGING="$(mktemp -d "${TMPDIR:-/tmp}/deepsentry-build.XXXXXX")"
+trap 'rm -rf "$STAGING"' EXIT
+mkdir -p "$STAGING/bin" "$OUTPUT_DIR/bin"
 
 build_main() {
   local goos=$1 goarch=$2
-  local out="$OUTPUT_DIR/${APP_NAME}-${goos}-${goarch}"
+  local out="$STAGING/${APP_NAME}-${goos}-${goarch}"
   [[ "$goos" == "windows" ]] && out="${out}.exe"
 
   echo "🔨 $goos/$goarch → $(basename "$out")"
@@ -48,7 +36,7 @@ build_main() {
 build_aux() {
   local name=$1 pkg=$2
   local goos=$3 goarch=$4
-  local out="$OUTPUT_DIR/bin/${name}-${goos}-${goarch}"
+  local out="$STAGING/bin/${name}-${goos}-${goarch}"
   [[ "$goos" == "windows" ]] && out="${out}.exe"
   env CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch \
     go build -ldflags "$LDFLAGS" -o "$out" "$pkg"
@@ -79,13 +67,34 @@ build_aux benchmark ./cmd/benchmark/main.go "$HOST_OS" "$HOST_ARCH"
 build_aux smoke ./cmd/smoke/main.go "$HOST_OS" "$HOST_ARCH"
 build_aux toolsmoke ./cmd/toolsmoke/main.go "$HOST_OS" "$HOST_ARCH"
 
-# 本机快捷名称（避免记 darwin-arm64 等后缀）
-cp "$OUTPUT_DIR/${APP_NAME}-${HOST_OS}-${HOST_ARCH}"* "$OUTPUT_DIR/bin/deepsentry" 2>/dev/null || \
-  cp "$OUTPUT_DIR/${APP_NAME}-${HOST_OS}-${HOST_ARCH}.exe" "$OUTPUT_DIR/bin/deepsentry.exe" 2>/dev/null || true
-cp "$OUTPUT_DIR/${APP_NAME}-${HOST_OS}-${HOST_ARCH}"* "$OUTPUT_DIR/deepsentry" 2>/dev/null || \
-  cp "$OUTPUT_DIR/${APP_NAME}-${HOST_OS}-${HOST_ARCH}.exe" "$OUTPUT_DIR/deepsentry.exe" 2>/dev/null || true
-cp "$OUTPUT_DIR/${APP_NAME}-${HOST_OS}-${HOST_ARCH}"* "$ROOT/deepsentry" 2>/dev/null || \
-  cp "$OUTPUT_DIR/${APP_NAME}-${HOST_OS}-${HOST_ARCH}.exe" "$ROOT/deepsentry.exe" 2>/dev/null || true
+# 只替换构建脚本拥有的已知产物；build/ 下的配置副本、报告和用户文件不删除。
+find "$OUTPUT_DIR" -maxdepth 1 -type f \( -name 'deepsentry-*-*' -o -name 'deepsentry-*-*.exe' -o -name 'deepsentry' -o -name 'deepsentry.exe' \) -delete
+find "$OUTPUT_DIR/bin" -maxdepth 1 -type f \( -name 'deepsentry' -o -name 'deepsentry.exe' -o -name 'benchmark-*' -o -name 'smoke-*' -o -name 'toolsmoke-*' \) -delete
+cp "$STAGING"/deepsentry-* "$OUTPUT_DIR/"
+cp "$STAGING"/bin/* "$OUTPUT_DIR/bin/"
+
+HOST_BINARY="$STAGING/${APP_NAME}-${HOST_OS}-${HOST_ARCH}"
+HOST_ALIAS="$OUTPUT_DIR/bin/deepsentry"
+ROOT_ALIAS="$ROOT/deepsentry"
+if [[ "$HOST_OS" == "windows" ]]; then
+  HOST_BINARY="${HOST_BINARY}.exe"
+  HOST_ALIAS="${HOST_ALIAS}.exe"
+  ROOT_ALIAS="${ROOT_ALIAS}.exe"
+fi
+cp "$HOST_BINARY" "$HOST_ALIAS"
+cp "$HOST_BINARY" "$OUTPUT_DIR/$(basename "$HOST_ALIAS")"
+cp "$HOST_BINARY" "$ROOT_ALIAS"
+
+# 配置与环境文件可能含密钥。既不删除也不打包，只收紧现有文件权限。
+find "$OUTPUT_DIR" -maxdepth 1 -type f \( -iname 'config*.yaml' -o -name '.env' \) -exec chmod 600 {} +
+
+# 校验文件只覆盖本次生成的二进制，供发布页和离线安装核验。
+(
+  cd "$OUTPUT_DIR"
+  find . -maxdepth 2 -type f \( -name 'deepsentry*' -o -name 'benchmark-*' -o -name 'smoke-*' -o -name 'toolsmoke-*' \) -print0 \
+    | sort -z \
+    | xargs -0 shasum -a 256
+) > "$OUTPUT_DIR/SHA256SUMS"
 
 echo "------------------------------------------"
 echo "✅ 编译完成"

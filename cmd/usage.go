@@ -25,6 +25,7 @@ DeepSentry — AI 安全应急 Agent
   deepsentry --init                         # 重新运行配置向导
 
   deepsentry --tui --pick-session              # TUI 选择恢复会话
+  # TUI 内输入 /tsecbench 可进入 TSecBench 跑分模式
   go run ./cmd/benchmark/ -c config.yaml --tui # Benchmark 可视化
 
 选项:

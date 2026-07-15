@@ -89,7 +89,7 @@ func (s *StdoutSink) Emit(e UIEvent) {
 		}
 	case EventAction:
 		if e.Action != nil {
-			printActionStdout(*e.Action)
+			printActionStdout(RedactedAction(*e.Action))
 		} else if e.Message != "" {
 			fmt.Println(ui.TerminalText(e.Message))
 		}
@@ -142,7 +142,7 @@ func (s *StdoutSink) Emit(e UIEvent) {
 	case EventSubAgentAction:
 		if e.Action != nil {
 			fmt.Print("   子 Agent ")
-			printActionStdout(*e.Action)
+			printActionStdout(RedactedAction(*e.Action))
 		} else if e.Message != "" {
 			fmt.Printf("   子 Agent 动作: %s\n", ui.TerminalText(e.Message))
 		}
@@ -173,106 +173,6 @@ func formatTargetSuffix(name, proto, host string) string {
 		return fmt.Sprintf(" @ %s (%s)", label, proto)
 	}
 	return fmt.Sprintf(" @ %s", label)
-}
-
-func streamDisplay(raw string, done bool) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		if done {
-			return "AI 思考完成"
-		}
-		return "AI 正在思考..."
-	}
-
-	var action AgentAction
-	if err := json.Unmarshal([]byte(raw), &action); err == nil {
-		if strings.TrimSpace(action.Thought) != "" {
-			return "思考: " + action.Thought
-		}
-		switch action.Type {
-		case ActionFinish:
-			if strings.TrimSpace(action.FinalReport) != "" {
-				return "正在整理最终报告..."
-			}
-			return "准备完成任务..."
-		case ActionExecute:
-			if action.Command != "" {
-				return "准备执行 Shell: " + action.Command
-			}
-		case ActionTool:
-			if action.ToolName != "" {
-				return "准备调用工具: " + action.ToolName
-			}
-		case ActionTask:
-			if action.TaskName != "" {
-				return "准备委派子 Agent: " + action.TaskName
-			}
-		case ActionTodo:
-			return "正在更新任务清单..."
-		case ActionAskUser:
-			return "需要用户补充信息..."
-		case ActionReadFile:
-			return "准备读取文件: " + action.Path
-		case ActionGrep:
-			return "准备搜索: " + action.Pattern
-		case ActionLS:
-			return "准备列目录: " + action.Path
-		}
-	}
-
-	if thought := extractJSONStringField(raw, "thought"); thought != "" {
-		return "思考: " + thought
-	}
-	if finalReport := extractJSONStringField(raw, "final_report"); finalReport != "" {
-		return "正在整理最终报告..."
-	}
-	if action := extractJSONStringField(raw, "action"); action != "" {
-		return "正在生成动作: " + action
-	}
-	if done {
-		return "AI 思考完成"
-	}
-	return "AI 正在思考..."
-}
-
-func extractJSONStringField(raw, field string) string {
-	marker := `"` + field + `":`
-	idx := strings.Index(raw, marker)
-	if idx < 0 {
-		return ""
-	}
-	rest := strings.TrimSpace(raw[idx+len(marker):])
-	if !strings.HasPrefix(rest, `"`) {
-		return ""
-	}
-	rest = rest[1:]
-	var b strings.Builder
-	escaped := false
-	for _, r := range rest {
-		if escaped {
-			switch r {
-			case 'n':
-				b.WriteRune('\n')
-			case 't':
-				b.WriteRune('\t')
-			case 'r':
-				b.WriteRune('\r')
-			default:
-				b.WriteRune(r)
-			}
-			escaped = false
-			continue
-		}
-		if r == '\\' {
-			escaped = true
-			continue
-		}
-		if r == '"' {
-			break
-		}
-		b.WriteRune(r)
-	}
-	return strings.TrimSpace(b.String())
 }
 
 // JSONSink 输出 JSONL 事件，便于 agent/CI 消费。

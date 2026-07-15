@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,16 +30,19 @@ func ManageConfig(args map[string]string) (string, error) {
 	path := resolveConfigPath(firstConfigArg(args, "config_path", "config_file"))
 
 	switch action {
-	case "status", "show", "show_config":
+	case "status", "show", "show_config", "view", "list", "overview":
 		return configStatus(path)
-	case "get", "read", "get_config", "read_config":
+	case "get", "read", "get_config", "read_config", "export":
 		return configGet(path, args)
 	case "validate":
-		_, _, err := loadConfigNode(path)
+		doc, _, err := loadConfigNode(path)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("[OK] 配置 YAML 校验通过: %s", path), nil
+		if err := validateConfigNode(doc); err != nil {
+			return "", fmt.Errorf("配置校验失败: %w", err)
+		}
+		return fmt.Sprintf("[OK] 配置 YAML 与运行时语义校验通过: %s", path), nil
 	case "backup":
 		backupPath, err := backupConfig(path)
 		if err != nil {
@@ -88,6 +93,9 @@ func ManageConfig(args map[string]string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := validateConfigNode(doc); err != nil {
+		return "", fmt.Errorf("变更后的配置无效，未写入: %w", err)
+	}
 
 	backupPath := "(新建配置，无旧文件)"
 	if existed {
@@ -121,6 +129,38 @@ func configStatus(path string) (string, error) {
 	b.WriteString(fmt.Sprintf("mcp_servers: %s\n", strings.Join(readScalarSeq(root, "mcp_servers"), ", ")))
 	b.WriteString(fmt.Sprintf("mcp_server_configs: %s\n", strings.Join(readMCPServerConfigSummaries(root), ", ")))
 	b.WriteString(fmt.Sprintf("targets: %d 个\n", len(readTargets(root))))
+	configured := GlobalConfig
+	if provider := readScalar(root, "provider"); provider != "" {
+		configured.Provider = provider
+	}
+	if apiURL := readScalar(root, "api_url"); apiURL != "" {
+		configured.ApiURL = apiURL
+	}
+	if model := readScalar(root, "model_name"); model != "" {
+		configured.ModelName = model
+	}
+	if profile := readScalar(root, "model_profile"); profile != "" {
+		configured.ModelProfile = profile
+	}
+	if raw := readScalar(root, "context_window_tokens"); raw != "" {
+		configured.ContextWindowTokens, _ = strconv.Atoi(raw)
+	}
+	if raw := readScalar(root, "model_parameter_b"); raw != "" {
+		configured.ModelParameterB, _ = strconv.ParseFloat(raw, 64)
+	}
+	if raw := readScalar(root, "context_utilization"); raw != "" {
+		configured.ContextUtilization, _ = strconv.ParseFloat(raw, 64)
+	}
+	if raw := readScalar(root, "reserved_output_tokens"); raw != "" {
+		configured.ReservedOutputTokens, _ = strconv.Atoi(raw)
+	}
+	if raw := readScalar(root, "native_tool_limit"); raw != "" {
+		configured.NativeToolLimit, _ = strconv.Atoi(raw)
+	}
+	capabilities := configured.EffectiveModelCapabilities()
+	b.WriteString(fmt.Sprintf("model_adaptation: profile=%s, context=%d, output_reserve=%d, native_tool_limit=%d, source=%s\n",
+		capabilities.PromptProfile, capabilities.ContextWindowTokens, capabilities.ReservedOutputTokens,
+		capabilities.NativeToolLimit, capabilities.DetectionSource))
 	if host := readScalar(root, "ssh_host"); host != "" && readScalar(root, "target_protocol") != "local" {
 		b.WriteString(fmt.Sprintf("single ssh: %s@%s\n", valueOr(readScalar(root, "ssh_user"), "root"), host))
 	}
@@ -329,6 +369,11 @@ func manageAddTarget(root *yaml.Node, args map[string]string) (string, error) {
 		return "", fmt.Errorf("host 不能为空")
 	}
 	protocol := strings.ToLower(valueOr(firstConfigArg(args, "protocol"), "ssh"))
+	var err error
+	host, err = normalizeManagedEndpoint(protocol, host, firstConfigArg(args, "port"))
+	if err != nil {
+		return "", err
+	}
 	name := firstConfigArg(args, "name")
 	if name == "" {
 		name = defaultTargetName(protocol, host)
@@ -345,6 +390,11 @@ func manageEnableFleet(root *yaml.Node, args map[string]string) (string, error) 
 	}
 	if host := firstConfigArg(args, "host", "ssh_host", "addr", "address"); host != "" {
 		protocol := strings.ToLower(valueOr(firstConfigArg(args, "protocol"), "ssh"))
+		normalizedHost, err := normalizeManagedEndpoint(protocol, host, firstConfigArg(args, "port"))
+		if err != nil {
+			return "", err
+		}
+		host = normalizedHost
 		name := firstConfigArg(args, "name")
 		if name == "" {
 			name = defaultTargetName(protocol, host)
@@ -372,6 +422,11 @@ func manageSetSSH(root *yaml.Node, args map[string]string) (string, error) {
 	if host == "" {
 		return "", fmt.Errorf("host/ssh_host 不能为空")
 	}
+	var err error
+	host, err = normalizeManagedEndpoint("ssh", host, firstConfigArg(args, "port"))
+	if err != nil {
+		return "", err
+	}
 	user := valueOr(firstConfigArg(args, "user", "ssh_user", "username"), "root")
 	password := firstConfigArg(args, "password", "ssh_password", "pass")
 	keyPath := firstConfigArg(args, "key_path", "ssh_key_path", "key")
@@ -392,8 +447,67 @@ func manageSetScalar(root *yaml.Node, args map[string]string) (string, error) {
 	if !allowedScalarConfigKey(key) {
 		return "", fmt.Errorf("不允许通过 set 修改该字段: %s", key)
 	}
+	if err := validateManagedScalar(key, value); err != nil {
+		return "", err
+	}
 	setScalar(root, key, value)
 	return fmt.Sprintf("已设置 %s = %s", key, redactConfigValue(key, value)), nil
+}
+
+func validateManagedScalar(key, value string) error {
+	value = strings.TrimSpace(value)
+	switch key {
+	case "model_profile":
+		switch strings.ToLower(value) {
+		case "auto", ModelProfileCompact, ModelProfileBalanced, ModelProfileFull:
+			return nil
+		default:
+			return fmt.Errorf("model_profile 必须是 auto|compact|balanced|full，收到 %q", value)
+		}
+	case "model_parameter_b":
+		n, err := strconv.ParseFloat(value, 64)
+		if err != nil || n < 0 || n > 1000 {
+			return fmt.Errorf("model_parameter_b 必须是 0-1000 的数字，收到 %q", value)
+		}
+	case "context_window_tokens":
+		n, err := strconv.Atoi(value)
+		if err != nil || (n != 0 && (n < 4096 || n > 4_194_304)) {
+			return fmt.Errorf("context_window_tokens 必须是 0 或 4096-4194304 的整数，收到 %q", value)
+		}
+	case "context_utilization":
+		n, err := strconv.ParseFloat(value, 64)
+		if err != nil || (n != 0 && (n < 0.40 || n > 0.90)) {
+			return fmt.Errorf("context_utilization 必须是 0 或 0.40-0.90，收到 %q", value)
+		}
+	case "reserved_output_tokens":
+		n, err := strconv.Atoi(value)
+		if err != nil || (n != 0 && n < 512) || n > 1_048_576 {
+			return fmt.Errorf("reserved_output_tokens 必须是 0 或 512-1048576 的整数，收到 %q", value)
+		}
+	case "native_tool_limit":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 || n > 1000 {
+			return fmt.Errorf("native_tool_limit 必须是 0-1000 的整数，收到 %q", value)
+		}
+	case "ssh_host_key_policy":
+		switch strings.ToLower(value) {
+		case "strict", "accept-new", "insecure":
+			return nil
+		default:
+			return fmt.Errorf("ssh_host_key_policy 必须是 strict|accept-new|insecure，收到 %q", value)
+		}
+	case "archive_max_entries":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 1_000_000 {
+			return fmt.Errorf("archive_max_entries 必须是 1-1000000 的整数，收到 %q", value)
+		}
+	case "archive_max_file_bytes", "archive_max_total_bytes":
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || n < 1_048_576 || n > 1<<50 {
+			return fmt.Errorf("%s 必须是 1048576-%d 的整数字节，收到 %q", key, int64(1<<50), value)
+		}
+	}
+	return nil
 }
 
 func manageReplaceYAML(path string, args map[string]string) (string, error) {
@@ -409,6 +523,9 @@ func manageReplaceYAML(path string, args map[string]string) (string, error) {
 		return "", fmt.Errorf("新配置根节点必须是 YAML mapping")
 	}
 	ensureConfigRoot(&doc)
+	if err := validateConfigNode(&doc); err != nil {
+		return "", fmt.Errorf("新配置无效，未写入: %w", err)
+	}
 
 	backupPath := "(新建配置，无旧文件)"
 	if _, err := os.Stat(path); err == nil {
@@ -475,20 +592,57 @@ func ensureConfigRoot(doc *yaml.Node) *yaml.Node {
 }
 
 func writeConfigNode(path string, doc *yaml.Node) error {
+	data, err := encodeConfigNode(doc)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("创建配置目录失败: %w", err)
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func encodeConfigNode(doc *yaml.Node) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
 	if err := enc.Encode(doc); err != nil {
 		_ = enc.Close()
-		return fmt.Errorf("编码配置失败: %w", err)
+		return nil, fmt.Errorf("编码配置失败: %w", err)
 	}
 	if err := enc.Close(); err != nil {
-		return fmt.Errorf("编码配置失败: %w", err)
+		return nil, fmt.Errorf("编码配置失败: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("创建配置目录失败: %w", err)
+	return buf.Bytes(), nil
+}
+
+func validateConfigNode(doc *yaml.Node) error {
+	data, err := encodeConfigNode(doc)
+	if err != nil {
+		return err
 	}
-	return os.WriteFile(path, buf.Bytes(), 0o600)
+	reader := viper.New()
+	reader.SetConfigType("yaml")
+	reader.SetDefault("provider", "deepseek")
+	reader.SetDefault("api_protocol", "auto")
+	reader.SetDefault("api_url", "https://api.deepseek.com/v1")
+	reader.SetDefault("model_name", "deepseek-v4-pro")
+	reader.SetDefault("model_profile", "auto")
+	reader.SetDefault("ssh_host_key_policy", "accept-new")
+	reader.SetDefault("ssh_known_hosts_path", "~/.deepsentry/known_hosts")
+	reader.SetDefault("scheduler_timezone", "Local")
+	if err := reader.ReadConfig(bytes.NewReader(data)); err != nil {
+		return fmt.Errorf("解析配置失败: %w", err)
+	}
+	var candidate Config
+	if err := reader.Unmarshal(&candidate); err != nil {
+		return fmt.Errorf("映射配置失败: %w", err)
+	}
+	ApplyProviderDefaults(&candidate)
+	if err := applyRawCaseSensitiveData(data, &candidate); err != nil {
+		return err
+	}
+	return ValidateRuntimeConfig(candidate)
 }
 
 func backupConfig(path string) (string, error) {
@@ -502,6 +656,7 @@ func backupConfig(path string) (string, error) {
 	}
 	name := fmt.Sprintf("config_%s.yaml", time.Now().Format("20060102_150405_000000000"))
 	backupPath := filepath.Join(dir, name)
+	// #nosec G703 -- path 是当前运行时已加载的本机配置，备份文件名由程序固定生成且权限为 0600。
 	if err := os.WriteFile(backupPath, data, 0o600); err != nil {
 		return "", fmt.Errorf("写入备份失败: %w", err)
 	}
@@ -509,15 +664,23 @@ func backupConfig(path string) (string, error) {
 }
 
 func reloadManagedConfig(path string) error {
+	setViperDefaults()
 	viper.SetConfigFile(path)
 	if err := viper.ReadInConfig(); err != nil {
 		return fmt.Errorf("重新读取配置失败: %w", err)
 	}
-	if err := viper.Unmarshal(&GlobalConfig); err != nil {
+	var loaded Config
+	if err := viper.Unmarshal(&loaded); err != nil {
 		return fmt.Errorf("重新解析配置失败: %w", err)
 	}
-	ApplyProviderDefaults(&GlobalConfig)
-	_ = applyRawCaseSensitiveConfig(path, &GlobalConfig)
+	ApplyProviderDefaults(&loaded)
+	if err := applyRawCaseSensitiveConfig(path, &loaded); err != nil {
+		return fmt.Errorf("读取大小写敏感配置失败: %w", err)
+	}
+	if err := ValidateRuntimeConfig(loaded); err != nil {
+		return fmt.Errorf("配置校验失败: %w", err)
+	}
+	GlobalConfig = loaded
 	return nil
 }
 
@@ -813,14 +976,79 @@ func targetNode(t TargetConfig) *yaml.Node {
 func upsertTarget(root *yaml.Node, t TargetConfig) bool {
 	target := targetNode(t)
 	seq := ensureSeq(root, "targets")
-	for i, item := range seq.Content {
-		if readScalar(item, "name") == t.Name || readScalar(item, "host") == t.Host {
-			seq.Content[i] = target
-			return true
+	out := make([]*yaml.Node, 0, len(seq.Content))
+	replaced := false
+	for _, item := range seq.Content {
+		if readScalar(item, "name") == t.Name || sameManagedEndpoint(readScalar(item, "protocol"), readScalar(item, "host"), t.Protocol, t.Host) {
+			if !replaced {
+				out = append(out, target)
+				replaced = true
+			}
+			// Drop later legacy/duplicate matches while preserving unrelated
+			// targets, including the same host on a different explicit port.
+			continue
+		}
+		out = append(out, item)
+	}
+	if replaced {
+		seq.Content = out
+		return true
+	}
+	seq.Content = append(out, target)
+	return false
+}
+
+func normalizeManagedEndpoint(protocol, host, rawPort string) (string, error) {
+	host = strings.TrimSpace(host)
+	rawPort = strings.TrimSpace(rawPort)
+	if host == "" || rawPort == "" {
+		return host, nil
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("port 必须是 1-65535 的整数，收到 %q", rawPort)
+	}
+	if existingHost, existingPort, err := net.SplitHostPort(host); err == nil {
+		if existingPort != rawPort {
+			return "", fmt.Errorf("host 已包含端口 %s，但 port=%s；请只保留一个一致端口", existingPort, rawPort)
+		}
+		return net.JoinHostPort(strings.Trim(existingHost, "[]"), rawPort), nil
+	}
+	trimmedHost := strings.Trim(host, "[]")
+	if strings.Contains(trimmedHost, ":") {
+		return net.JoinHostPort(trimmedHost, rawPort), nil
+	}
+	return net.JoinHostPort(trimmedHost, rawPort), nil
+}
+
+func sameManagedEndpoint(protocolA, hostA, protocolB, hostB string) bool {
+	if !strings.EqualFold(strings.TrimSpace(protocolA), strings.TrimSpace(protocolB)) {
+		return false
+	}
+	hostA = strings.TrimSpace(hostA)
+	hostB = strings.TrimSpace(hostB)
+	if hostA == hostB {
+		return true
+	}
+	baseA, portA := splitManagedEndpoint(hostA)
+	baseB, portB := splitManagedEndpoint(hostB)
+	// A legacy host without an explicit port is the same logical target when
+	// the corrected call adds its port. Two explicit different ports remain
+	// distinct and can coexist intentionally.
+	return strings.EqualFold(baseA, baseB) && (portA == "" || portB == "" || portA == portB)
+}
+
+func splitManagedEndpoint(endpoint string) (string, string) {
+	if host, port, err := net.SplitHostPort(endpoint); err == nil {
+		return strings.Trim(host, "[]"), port
+	}
+	if strings.Count(endpoint, ":") == 1 {
+		parts := strings.SplitN(endpoint, ":", 2)
+		if _, err := strconv.Atoi(parts[1]); err == nil {
+			return parts[0], parts[1]
 		}
 	}
-	seq.Content = append(seq.Content, target)
-	return false
+	return strings.Trim(endpoint, "[]"), ""
 }
 
 func configTargetFromArgs(name, protocol, host string, args map[string]string) TargetConfig {
@@ -979,14 +1207,18 @@ func parseEnvArg(raw string) map[string]string {
 func allowedScalarConfigKey(key string) bool {
 	switch key {
 	case "provider", "api_protocol", "api_url", "model_name", "api_key", "temperature",
+		"model_profile", "model_parameter_b", "context_window_tokens", "context_utilization",
+		"reserved_output_tokens", "native_tool_limit",
 		"llm_timeout_sec", "llm_retries", "ssh_command_timeout_sec", "ssh_max_output_bytes",
 		"max_steps", "subagent_max_steps", "target_protocol", "ssh_host", "ssh_user",
-		"ssh_password", "ssh_key_path", "telnet_host", "telnet_user", "telnet_password",
+		"ssh_password", "ssh_key_path", "ssh_host_key_policy", "ssh_known_hosts_path", "telnet_host", "telnet_user", "telnet_password",
 		"telnet_prompt", "ftp_host", "ftp_user", "ftp_password", "use_native_tools",
 		"controller_proxy", "browser_binary", "browser_timeout_sec", "browser_artifact_dir",
+		"archive_max_entries", "archive_max_file_bytes", "archive_max_total_bytes",
 		"scheduler_enabled", "scheduler_store", "scheduler_interval_sec", "scheduler_timezone",
 		"dingtalk_webhook", "dingtalk_secret", "feishu_webhook", "feishu_secret",
-		"email_gateway_url", "email_gateway_token", "email_gateway_header", "email_to", "email_from":
+		"email_gateway_url", "email_gateway_token", "email_gateway_header", "email_to", "email_from",
+		"benchmark_base_url", "benchmark_token":
 		return true
 	default:
 		return false

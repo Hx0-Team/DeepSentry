@@ -63,3 +63,111 @@ func TestRenderMarkdownHeadingSeparatesEmojiFromText(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderMarkdownHeadingKeepsEmojiGraphemeTogether(t *testing.T) {
+	got := normalizeMarkdownHeadingText("⚠️执行提醒")
+	if got != "⚠️ 执行提醒" {
+		t.Fatalf("emoji cluster should stay intact and be separated from text: %q", got)
+	}
+	if strings.Contains(got, "⚠ ️") {
+		t.Fatalf("variation selector must not be split from its emoji: %q", got)
+	}
+}
+
+func TestRenderMarkdownAskRendersRichQuestionInsideViewport(t *testing.T) {
+	md := strings.Join([]string{
+		"📊 **当前战况：**",
+		"",
+		"| 题目 | 难度 | 状态 |",
+		"|---|---|---|",
+		"| `a-05` | easy | **available** |",
+		"",
+		"请选择下一步：",
+		"1. 启动 a-05",
+		"2. 暂不启动",
+	}, "\n")
+
+	rendered := renderMarkdownAsk(md, "[13:32:27] ", 78)
+	plain := stripANSIForTest(rendered)
+	for _, bad := range []string{"**当前战况：**", "`a-05`", "|---|---|---|"} {
+		if strings.Contains(plain, bad) {
+			t.Fatalf("ask prompt still contains markdown marker %q:\n%s", bad, plain)
+		}
+	}
+	for _, want := range []string{"需要用户补充", "当前战况", "a-05", "available", "1. 启动"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("ask prompt missing %q:\n%s", want, plain)
+		}
+	}
+	for _, line := range strings.Split(rendered, "\n") {
+		if got := lipgloss.Width(line); got > 78 {
+			t.Fatalf("ask line width=%d want <=78: %q", got, line)
+		}
+	}
+}
+
+func TestMarkdownTableFallsBackWithoutOverflowAtNarrowWidth(t *testing.T) {
+	md := "| 题目 | 难度 | 状态 |\n|---|---|---|\n| a-05 | easy | available |"
+	for _, width := range []int{8, 12, 18} {
+		rendered := renderMarkdownBlocks(md, width)
+		for _, line := range strings.Split(rendered, "\n") {
+			if got := lipgloss.Width(line); got > width {
+				t.Fatalf("width=%d rendered line width=%d: %q", width, got, line)
+			}
+		}
+		plain := strings.ReplaceAll(stripANSIForTest(rendered), "\n", "")
+		if !strings.Contains(plain, "a-05") || !strings.Contains(plain, "available") {
+			t.Fatalf("narrow table lost data at width=%d:\n%s", width, plain)
+		}
+	}
+}
+
+func TestMarkdownCodeBlockWrapsWithoutLosingCommand(t *testing.T) {
+	command := "sqlmap --batch --url http://10.0.0.1/item?id=1 --level=5 --risk=3 --tamper=space2comment"
+	rendered := renderMarkdownBlocks("```sh\n"+command+"\n```", 24)
+	plain := strings.ReplaceAll(stripANSIForTest(rendered), "\n", "")
+	if !strings.Contains(plain, command) {
+		t.Fatalf("wrapped code block lost command text:\n%s", stripANSIForTest(rendered))
+	}
+	for _, line := range strings.Split(rendered, "\n") {
+		if got := lipgloss.Width(line); got > 24 {
+			t.Fatalf("wrapped code line width=%d: %q", got, line)
+		}
+	}
+}
+
+func TestMarkdownEmojiTableKeepsColumnsAndPanelBorderAligned(t *testing.T) {
+	t.Setenv("DEEPSENTRY_FANCY", "1")
+	t.Setenv("DEEPSENTRY_PLAIN", "")
+	t.Setenv("TERM", "xterm-256color")
+	md := strings.Join([]string{
+		"🎉 请选择下一步：",
+		"",
+		"| 状态 | 项目 | 说明 |",
+		"|---|---|---|",
+		"| ⚠️ | 执行出错 | 请重试 |",
+		"| ✅ | 已完成 | 正常 |",
+	}, "\n")
+	rendered := renderMarkdownAsk(md, "[16:42:31] ", 52)
+	for _, line := range strings.Split(rendered, "\n") {
+		if got := displayWidth(line); got != 52 {
+			t.Fatalf("emoji panel row is not aligned: width=%d want=52 line=%q", got, line)
+		}
+	}
+	plain := stripANSIForTest(rendered)
+	if !strings.Contains(plain, "⚠️") || !strings.Contains(plain, "执行出错") {
+		t.Fatalf("emoji table lost content:\n%s", plain)
+	}
+}
+
+func TestWrapDisplayDoesNotSplitEmojiPresentationSequence(t *testing.T) {
+	wrapped := wrapDisplay("1234567⚠️执行出错", 8)
+	if strings.Contains(wrapped, "⚠\n️") || strings.Contains(wrapped, "⚠\n") {
+		t.Fatalf("emoji grapheme was split across rows: %q", wrapped)
+	}
+	for _, line := range strings.Split(wrapped, "\n") {
+		if got := displayWidth(line); got > 8 {
+			t.Fatalf("wrapped line width=%d: %q", got, line)
+		}
+	}
+}

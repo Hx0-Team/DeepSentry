@@ -2,9 +2,8 @@ package security
 
 import (
 	"ai-edr/internal/executor"
-	"crypto/md5"
+	"crypto/sha256"
 	"fmt"
-	"regexp"
 	"strings"
 	"sync"
 )
@@ -22,7 +21,7 @@ func RecordApproval(cmd string) {
 	if cmd == "" {
 		return
 	}
-	hash := fmt.Sprintf("%x", md5.Sum([]byte(cmd)))
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(cmd)))
 
 	cacheMutex.Lock()
 	defer cacheMutex.Unlock()
@@ -35,14 +34,12 @@ func isApproved(cmd string) bool {
 	if cmd == "" {
 		return false
 	}
-	hash := fmt.Sprintf("%x", md5.Sum([]byte(cmd)))
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(cmd)))
 
 	cacheMutex.RLock()
 	defer cacheMutex.RUnlock()
 	return approvedCache[hash]
 }
-
-var shellSplitRe = regexp.MustCompile(`\s*(?:&&|\|\||;)\s*`)
 
 // CheckRisk 评估命令的风险等级。
 // 策略尽量贴近 Claude Code 的交互体验：只读观测命令默认放行，明确有副作用的操作才确认。
@@ -75,60 +72,16 @@ func CheckRisk(cmd string) (string, string) {
 	return "low", "只读/低副作用操作"
 }
 
-// CanReviewHighRiskWithAI 判断一条规则命中的高风险命令是否适合交给 LLM 二次复核。
-// 明确破坏、提权、持久化和管道执行脚本的命令仍保持硬拦截；只对容易误判的观测/枚举类命令链开放复核。
+// CanReviewHighRiskWithAI 表示规则引擎判高后是否进入 AI 二次复核。
+// 人工确认采用“双高危”策略：规则高危 + AI 高危才弹窗；
+// AI 明确判低则自动放行，AI 超时/失败/低置信度则失败关闭到人工确认。
 func CanReviewHighRiskWithAI(cmd, reason string) bool {
 	cmd = strings.TrimSpace(cmd)
 	reason = strings.TrimSpace(reason)
 	if cmd == "" || reason == "" {
 		return false
 	}
-	if isApproved(cmd) {
-		return false
-	}
-	if isClearlyDestructive(cmd, reason) {
-		return false
-	}
-	return true
-}
-
-func isClearlyDestructive(cmd, reason string) bool {
-	analyzeCmd := strings.ToLower(normalizeCommand(cmd))
-	reason = strings.ToLower(reason)
-
-	if strings.Contains(reason, "管道执行脚本") {
-		return true
-	}
-
-	hardVerbs := map[string]bool{
-		"rm": true, "del": true, "erase": true, "rmdir": true,
-		"mkfs": true, "format": true, "fdisk": true, "dd": true,
-		"shred": true, "wipe": true, "truncate": true,
-		"reboot": true, "shutdown": true, "halt": true, "poweroff": true, "init": true,
-		"chown": true, "chgrp": true, "useradd": true, "usermod": true, "userdel": true,
-		"passwd": true, "groupadd": true, "groupmod": true, "groupdel": true,
-		"sudo": true, "su": true, "doas": true, "mount": true, "umount": true,
-		"kill": true, "pkill": true, "killall": true, "taskkill": true,
-		"invoke-expression": true, "iex": true,
-	}
-	for _, sub := range splitShellCommands(analyzeCmd) {
-		parts := strings.Fields(sub)
-		if len(parts) == 0 {
-			continue
-		}
-		verb := strings.Trim(strings.ToLower(parts[0]), "\"'")
-		if hardVerbs[verb] {
-			return true
-		}
-	}
-
-	if strings.Contains(analyzeCmd, "| sh") || strings.Contains(analyzeCmd, "| bash") ||
-		strings.Contains(analyzeCmd, "| sudo") || strings.Contains(analyzeCmd, "| powershell") ||
-		strings.Contains(analyzeCmd, "| pwsh") {
-		return true
-	}
-
-	return false
+	return !isApproved(cmd)
 }
 
 func normalizeCommand(cmd string) string {
@@ -164,20 +117,59 @@ func cleanShellWrapper(cmd string) string {
 }
 
 func splitShellCommands(cmd string) []string {
-	raw := shellSplitRe.Split(cmd, -1)
-	out := make([]string, 0, len(raw))
-	for _, part := range raw {
-		part = strings.TrimSpace(part)
-		if part != "" {
+	out := make([]string, 0, 4)
+	var current strings.Builder
+	var quote byte
+	escaped := false
+	flush := func() {
+		if part := strings.TrimSpace(current.String()); part != "" {
 			out = append(out, part)
 		}
+		current.Reset()
 	}
+	for i := 0; i < len(cmd); i++ {
+		ch := cmd[i]
+		if escaped {
+			current.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if ch == '\\' && quote != '\'' {
+			current.WriteByte(ch)
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			current.WriteByte(ch)
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			quote = ch
+			current.WriteByte(ch)
+			continue
+		}
+		ampersandOperator := ch == '&' &&
+			!(i > 0 && cmd[i-1] == '>') &&
+			!(i+1 < len(cmd) && cmd[i+1] == '>')
+		if ch == ';' || ch == '|' || ampersandOperator {
+			flush()
+			if (ch == '|' || ch == '&') && i+1 < len(cmd) && cmd[i+1] == ch {
+				i++
+			}
+			continue
+		}
+		current.WriteByte(ch)
+	}
+	flush()
 	return out
 }
 
 func dangerousShellPattern(cmd string) string {
 	lower := strings.ToLower(cmd)
-	if strings.Contains(cmd, ">") {
+	if hasFileWriteRedirection(cmd) {
 		return "检测到文件重定向，可能覆盖/写入文件"
 	}
 	if strings.Contains(cmd, "|") {
@@ -191,6 +183,50 @@ func dangerousShellPattern(cmd string) string {
 		return "检测到命令替换，需确认真实执行内容"
 	}
 	return ""
+}
+
+// hasFileWriteRedirection 只识别 shell 语法中真正向文件/设备写入的 > / >> / &>。
+// 2>&1、1>&2、>&2 只是复制文件描述符，不会创建或覆盖文件，不应误报。
+// 引号内的 > 是普通文本，同样忽略。
+func hasFileWriteRedirection(cmd string) bool {
+	var quote byte
+	escaped := false
+	for i := 0; i < len(cmd); i++ {
+		ch := cmd[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && quote != '\'' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			quote = ch
+			continue
+		}
+		if ch != '>' {
+			continue
+		}
+		// >&N / >&- 与 2>&1 都是 fd duplication/close，没有文件写入。
+		if i+1 < len(cmd) && cmd[i+1] == '&' {
+			j := i + 2
+			if j < len(cmd) && cmd[j] == '-' {
+				continue
+			}
+			if j < len(cmd) && cmd[j] >= '0' && cmd[j] <= '9' {
+				continue
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // checkSingleCommand 单个命令判定逻辑
@@ -217,7 +253,7 @@ func checkSingleCommand(subCmd string) (string, string) {
 	lowRiskVerbs := map[string]bool{
 		// 浏览与查看
 		"ls": true, "dir": true, "pwd": true, "cd": true,
-		"cat": true, "echo": true, "head": true, "tail": true,
+		"cat": true, "echo": true, "printf": true, "head": true, "tail": true,
 		"more": true, "less": true, "tree": true,
 		"find": true, "grep": true, "findstr": true,
 		"stat": true, "file": true, "where": true, "which": true,
@@ -237,10 +273,10 @@ func checkSingleCommand(subCmd string) (string, string) {
 		"ping": true, "arp": true, "route": true, "nslookup": true, "dig": true,
 		"host": true, "traceroute": true, "tracepath": true, "mtr": true,
 		"wmic": true, "ver": true, "scutil": true, "sw_vers": true,
-		"curl": true, "wget": true,
+		"curl": true,
 
-		// 文件操作 (非破坏性)
-		"mkdir": true, "touch": true, "type": true,
+		// 文件内容查看
+		"type": true,
 
 		"get-childitem": true, "gci": true,
 		"get-content": true, "gc": true,
@@ -258,11 +294,15 @@ func checkSingleCommand(subCmd string) (string, string) {
 		}
 		return "low", "只读/低副作用操作"
 	}
+	if isKnownReadOnlySubcommand(verb, parts[1:]) {
+		return "low", "已知只读子命令"
+	}
 
 	highRiskVerbs := map[string]bool{
 		// 破坏性操作
 		"rm": true, "del": true, "erase": true, "rmdir": true,
 		"mv": true, "move": true, "cp": true, "copy": true,
+		"mkdir": true, "touch": true, "wget": true,
 		"mkfs": true, "format": true, "fdisk": true, "dd": true,
 		"shred": true, "wipe": true, "truncate": true,
 
@@ -290,7 +330,32 @@ func checkSingleCommand(subCmd string) (string, string) {
 		return "high", fmt.Sprintf("敏感指令: %s", verb)
 	}
 
-	return "low", fmt.Sprintf("未识别指令(%s)，未发现写入/破坏/提权特征，按低风险执行", verb)
+	return "high", fmt.Sprintf("未识别指令(%s)，无法静态确认副作用", verb)
+}
+
+func isKnownReadOnlySubcommand(verb string, args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	sub := strings.ToLower(strings.Trim(args[0], "\"'"))
+	if verb == "git" && sub == "remote" && len(args) > 1 {
+		next := strings.ToLower(strings.Trim(args[1], "\"'"))
+		return next == "-v" || next == "--verbose"
+	}
+	allowed := map[string]map[string]bool{
+		"kubectl": {
+			"get": true, "describe": true, "logs": true, "top": true, "version": true,
+			"cluster-info": true, "api-resources": true, "api-versions": true,
+		},
+		"docker":    {"ps": true, "inspect": true, "logs": true, "stats": true, "version": true, "info": true, "images": true},
+		"podman":    {"ps": true, "inspect": true, "logs": true, "stats": true, "version": true, "info": true, "images": true},
+		"git":       {"status": true, "log": true, "diff": true, "show": true, "rev-parse": true, "remote": true},
+		"systemctl": {"status": true, "show": true, "is-active": true, "is-enabled": true, "list-units": true, "list-unit-files": true},
+		"service":   {"status": true},
+		"sc":        {"query": true, "queryex": true},
+		"reg":       {"query": true},
+	}
+	return allowed[verb][sub]
 }
 
 func isAssignmentOrEnvPrefix(verb string) bool {
@@ -302,7 +367,8 @@ func isAssignmentOrEnvPrefix(verb string) bool {
 
 func lowRiskCommandWithDangerousArgs(verb string, args []string) string {
 	for i, arg := range args {
-		lower := strings.ToLower(strings.TrimSpace(arg))
+		trimmed := strings.TrimSpace(arg)
+		lower := strings.ToLower(trimmed)
 		if lower == "" {
 			continue
 		}
@@ -321,6 +387,12 @@ func lowRiskCommandWithDangerousArgs(verb string, args []string) string {
 			}
 			if lower == "-d" || lower == "--data" || lower == "--data-raw" || lower == "--data-binary" || strings.HasPrefix(lower, "-d") {
 				return "curl 发送请求体，可能改变远端状态"
+			}
+			if trimmed == "-T" || lower == "--upload-file" || strings.HasPrefix(lower, "--upload-file=") ||
+				trimmed == "-F" || lower == "--form" || strings.HasPrefix(lower, "--form=") ||
+				lower == "--json" || strings.HasPrefix(lower, "--json=") ||
+				lower == "--data-urlencode" || strings.HasPrefix(lower, "--data-urlencode=") {
+				return "curl 将上传数据或发送请求体，可能改变远端状态"
 			}
 			if (lower == "-x" || lower == "--request") && i+1 < len(args) {
 				method := strings.ToUpper(strings.Trim(args[i+1], "\"'"))

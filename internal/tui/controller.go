@@ -14,15 +14,18 @@ import (
 
 // SessionController 驱动 Agent 循环（Claude Code 式多轮追问）
 type SessionController struct {
-	cfg              SessionConfig
-	sink             *ChannelSink
-	mu               sync.Mutex
-	running          bool
-	turn             int
-	program          *tea.Program
-	stopCh           chan struct{}
-	stopped          bool
-	pendingInterrupt bool
+	cfg                  SessionConfig
+	sink                 *ChannelSink
+	mu                   sync.Mutex
+	confirmMu            sync.Mutex
+	sudoMu               sync.Mutex
+	running              bool
+	turn                 int
+	program              *tea.Program
+	stopCh               chan struct{}
+	stopped              bool
+	pendingInterruptText string
+	cachedStats          SessionStats
 }
 
 type SessionStats struct {
@@ -48,9 +51,21 @@ func (c *SessionController) SetProgram(p *tea.Program) { c.program = p }
 func (c *SessionController) Stats() SessionStats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The agent owns and mutates History while a run is active. Reading that
+	// slice from the renderer at the same time is a data race and can observe a
+	// half-written slice header. Serve the last safe snapshot until the run has
+	// stopped; real token usage is tracked independently by UI events.
+	if !c.running {
+		c.refreshStatsLocked()
+	}
+	stats := c.cachedStats
+	stats.Running = c.running
+	return stats
+}
+
+func (c *SessionController) refreshStatsLocked() {
 	stats := SessionStats{
 		Turns:    c.turn,
-		Running:  c.running,
 		Messages: 0,
 	}
 	if c.cfg.Agent != nil {
@@ -61,29 +76,48 @@ func (c *SessionController) Stats() SessionStats {
 		stats.Turns = harness.CountUserTurns(*c.cfg.History)
 		stats.ApproxTokens = estimateHistoryTokens(*c.cfg.History)
 	}
-	return stats
+	c.cachedStats = stats
 }
 
 func (c *SessionController) pumpEvents() {
-	for e := range c.sink.Events() {
-		if c.program != nil {
-			c.program.Send(uiEventMsg(e))
+	for {
+		select {
+		case e := <-c.sink.Events():
+			if c.program != nil {
+				c.program.Send(uiEventMsg(e))
+			}
+		case <-c.sink.Done():
+			return
 		}
 	}
 }
 
 func (c *SessionController) confirmFn(action *harness.AgentAction) bool {
+	if action == nil {
+		return false
+	}
 	if c.cfg.BatchMode || c.program == nil {
 		if c.program != nil {
 			c.program.Send(uiEventMsg(harness.UIEvent{Kind: harness.EventBatchAuto, Message: "Batch 模式已启用：本次操作自动批准"}))
 		}
 		return true
 	}
-	prompt := fmt.Sprintf("确认执行 %s ?", action.Type)
+	c.confirmMu.Lock()
+	defer c.confirmMu.Unlock()
+	c.mu.Lock()
+	stopped := c.stopped
+	c.mu.Unlock()
+	if stopped {
+		return false
+	}
+	prompt := fmt.Sprintf("**操作类型**：`%s`", action.Type)
 	if action.Type == harness.ActionExecute {
-		prompt = fmt.Sprintf("高风险命令: %s", truncateStr(action.Command, 80))
+		prompt = "**高风险命令**\n\n```sh\n" + action.Command + "\n```"
 	} else if action.Type == harness.ActionTool {
-		prompt = fmt.Sprintf("工具 %s (%s)", action.ToolName, action.RiskLevel)
+		prompt = fmt.Sprintf("**工具**：`%s`\n\n**风险等级**：%s", action.ToolName, action.RiskLevel)
+	}
+	if reason := strings.TrimSpace(action.Reason); reason != "" {
+		prompt += "\n\n**确认原因**：" + reason
 	}
 	return WaitConfirm(c.program, action, prompt)
 }
@@ -94,7 +128,9 @@ func (c *SessionController) RequestStop() {
 	if c.stopped {
 		return
 	}
-	close(c.stopCh)
+	if c.stopCh != nil {
+		close(c.stopCh)
+	}
 	c.stopped = true
 }
 
@@ -108,10 +144,13 @@ func (c *SessionController) InterruptWithInput(text string) bool {
 	if !c.running {
 		return false
 	}
-	*c.cfg.History = append(*c.cfg.History, analyzer.Message{Role: "user", Content: "【用户中途打断/改写目标】" + text})
-	c.pendingInterrupt = true
+	// Do not append to History while RunLoop is using it. Queue the rewrite and
+	// commit it after the current run acknowledges stop, then start the next run.
+	c.pendingInterruptText = text
 	if !c.stopped {
-		close(c.stopCh)
+		if c.stopCh != nil {
+			close(c.stopCh)
+		}
 		c.stopped = true
 	}
 	return true
@@ -124,6 +163,7 @@ func (c *SessionController) beginRun() bool {
 		c.mu.Unlock()
 		return false
 	}
+	c.refreshStatsLocked()
 	c.running = true
 	c.stopCh = make(chan struct{})
 	c.stopped = false
@@ -140,10 +180,14 @@ func (c *SessionController) beginRun() bool {
 			}
 			c.mu.Lock()
 			c.running = false
-			restart := c.pendingInterrupt
-			c.pendingInterrupt = false
+			interruptText := c.pendingInterruptText
+			c.pendingInterruptText = ""
+			if interruptText != "" && c.cfg.History != nil {
+				*c.cfg.History = append(*c.cfg.History, analyzer.Message{Role: "user", Content: "【用户中途打断/改写目标】" + interruptText})
+			}
+			c.refreshStatsLocked()
 			c.mu.Unlock()
-			if restart && c.beginRun() {
+			if interruptText != "" && c.beginRun() {
 				if c.program != nil {
 					c.program.Send(agentStartMsg{followUp: true})
 				}
@@ -166,6 +210,7 @@ func (c *SessionController) beginRun() bool {
 			PlanMode:         c.cfg.PlanMode,
 			ConfirmFn:        c.confirmFn,
 			AwaitUserFn:      c.awaitUserFn,
+			SudoAuthFn:       c.sudoAuthFn,
 			UI:               c.sink,
 			Stop:             c.stopCh,
 		})
@@ -180,14 +225,40 @@ func (c *SessionController) awaitUserFn(action *harness.AgentAction) (string, bo
 	return WaitUserInput(c.program, action)
 }
 
+func (c *SessionController) sudoAuthFn() bool {
+	if c.cfg.BatchMode || c.program == nil {
+		return false
+	}
+	c.sudoMu.Lock()
+	defer c.sudoMu.Unlock()
+	ch := make(chan bool, 1)
+	c.program.Send(sudoAuthMsg{respCh: ch})
+	c.mu.Lock()
+	stop := c.stopCh
+	c.mu.Unlock()
+	select {
+	case ok := <-ch:
+		return ok
+	case <-stop:
+		return false
+	}
+}
+
 // PrepareFollowUp 追问：写入 history 并启动新一轮
 func (c *SessionController) PrepareFollowUp(text string) bool {
 	text = trimInput(text)
 	if text == "" {
 		return false
 	}
+	c.mu.Lock()
+	if c.running || c.cfg.History == nil {
+		c.mu.Unlock()
+		return false
+	}
 	c.turn++
 	*c.cfg.History = append(*c.cfg.History, analyzer.Message{Role: "user", Content: text})
+	c.refreshStatsLocked()
+	c.mu.Unlock()
 	return c.beginRun()
 }
 
@@ -197,7 +268,13 @@ func (c *SessionController) SetInitialGoal(goal string) {
 	if goal == "" {
 		return
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.History == nil || c.running {
+		return
+	}
 	*c.cfg.History = append(*c.cfg.History, analyzer.Message{Role: "user", Content: "需求：" + goal})
+	c.refreshStatsLocked()
 }
 
 // StartNewSession 清空当前 TUI 上下文并创建新的 checkpoint session。
@@ -224,7 +301,8 @@ func (c *SessionController) StartNewSession(goal string) (string, bool, error) {
 		*c.cfg.History = nil
 	}
 	c.turn = 0
-	c.pendingInterrupt = false
+	c.pendingInterruptText = ""
+	c.refreshStatsLocked()
 	c.stopped = false
 	c.stopCh = make(chan struct{})
 	c.mu.Unlock()
@@ -275,7 +353,8 @@ func (c *SessionController) ResumeSession(sessionID, supplement string) (int, er
 	}
 	*c.cfg.History = history
 	c.turn = 0
-	c.pendingInterrupt = false
+	c.pendingInterruptText = ""
+	c.refreshStatsLocked()
 	c.stopped = false
 	c.stopCh = make(chan struct{})
 	c.mu.Unlock()

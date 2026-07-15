@@ -230,6 +230,14 @@ func ReadFileWithExecutor(ex Executor, path string) ([]byte, error) {
 	if ex == nil {
 		return nil, fmt.Errorf("执行器未初始化")
 	}
+	if _, ok := ex.(*LocalExecutor); ok {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		return io.ReadAll(io.LimitReader(f, maxReadSize))
+	}
 	return ex.ReadTargetFile(path)
 }
 
@@ -251,6 +259,13 @@ func GlobTarget(root, pattern string, maxResults int) ([]string, error) {
 	if Current == nil {
 		return nil, fmt.Errorf("执行器未初始化")
 	}
+	return GlobTargetWithExecutor(Current, root, pattern, maxResults)
+}
+
+func GlobTargetWithExecutor(ex Executor, root, pattern string, maxResults int) ([]string, error) {
+	if ex == nil {
+		return nil, fmt.Errorf("执行器未初始化")
+	}
 	if maxResults <= 0 {
 		maxResults = 200
 	}
@@ -264,8 +279,8 @@ func GlobTarget(root, pattern string, maxResults int) ([]string, error) {
 	}
 
 	var matches []string
-	if Current.IsRemote() {
-		matches = globRemote(root, pattern, maxResults)
+	if ex.IsRemote() {
+		matches = globRemote(ex, root, pattern, maxResults)
 	} else {
 		matches = globLocal(root, pattern, maxResults)
 	}
@@ -298,11 +313,11 @@ func globLocal(root, pattern string, max int) []string {
 	return matches
 }
 
-func globRemote(root, pattern string, max int) []string {
+func globRemote(ex Executor, root, pattern string, max int) []string {
 	// 无通配符时仅扫描当前目录，避免 /proc 等深层目录递归爆炸
 	if !strings.ContainsAny(pattern, "*?[") {
 		var matches []string
-		entries, err := ReadTargetEntries(root)
+		entries, err := ReadEntriesWithExecutor(ex, root)
 		if err != nil {
 			return matches
 		}
@@ -317,15 +332,15 @@ func globRemote(root, pattern string, max int) []string {
 		return matches
 	}
 	var matches []string
-	globRemoteWalk(root, pattern, &matches, max, 0, 4)
+	globRemoteWalk(ex, root, pattern, &matches, max, 0, 4)
 	return matches
 }
 
-func globRemoteWalk(dir, pattern string, matches *[]string, max, depth, maxDepth int) {
+func globRemoteWalk(ex Executor, dir, pattern string, matches *[]string, max, depth, maxDepth int) {
 	if len(*matches) >= max || depth > maxDepth {
 		return
 	}
-	entries, err := ReadTargetEntries(dir)
+	entries, err := ReadEntriesWithExecutor(ex, dir)
 	if err != nil {
 		return
 	}
@@ -340,7 +355,7 @@ func globRemoteWalk(dir, pattern string, matches *[]string, max, depth, maxDepth
 			*matches = append(*matches, full)
 		}
 		if e.IsDir && depth < maxDepth {
-			globRemoteWalk(full, pattern, matches, max, depth+1, maxDepth)
+			globRemoteWalk(ex, full, pattern, matches, max, depth+1, maxDepth)
 		}
 	}
 }

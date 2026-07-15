@@ -12,7 +12,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"ai-edr/internal/harness"
 	"ai-edr/internal/harness/subagent"
 	"ai-edr/internal/logger"
+	"ai-edr/internal/mcp"
 	"ai-edr/internal/scheduler"
 	"ai-edr/internal/tools"
 	"ai-edr/internal/tui"
@@ -37,6 +40,7 @@ func main() {
 	// 1. 跨平台控制台初始化
 	enableWindowsANSI()
 	defer ui.ResetTerminalState()
+	defer mcp.CloseAll()
 
 	// 🟢 [核心增强] 强制设置 Windows 控制台代码页为 UTF-8
 	// 这解决了即便开启了 ANSI 渲染，底层系统命令输出依然可能坚持使用 GBK 的问题
@@ -87,10 +91,12 @@ func main() {
 	if *noTUI {
 		*tuiMode = false
 	}
-	nonInteractive := *jsonOutput || *quiet
+	interactiveTerminal := isInteractiveTerminal()
+	nonInteractive := *jsonOutput || *quiet || !interactiveTerminal
 	if nonInteractive && !flagWasPassed("tui") {
 		*tuiMode = false
 	}
+	*tuiMode = resolvedTUIMode(*tuiMode, *noTUI, nonInteractive, flagWasPassed("tui"), interactiveTerminal)
 
 	if *showHelp || *showHelpLong {
 		printUsage()
@@ -177,7 +183,7 @@ func main() {
 		msg := fmt.Sprintf("已加载配置: %s", viper.ConfigFileUsed())
 		if *tuiMode {
 			startup.ConfigPath = viper.ConfigFileUsed()
-		} else if !*jsonOutput {
+		} else if !*jsonOutput && !*quiet {
 			fmt.Printf("%s%s\n", ui.Prefix("📂", "[CFG]"), ui.StripANSIIfPlain("\033[1;32m"+msg+"\033[0m"))
 		}
 	}
@@ -192,7 +198,7 @@ func main() {
 		id, cancelled, err := tui.PickSession()
 		if err != nil {
 			fmt.Printf("%s会话选择失败: %v\n", ui.Prefix("❌", "[ERR]"), err)
-			return
+			ui.Exit(1)
 		}
 		if cancelled {
 			return
@@ -204,7 +210,7 @@ func main() {
 		cp, err := harness.LoadCheckpoint(sessionID)
 		if err != nil {
 			fmt.Printf("%s恢复会话失败: %v\n", ui.Prefix("❌", "[ERR]"), err)
-			return
+			ui.Exit(1)
 		}
 		history = cp.History
 		if len(history) == 0 {
@@ -352,6 +358,25 @@ func main() {
 	}
 	defer executor.Current.Close()
 
+	// Batch mode can approve destructive actions. Require an explicit -y in
+	// non-interactive environments, and ask once before starting any background
+	// scheduler or Agent work in an interactive terminal (including TUI mode).
+	needsBatchPrompt, batchApprovalErr := batchApprovalRequirement(*batchMode, *autoYes, interactiveTerminal)
+	if batchApprovalErr != nil {
+		emitInitFailure(*jsonOutput, "batch_confirmation_required", batchApprovalErr.Error())
+		ui.Exit(1)
+	}
+	if needsBatchPrompt {
+		fmt.Println("\n" + ui.TerminalText("\033[41;37m ⚠️  警告：无人值守模式 (BATCH MODE) 已开启 ⚠️ \033[0m"))
+		confirm := false
+		prompt := &survey.Confirm{Message: "确认要在无人值守模式下运行吗?", Default: false}
+		_ = askOne(prompt, &confirm)
+		ui.ResetTerminalState()
+		if !confirm {
+			return
+		}
+	}
+
 	schedRunner := scheduler.NewRunner(config.GlobalConfig)
 	schedRunner.ConfigPath = viper.ConfigFileUsed()
 	schedCtx, schedCancel := context.WithCancel(context.Background())
@@ -369,20 +394,7 @@ func main() {
 		}
 	}
 
-	// 6. Batch Mode 确认
-	if *batchMode && !*autoYes && !*tuiMode {
-		fmt.Println("\n" + ui.TerminalText("\033[41;37m ⚠️  警告：无人值守模式 (BATCH MODE) 已开启 ⚠️ \033[0m"))
-		confirm := false
-		prompt := &survey.Confirm{
-			Message: "确认要在无人值守模式下运行吗?",
-			Default: false,
-		}
-		_ = askOne(prompt, &confirm)
-		ui.ResetTerminalState()
-		if !confirm {
-			return
-		}
-	}
+	// 6. Batch Mode 状态提示（确认已在任何后台任务启动前完成）
 	if *batchMode && *tuiMode {
 		startup.Notices = append(startup.Notices, "Batch 模式已开启：高风险操作会自动批准，请确认目标环境可接受。")
 	}
@@ -391,18 +403,20 @@ func main() {
 	}
 
 	// 7. 初始化报告
-	reporter, reportPath, _ := logger.NewReporterWithTitle(logger.TitleFromHistory(history))
-	if reporter != nil {
-		defer reporter.Close()
-		if *tuiMode {
-			startup.ReportPath = reportPath
-		} else if !*jsonOutput {
-			fmt.Printf("[*] 审计日志: %s\n", reportPath)
-		}
+	reporter, reportPath, reportErr := logger.NewReporterWithTitle(logger.TitleFromHistory(history))
+	if reportErr != nil {
+		emitInitFailure(*jsonOutput, "report_init_failed", reportErr.Error())
+		ui.Exit(1)
+	}
+	defer reporter.Close()
+	if *tuiMode {
+		startup.ReportPath = reportPath
+	} else if !*jsonOutput && !*quiet {
+		fmt.Printf("[*] 审计日志: %s\n", reportPath)
 	}
 
 	// 8. 环境感知
-	if !*tuiMode && !*jsonOutput {
+	if !*tuiMode && !*jsonOutput && !*quiet {
 		fmt.Println(ui.Prefix("🔍", "[SCAN]") + "正在采集系统指纹...")
 	}
 	sysCtx := collector.GetSystemContext()
@@ -426,14 +440,14 @@ func main() {
 		startup.Arch = sysCtx.Arch
 		startup.Username = sysCtx.Username
 		startup.Hostname = sysCtx.Hostname
-		startup.ModelInfo = fmt.Sprintf("%s / %s", config.GlobalConfig.Provider, config.GlobalConfig.ModelName)
+		startup.ModelInfo = config.GlobalConfig.ModelDisplayInfo()
 		startup.TargetCount = len(config.GlobalConfig.Targets)
 		startup.MCPCount = len(config.GlobalConfig.MCPServers)
 		startup.NativeTools = config.GlobalConfig.UseNativeTools
 		executor.SetModeOutputEnabled(false)
 	} else {
-		executor.SetModeOutputEnabled(!*jsonOutput)
-		if !*jsonOutput {
+		executor.SetModeOutputEnabled(!*jsonOutput && !*quiet)
+		if !*jsonOutput && !*quiet {
 			fmt.Println("--------------------------------------------------")
 			fmt.Printf("[+] 连接状态: %s\n", ui.StripANSIIfPlain("\033[1;33m"+connInfo+"\033[0m"))
 			fmt.Printf("[+] 目标系统: %s / %s\n", sysCtx.OS, sysCtx.Arch)
@@ -467,6 +481,9 @@ func main() {
 		}
 		ui.Exit(1)
 	}
+	if *tuiMode {
+		startup.MCPCount = len(mcp.Global().ListNames())
+	}
 
 	if sessionID != "" {
 		if cp, err := harness.LoadCheckpoint(sessionID); err == nil {
@@ -486,7 +503,10 @@ func main() {
 		subAgentMaxSteps = 15
 	}
 
+	var confirmationMu sync.Mutex
 	confirmFn := func(action *harness.AgentAction) bool {
+		confirmationMu.Lock()
+		defer confirmationMu.Unlock()
 		confirm := false
 		reason := action.Reason
 		if action.Type == harness.ActionExecute {
@@ -495,9 +515,15 @@ func main() {
 				Default: false,
 			}
 			_ = askOne(prompt, &confirm)
+		} else if action.Type == harness.ActionTool {
+			prompt := &survey.Confirm{
+				Message: fmt.Sprintf("%s确认执行工具 %s（风险: %s，原因: %s）?", ui.Prefix("🔴", "[HIGH]"), action.ToolName, action.RiskLevel, reason),
+				Default: false,
+			}
+			_ = askOne(prompt, &confirm)
 		} else {
 			prompt := &survey.Confirm{
-				Message: fmt.Sprintf("%s确认执行 %s?", ui.Prefix("🔴", "[HIGH]"), action.Type),
+				Message: fmt.Sprintf("%s确认执行 %s（%s）?", ui.Prefix("🔴", "[HIGH]"), action.Type, reason),
 				Default: false,
 			}
 			_ = askOne(prompt, &confirm)
@@ -560,13 +586,14 @@ func main() {
 			MaxSteps:         maxSteps,
 			SubAgentMaxSteps: subAgentMaxSteps,
 			ConnInfo:         connInfo,
-			ModelInfo:        fmt.Sprintf("%s / %s", config.GlobalConfig.Provider, config.GlobalConfig.ModelName),
+			ModelInfo:        config.GlobalConfig.ModelDisplayInfo(),
 			Startup:          startup,
 			AwaitGoal:        awaitGoal,
 			MultiTurn:        true,
 			PlanMode:         *planMode,
 		}); err != nil {
 			fmt.Printf("%sTUI 退出: %v\n", ui.Prefix("❌", "[ERR]"), err)
+			ui.Exit(1)
 		}
 		return
 	}
@@ -584,6 +611,9 @@ func main() {
 		outSink = harness.NewQuietSink(outSink)
 	}
 	loopCfg.UI = outSink
+	runCtx, stopRunSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopRunSignals()
+	loopCfg.Stop = runCtx.Done()
 	agent.RunLoop(loopCfg)
 	if !*jsonOutput && !*quiet {
 		printExitHint()
@@ -602,6 +632,31 @@ func flagWasPassed(name string) bool {
 
 func isInteractiveTerminal() bool {
 	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+func resolvedTUIMode(requested, noTUI, nonInteractive, explicitTUI, interactiveTerminal bool) bool {
+	if !requested || noTUI {
+		return false
+	}
+	if nonInteractive && !explicitTUI {
+		return false
+	}
+	// Pipes, redirects, cron and CI cannot render an alternate-screen app
+	// reliably. Use readable classic output unless --tui was explicit.
+	if !interactiveTerminal && !explicitTUI {
+		return false
+	}
+	return true
+}
+
+func batchApprovalRequirement(batchMode, autoYes, interactiveTerminal bool) (bool, error) {
+	if !batchMode || autoYes {
+		return false, nil
+	}
+	if !interactiveTerminal {
+		return false, fmt.Errorf("非交互环境启用 --batch 时必须同时传入 -y，避免未经确认自动执行高风险操作")
+	}
+	return true, nil
 }
 
 func printJSON(v any) {
@@ -624,34 +679,27 @@ func launchDetachedWebShell(title string) (string, string, string, error) {
 	if err := os.MkdirAll("reports", 0755); err != nil {
 		return "", "", "", err
 	}
-	timestamp := time.Now().Format("20060102_150405")
-	reportPath, err := filepath.Abs(filepath.Join("reports", fmt.Sprintf("report_%s.md", timestamp)))
-	if err != nil {
-		return "", "", "", err
-	}
-	progressPath, err := filepath.Abs(filepath.Join("reports", fmt.Sprintf("webshell_progress_%s.log", timestamp)))
+	stamp := time.Now().Format("20060102_150405_000000000")
+	progressFile, progressPath, reportPath, err := createWebShellArtifacts(stamp)
 	if err != nil {
 		return "", "", "", err
 	}
 	latestPath, err := filepath.Abs(filepath.Join("reports", "latest_webshell.txt"))
 	if err != nil {
-		return "", "", "", err
-	}
-
-	progressFile, err := os.OpenFile(progressPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
+		_ = progressFile.Close()
 		return "", "", "", err
 	}
 
 	notice := webShellNoticeText(reportPath, progressPath, latestPath)
 	_, _ = progressFile.WriteString(notice + "\n\n")
-	_ = os.WriteFile(latestPath, []byte(notice+"\n"), 0644)
+	_ = writePrivateFile(latestPath, []byte(notice+"\n"))
 
 	exe, err := os.Executable()
 	if err != nil {
 		_ = progressFile.Close()
 		return "", "", "", err
 	}
+	// #nosec G204 G702 -- exe 由 os.Executable 返回，参数是操作员用来启动当前进程的原始 argv；未经 shell 解析，用于受控后台重启自身。
 	cmd := exec.Command(exe, os.Args[1:]...)
 	if wd, err := os.Getwd(); err == nil {
 		cmd.Dir = wd
@@ -678,9 +726,44 @@ func launchDetachedWebShell(title string) (string, string, string, error) {
 	_ = progressFile.Close()
 
 	if strings.TrimSpace(title) != "" {
-		_ = os.WriteFile(latestPath, []byte(notice+"\n任务标题: "+logger.NormalizeReportTitle(title)+"\n"), 0644)
+		_ = writePrivateFile(latestPath, []byte(notice+"\n任务标题: "+logger.NormalizeReportTitle(title)+"\n"))
 	}
 	return reportPath, progressPath, latestPath, nil
+}
+
+func createWebShellArtifacts(stamp string) (*os.File, string, string, error) {
+	for i := 0; i < 1000; i++ {
+		suffix := stamp
+		if i > 0 {
+			suffix = fmt.Sprintf("%s_%d", stamp, i+1)
+		}
+		progressPath, err := filepath.Abs(filepath.Join("reports", "webshell_progress_"+suffix+".log"))
+		if err != nil {
+			return nil, "", "", err
+		}
+		file, err := os.OpenFile(progressPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, "", "", err
+		}
+		reportPath, err := filepath.Abs(filepath.Join("reports", "report_"+suffix+".md"))
+		if err != nil {
+			_ = file.Close()
+			_ = os.Remove(progressPath)
+			return nil, "", "", err
+		}
+		return file, progressPath, reportPath, nil
+	}
+	return nil, "", "", fmt.Errorf("无法生成唯一的 WebShell 任务文件名")
+}
+
+func writePrivateFile(path string, data []byte) error {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
 
 func printWebShellDetachedNotice(reportPath, progressPath, latestPath string) {
@@ -698,21 +781,28 @@ func webShellNoticeText(reportPath, progressPath, latestPath string) string {
 		reportPath, progressPath, latestPath, progressPath, reportPath)
 }
 
-func captureStdout(fn func()) string {
+func captureStdout(fn func()) (out string) {
 	old := os.Stdout
 	r, w, err := os.Pipe()
 	if err != nil {
 		fn()
 		return ""
 	}
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		_ = r.Close()
+		done <- buf.String()
+	}()
 	os.Stdout = w
+	defer func() {
+		os.Stdout = old
+		_ = w.Close()
+		out = <-done
+	}()
 	fn()
-	_ = w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	_, _ = io.Copy(&buf, r)
-	_ = r.Close()
-	return buf.String()
+	return ""
 }
 
 func appendLogLines(dst []string, raw string) []string {
@@ -900,7 +990,7 @@ func switchToLocalMode() {
 
 func saveCurrentConfig() error {
 	if path := strings.TrimSpace(viper.ConfigFileUsed()); path != "" {
-		return viper.WriteConfigAs(path)
+		return config.WriteConfigAsPrivate(path)
 	}
 	return config.SaveConfig()
 }
@@ -1067,6 +1157,117 @@ func resumeUserSupplement(taskFlag, taskShort string, args []string) string {
 	return ""
 }
 
+const contextWindowAutoChoice = "自动（推荐，按服务商/模型名推断）"
+const contextWindowCustomChoice = "自定义"
+
+var contextWindowChoices = []string{
+	contextWindowAutoChoice,
+	"64K (65,536 tokens)",
+	"128K (131,072 tokens)",
+	"256K (262,144 tokens)",
+	"512K (524,288 tokens)",
+	"1M (1,048,576 tokens)",
+	"2M (2,097,152 tokens)",
+	contextWindowCustomChoice,
+}
+
+func contextWindowTokensFromChoice(choice string) (int, bool) {
+	switch strings.TrimSpace(choice) {
+	case contextWindowAutoChoice:
+		return 0, true
+	case "64K (65,536 tokens)":
+		return 65_536, true
+	case "128K (131,072 tokens)":
+		return 131_072, true
+	case "256K (262,144 tokens)":
+		return 262_144, true
+	case "512K (524,288 tokens)":
+		return 524_288, true
+	case "1M (1,048,576 tokens)":
+		return 1_048_576, true
+	case "2M (2,097,152 tokens)":
+		return 2_097_152, true
+	default:
+		return 0, false
+	}
+}
+
+func contextWindowDefaultChoice(tokens int) string {
+	for _, choice := range contextWindowChoices {
+		if value, ok := contextWindowTokensFromChoice(choice); ok && value == tokens {
+			return choice
+		}
+	}
+	if tokens > 0 {
+		return contextWindowCustomChoice
+	}
+	return contextWindowAutoChoice
+}
+
+func validateCustomContextWindow(value interface{}) error {
+	n, err := strconv.Atoi(strings.TrimSpace(fmt.Sprint(value)))
+	if err != nil || n < 4_096 || n > 4_194_304 {
+		return fmt.Errorf("请输入 4096-4194304 的整数 token")
+	}
+	return nil
+}
+
+var wizardProviderOptions = []string{
+	"DeepSeek (deepseek-v4-pro)",
+	"Qwen / 阿里百炼 (qwen-plus)",
+	"百度千帆 Coding Plan (qianfan-code-latest)",
+	"火山方舟 Coding Plan (ark-code-latest)",
+	"中国电信星辰 TeleAI (GLM-5-Pro)",
+	"腾讯混元 Hunyuan (hunyuan-turbos-latest)",
+	"OpenAI (gpt-5.5)",
+	"Anthropic Claude (claude-opus-4-8)",
+	"Google Gemini (gemini-3.5-flash)",
+	"MiniMax (MiniMax-M3)",
+	"智谱 GLM (glm-5.2)",
+	"Xiaomi MiMo Token Plan / MiMo Claw (mimo-v2.5-pro)",
+	"xAI Grok (grok-4)",
+	"Ollama (本地运行)",
+	"LM Studio (本地运行)",
+	"其他 (自定义/中转)",
+}
+
+func wizardProviderID(providerLabel string) string {
+	switch {
+	case strings.Contains(providerLabel, "DeepSeek"):
+		return "deepseek"
+	case strings.Contains(providerLabel, "Qwen"):
+		return "qwen"
+	case strings.Contains(providerLabel, "千帆"):
+		return "qianfan"
+	case strings.Contains(providerLabel, "火山") || strings.Contains(providerLabel, "方舟"):
+		return "volcengine"
+	case strings.Contains(providerLabel, "星辰") || strings.Contains(providerLabel, "TeleAI"):
+		return "teleai"
+	case strings.Contains(providerLabel, "混元") || strings.Contains(providerLabel, "Hunyuan"):
+		return "hunyuan"
+	case strings.Contains(providerLabel, "OpenAI"):
+		return "openai"
+	case strings.Contains(providerLabel, "Anthropic"):
+		return "anthropic"
+	case strings.Contains(providerLabel, "Gemini"):
+		return "google"
+	case strings.Contains(providerLabel, "MiniMax"):
+		return "minimax"
+	case strings.Contains(providerLabel, "GLM"):
+		return "glm"
+	case strings.Contains(providerLabel, "MiMo"):
+		return "mimo"
+	case strings.Contains(providerLabel, "Grok"):
+		return "xai"
+	case strings.Contains(providerLabel, "Ollama"):
+		return "ollama"
+	case strings.Contains(providerLabel, "LM Studio"):
+		return "lmstudio"
+	default:
+		return "custom"
+	}
+}
+
 // runElegantWizard 完整初始化向导
 func runElegantWizard() error {
 	fmt.Println("\n" + ui.Prefix("🛠️", "[INIT]") + ui.StripANSIIfPlain("\033[1;34mDeepSentry 初始化向导\033[0m"))
@@ -1076,64 +1277,29 @@ func runElegantWizard() error {
 	var providerLabel string
 	providerPrompt := &survey.Select{
 		Message: ui.Prefix("🤖", "[AI]") + "请选择您的 AI 模型服务商:",
-		Options: []string{
-			"DeepSeek (deepseek-v4-pro)",
-			"Qwen / 阿里百炼 (qwen-plus)",
-			"中国电信星辰 TeleAI (GLM-5-Pro)",
-			"腾讯混元 Hunyuan (hunyuan-turbos-latest)",
-			"OpenAI (gpt-5.5)",
-			"Anthropic Claude (claude-opus-4-8)",
-			"Google Gemini (gemini-3.5-flash)",
-			"MiniMax (MiniMax-M3)",
-			"智谱 GLM (glm-5.2)",
-			"Xiaomi MiMo (mimo-v2.5-pro)",
-			"xAI Grok (grok-4)",
-			"Ollama (本地运行)",
-			"LM Studio (本地运行)",
-			"其他 (自定义/中转)",
-		},
+		Options: wizardProviderOptions,
 		Default: "DeepSeek (deepseek-v4-pro)",
 	}
 	if err := askOne(providerPrompt, &providerLabel); err != nil {
 		return err
 	}
 
-	providerID := "custom"
+	providerID := wizardProviderID(providerLabel)
 	defaultURL := ""
 	defaultModel := ""
 	urlHelp := "请输入 API Base URL（可只填 /v1，自动补全 chat/completions）"
 
-	switch {
-	case strings.Contains(providerLabel, "DeepSeek"):
-		providerID = "deepseek"
-	case strings.Contains(providerLabel, "Qwen"):
-		providerID = "qwen"
-	case strings.Contains(providerLabel, "星辰") || strings.Contains(providerLabel, "TeleAI"):
-		providerID = "teleai"
+	switch providerID {
+	case "qianfan":
+		urlHelp = "千帆 Coding Plan 官方 OpenAI 兼容 Base URL；使用 Coding Plan 订阅 API Key"
+	case "volcengine":
+		urlHelp = "火山方舟 Coding Plan 官方 OpenAI 兼容 Base URL；请使用 Coding Plan 专用地址与 API Key"
+	case "teleai":
 		urlHelp = "电信星辰/TokenHub OpenAI 兼容 Base URL；如控制台分配了专属 endpoint，请覆盖此值"
-	case strings.Contains(providerLabel, "混元") || strings.Contains(providerLabel, "Hunyuan"):
-		providerID = "hunyuan"
-	case strings.Contains(providerLabel, "OpenAI"):
-		providerID = "openai"
-	case strings.Contains(providerLabel, "Anthropic"):
-		providerID = "anthropic"
-	case strings.Contains(providerLabel, "Gemini"):
-		providerID = "google"
-	case strings.Contains(providerLabel, "MiniMax"):
-		providerID = "minimax"
-	case strings.Contains(providerLabel, "GLM"):
-		providerID = "glm"
-	case strings.Contains(providerLabel, "MiMo"):
-		providerID = "mimo"
-	case strings.Contains(providerLabel, "Grok"):
-		providerID = "xai"
-	case strings.Contains(providerLabel, "Ollama"):
-		providerID = "ollama"
-	case strings.Contains(providerLabel, "LM Studio"):
-		providerID = "lmstudio"
+	case "mimo":
+		urlHelp = "MiMo Token Plan 中国站 OpenAI 兼容 Base URL；MiMo Claw/Agent 场景共用该套餐接口"
+	case "lmstudio":
 		urlHelp = "LM Studio 默认端口 1234"
-	default:
-		providerID = "custom"
 	}
 
 	if preset, ok := config.FindProvider(providerID); ok && defaultURL == "" {
@@ -1174,6 +1340,15 @@ func runElegantWizard() error {
 			Validate: survey.Required,
 		},
 		{
+			Name: "context_window_choice",
+			Prompt: &survey.Select{
+				Message: ui.Prefix("📏", "[CTX]") + "模型/服务端实际上下文长度:",
+				Options: contextWindowChoices,
+				Default: contextWindowDefaultChoice(viper.GetInt("context_window_tokens")),
+				Help:    "应填 API 或本地运行时的实际限制，不确定时选自动；Ollama/LM Studio 需与 num_ctx/max_model_len 一致",
+			},
+		},
+		{
 			Name: "api_key",
 			Prompt: &survey.Password{
 				Message: ui.Prefix("🔑", "[KEY]") + "API Key (本地模型可回车跳过):",
@@ -1198,6 +1373,25 @@ func runElegantWizard() error {
 			},
 		},
 	}
+	if providerID == "ollama" || providerID == "lmstudio" {
+		qs = append(qs,
+			&survey.Question{
+				Name: "model_parameter_b",
+				Prompt: &survey.Input{
+					Message: ui.Prefix("🧠", "[MODEL]") + "模型参数量（B，用于指令密度适配）:",
+					Default: "0",
+					Help:    "模型名已含 14b/20b/30b/70b 时可留 0 自动识别",
+				},
+				Validate: func(value interface{}) error {
+					n, err := strconv.ParseFloat(strings.TrimSpace(fmt.Sprint(value)), 64)
+					if err != nil || n < 0 || n > 1000 {
+						return fmt.Errorf("请输入 0-1000 的数字")
+					}
+					return nil
+				},
+			},
+		)
+	}
 
 	answers := struct {
 		ApiUrl           string `survey:"api_url"`
@@ -1206,12 +1400,30 @@ func runElegantWizard() error {
 		ApiKey           string `survey:"api_key"`
 		MaxSteps         string `survey:"max_steps"`
 		SubAgentMaxSteps string `survey:"subagent_max_steps"`
+		ModelParameterB  string `survey:"model_parameter_b"`
+		ContextChoice    string `survey:"context_window_choice"`
 	}{}
 
 	// 执行问答
 	err := ask(qs, &answers)
 	if err != nil {
 		return err
+	}
+	contextWindowTokens, knownChoice := contextWindowTokensFromChoice(answers.ContextChoice)
+	if !knownChoice {
+		customDefault := viper.GetInt("context_window_tokens")
+		if customDefault <= 0 {
+			customDefault = 32_768
+		}
+		customValue := strconv.Itoa(customDefault)
+		if err := askOne(&survey.Input{
+			Message: ui.Prefix("📏", "[CTX]") + "自定义上下文长度（tokens）:",
+			Default: customValue,
+			Help:    "范围 4096-4194304；请使用精确 token 数",
+		}, &customValue, survey.WithValidator(validateCustomContextWindow)); err != nil {
+			return err
+		}
+		contextWindowTokens, _ = strconv.Atoi(strings.TrimSpace(customValue))
 	}
 
 	if answers.ApiKey == "" {
@@ -1224,9 +1436,17 @@ func runElegantWizard() error {
 	viper.Set("api_url", answers.ApiUrl)
 	viper.Set("model_name", answers.ModelName)
 	viper.Set("api_key", answers.ApiKey)
+	viper.Set("model_profile", "auto")
+	viper.Set("context_window_tokens", contextWindowTokens)
+	if providerID == "ollama" || providerID == "lmstudio" {
+		viper.Set("model_parameter_b", answers.ModelParameterB)
+	}
 	// 🟢 2. 保存最大轮数 (Viper 会自动处理类型，这里存为字符串或数字均可被 GetInt 读取)
 	viper.Set("max_steps", answers.MaxSteps)
 	viper.Set("subagent_max_steps", answers.SubAgentMaxSteps)
+	if err := runTSecBenchWizard(); err != nil {
+		return err
+	}
 
 	mode := ""
 	fmt.Println(ui.Prefix("💡", "[TIP]") + "管理模式默认本地任务；Windows cmd 若上下键无效，可用 Tab / Shift+Tab 切换，Enter 确认。")
@@ -1275,8 +1495,67 @@ func runElegantWizard() error {
 	}
 
 	// 刷新全局配置
-	viper.Unmarshal(&config.GlobalConfig)
+	var loaded config.Config
+	if err := viper.Unmarshal(&loaded); err != nil {
+		return fmt.Errorf("刷新配置失败: %w", err)
+	}
+	config.ApplyProviderDefaults(&loaded)
+	if err := config.ValidateRuntimeConfig(loaded); err != nil {
+		return fmt.Errorf("配置校验失败: %w", err)
+	}
+	config.GlobalConfig = loaded
 	fmt.Println("-------------------------------------------")
 	ui.ResetTerminalState()
+	return nil
+}
+
+func runTSecBenchWizard() error {
+	enable := false
+	if err := askOne(&survey.Confirm{
+		Message: ui.Prefix("🏁", "[TSEC]") + "是否配置 /tsecbench 跑分模式?",
+		Default: false,
+		Help:    "配置后可在 TUI 中输入 /tsecbench，Agent 会使用 TSecBench API 拉题、启动容器、提交 flag 并关闭容器。",
+	}, &enable); err != nil {
+		return err
+	}
+	if !enable {
+		return nil
+	}
+
+	defaultBase := firstNonEmptyString(
+		viper.GetString("benchmark_base_url"),
+		viper.GetString("BENCHMARK_BASE_URL"),
+		os.Getenv("BENCHMARK_BASE_URL"),
+		"https://tsecbench.zc.tencent.com",
+	)
+	var answers struct {
+		BaseURL string `survey:"benchmark_base_url"`
+		Token   string `survey:"benchmark_token"`
+	}
+	qs := []*survey.Question{
+		{
+			Name: "benchmark_base_url",
+			Prompt: &survey.Input{
+				Message: ui.Prefix("🌐", "[TSEC]") + "benchmark_base_url:",
+				Default: defaultBase,
+				Help:    "例如 https://tsecbench.zc.tencent.com",
+			},
+			Validate: survey.Required,
+		},
+		{
+			Name: "benchmark_token",
+			Prompt: &survey.Password{
+				Message: ui.Prefix("🔑", "[TSEC]") + "benchmark_token:",
+				Help:    "平台创建跑分任务后下发的 BENCHMARK_TOKEN；保存到 config.yaml，不会在报告中明文输出。",
+			},
+			Validate: survey.Required,
+		},
+	}
+	if err := ask(qs, &answers); err != nil {
+		return err
+	}
+	viper.Set("benchmark_base_url", strings.TrimSpace(answers.BaseURL))
+	viper.Set("benchmark_token", strings.TrimSpace(answers.Token))
+	fmt.Println(ui.Prefix("✅", "[OK]") + "已启用 /tsecbench 跑分模式配置")
 	return nil
 }

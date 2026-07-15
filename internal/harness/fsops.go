@@ -5,23 +5,13 @@ import (
 	"ai-edr/internal/memory"
 	"ai-edr/internal/ui"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
 const maxFileReadDisplay = 8000
-
-// fsPerspective 返回当前文件操作视角描述
-func fsPerspective(local bool) string {
-	if local {
-		return "controller"
-	}
-	if executor.Current != nil && executor.Current.IsRemote() {
-		return "target"
-	}
-	return "local"
-}
 
 func fsPerspectiveForExecutor(local bool, ex executor.Executor) string {
 	if local {
@@ -57,13 +47,12 @@ func expandUserPath(path string) string {
 	return path
 }
 
-func readTargetOrLocal(path string) ([]byte, error) {
-	return readTargetOrLocalWithExecutor(path, executor.Current)
-}
-
 func readTargetOrLocalWithExecutor(path string, ex executor.Executor) ([]byte, error) {
 	path = expandUserPath(path)
 	if isControllerLocalPath(path) {
+		if !memory.IsAgentsMDPath(path) {
+			return readWorkspaceFile(path)
+		}
 		return executor.ReadLocalFile(path)
 	}
 	if ex == nil {
@@ -72,16 +61,151 @@ func readTargetOrLocalWithExecutor(path string, ex executor.Executor) ([]byte, e
 	return executor.ReadFileWithExecutor(ex, path)
 }
 
-func writeTargetOrLocal(path string, content []byte) error {
-	return writeTargetOrLocalWithExecutor(path, content, executor.Current)
-}
-
 func writeTargetOrLocalWithExecutor(path string, content []byte, ex executor.Executor) error {
 	path = expandUserPath(path)
 	if isControllerLocalPath(path) {
+		if !memory.IsAgentsMDPath(path) {
+			return writeWorkspaceFile(path, content)
+		}
 		return executor.WriteLocalFile(path, content)
 	}
 	return executor.WriteFileWithExecutor(ex, path, content)
+}
+
+func workspaceRootAndRelative(path string) (*os.Root, string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, "", err
+	}
+	workspace := filepath.Join(home, ".deepsentry", "workspace")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		return nil, "", err
+	}
+	workspaceAbs, err := filepath.Abs(workspace)
+	if err != nil {
+		return nil, "", err
+	}
+	pathAbs, err := filepath.Abs(expandUserPath(path))
+	if err != nil {
+		return nil, "", err
+	}
+	rel, err := filepath.Rel(workspaceAbs, pathAbs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return nil, "", fmt.Errorf("控制端路径必须位于 %s", workspaceAbs)
+	}
+	root, err := os.OpenRoot(workspaceAbs)
+	if err != nil {
+		return nil, "", err
+	}
+	return root, rel, nil
+}
+
+func readWorkspaceFile(path string) ([]byte, error) {
+	root, rel, err := workspaceRootAndRelative(path)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	f, err := root.Open(rel)
+	if err != nil {
+		return nil, fmt.Errorf("workspace 安全读取失败: %w", err)
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, 2<<20))
+}
+
+func writeWorkspaceFile(path string, content []byte) error {
+	root, rel, err := workspaceRootAndRelative(path)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if dir := filepath.Dir(rel); dir != "." {
+		if err := root.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("workspace 安全创建目录失败: %w", err)
+		}
+	}
+	f, err := root.OpenFile(rel, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("workspace 安全写入失败: %w", err)
+	}
+	if _, err := f.Write(content); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func readWorkspaceDir(path string) ([]os.DirEntry, error) {
+	root, rel, err := workspaceRootAndRelative(path)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	f, err := root.Open(rel)
+	if err != nil {
+		return nil, fmt.Errorf("workspace 安全列目录失败: %w", err)
+	}
+	defer f.Close()
+	return f.ReadDir(-1)
+}
+
+func globWorkspace(path, pattern string, maxResults int) ([]string, error) {
+	if maxResults <= 0 {
+		maxResults = 200
+	}
+	root, baseRel, err := workspaceRootAndRelative(path)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	basePath, err := filepath.Abs(expandUserPath(path))
+	if err != nil {
+		return nil, err
+	}
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return nil, fmt.Errorf("glob_pattern 不能为空")
+	}
+	var matches []string
+	var walk func(string, string, int)
+	walk = func(dirRel, displayRel string, depth int) {
+		if len(matches) >= maxResults || depth > 8 {
+			return
+		}
+		f, openErr := root.Open(dirRel)
+		if openErr != nil {
+			return
+		}
+		entries, readErr := f.ReadDir(-1)
+		_ = f.Close()
+		if readErr != nil {
+			return
+		}
+		for _, entry := range entries {
+			if len(matches) >= maxResults {
+				return
+			}
+			rel := filepath.Join(displayRel, entry.Name())
+			matched, _ := filepath.Match(pattern, rel)
+			if !matched {
+				matched, _ = filepath.Match(pattern, entry.Name())
+			}
+			if !matched && strings.HasPrefix(pattern, "**"+string(os.PathSeparator)) {
+				matched, _ = filepath.Match(strings.TrimPrefix(pattern, "**"+string(os.PathSeparator)), rel)
+			}
+			if matched {
+				matches = append(matches, filepath.Join(basePath, rel))
+			}
+			// DirEntry.IsDir is false for symlinks, so traversal cannot cross a
+			// link even before os.Root applies its confinement.
+			if entry.IsDir() {
+				walk(filepath.Join(dirRel, entry.Name()), rel, depth+1)
+			}
+		}
+	}
+	walk(baseRel, "", 0)
+	return matches, nil
 }
 
 func formatFSResult(perspective, body string) string {
@@ -104,7 +228,7 @@ func truncateContent(content string, total int) string {
 		}
 		return content
 	}
-	return content[:maxFileReadDisplay] + fmt.Sprintf("\n...(内容已截断，共 %d 字节)...", total)
+	return safeUTF8BytePrefix(content, maxFileReadDisplay) + fmt.Sprintf("\n...(内容已截断，共 %d 字节)...", total)
 }
 
 func formatDirListing(path string, entries []executor.DirEntry) string {
@@ -118,10 +242,6 @@ func formatDirListing(path string, entries []executor.DirEntry) string {
 		b.WriteString(fmt.Sprintf("%s %8d %s\n", prefix, e.Size, e.Name))
 	}
 	return b.String()
-}
-
-func editFileContent(path, oldStr, newStr string, replaceAll bool) (string, error) {
-	return editFileContentWithExecutor(path, oldStr, newStr, replaceAll, executor.Current)
 }
 
 func editFileContentWithExecutor(path, oldStr, newStr string, replaceAll bool, ex executor.Executor) (string, error) {

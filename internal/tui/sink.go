@@ -12,7 +12,9 @@ import (
 // ChannelSink 将 harness 事件转发到 TUI（线程安全）
 type ChannelSink struct {
 	mu            sync.Mutex
+	sendMu        sync.Mutex
 	events        chan harness.UIEvent
+	done          chan struct{}
 	closed        bool
 	droppedStream int
 }
@@ -21,50 +23,80 @@ func NewChannelSink(buf int) *ChannelSink {
 	if buf <= 0 {
 		buf = 256
 	}
-	return &ChannelSink{events: make(chan harness.UIEvent, buf)}
+	return &ChannelSink{events: make(chan harness.UIEvent, buf), done: make(chan struct{})}
 }
 
 func (s *ChannelSink) Emit(e harness.UIEvent) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return
 	}
-	if e.Kind != harness.EventStreamDelta && s.droppedStream > 0 {
-		notice := harness.UIEvent{
-			Kind:    harness.EventInfo,
-			Message: fmt.Sprintf("流式输出过快，已省略 %d 个片段；完整内容仍会进入模型上下文。", s.droppedStream),
-		}
+	s.mu.Unlock()
+
+	noisy := e.Kind == harness.EventStreamDelta || e.Kind == harness.EventCommandOutput
+	if noisy {
 		select {
-		case s.events <- notice:
-			s.droppedStream = 0
+		case s.events <- e:
+			return
 		default:
 		}
-	}
-	select {
-	case s.events <- e:
-	default:
 		timer := time.NewTimer(50 * time.Millisecond)
 		defer timer.Stop()
 		select {
 		case s.events <- e:
 			return
+		case <-s.done:
+			return
 		case <-timer.C:
+			s.mu.Lock()
+			if !s.closed {
+				s.droppedStream++
+			}
+			s.mu.Unlock()
+			return
 		}
-		if e.Kind == harness.EventStreamDelta {
-			s.droppedStream++
+	}
+
+	// Semantic events (finish/error/ask/result/step...) must never disappear.
+	// Serialize them so a dropped-output notice stays immediately before the
+	// event that made room for it.
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	s.mu.Lock()
+	dropped := s.droppedStream
+	s.droppedStream = 0
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return
+	}
+	if dropped > 0 {
+		notice := harness.UIEvent{
+			Kind:    harness.EventInfo,
+			Message: fmt.Sprintf("高频输出过快，已省略 %d 个显示片段；完整内容仍会进入模型上下文/审计结果。", dropped),
 		}
+		select {
+		case s.events <- notice:
+		case <-s.done:
+			return
+		}
+	}
+	select {
+	case s.events <- e:
+	case <-s.done:
 	}
 }
 
 func (s *ChannelSink) Events() <-chan harness.UIEvent { return s.events }
+func (s *ChannelSink) Done() <-chan struct{}          { return s.done }
 
 func (s *ChannelSink) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.closed {
 		s.closed = true
-		close(s.events)
+		close(s.done)
 	}
 }
 
@@ -73,6 +105,8 @@ func FormatActionLine(a *harness.AgentAction) string {
 	if a == nil {
 		return ""
 	}
+	redacted := harness.RedactedAction(*a)
+	a = &redacted
 	switch a.Type {
 	case harness.ActionTool:
 		args := ""

@@ -6,23 +6,25 @@ import "strings"
 type Provider string
 
 const (
-	ProviderOpenAI    Provider = "openai"
-	ProviderAnthropic Provider = "anthropic"
-	ProviderGoogle    Provider = "google"
-	ProviderDeepSeek  Provider = "deepseek"
-	ProviderQwen      Provider = "qwen"
-	ProviderMiniMax   Provider = "minimax"
-	ProviderMimo      Provider = "mimo"
-	ProviderGLM       Provider = "glm"
-	ProviderHunyuan   Provider = "hunyuan"
-	ProviderTencentHY Provider = "tencent_hy"
-	ProviderTeleAI    Provider = "teleai"
-	ProviderCTYun     Provider = "ctyun"
-	ProviderOllama    Provider = "ollama"
-	ProviderLMStudio  Provider = "lmstudio"
-	ProviderXAI       Provider = "xai"
-	ProviderGrok      Provider = "grok"
-	ProviderCustom    Provider = "custom"
+	ProviderOpenAI     Provider = "openai"
+	ProviderAnthropic  Provider = "anthropic"
+	ProviderGoogle     Provider = "google"
+	ProviderDeepSeek   Provider = "deepseek"
+	ProviderQwen       Provider = "qwen"
+	ProviderQianfan    Provider = "qianfan"
+	ProviderVolcengine Provider = "volcengine"
+	ProviderMiniMax    Provider = "minimax"
+	ProviderMimo       Provider = "mimo"
+	ProviderGLM        Provider = "glm"
+	ProviderHunyuan    Provider = "hunyuan"
+	ProviderTencentHY  Provider = "tencent_hy"
+	ProviderTeleAI     Provider = "teleai"
+	ProviderCTYun      Provider = "ctyun"
+	ProviderOllama     Provider = "ollama"
+	ProviderLMStudio   Provider = "lmstudio"
+	ProviderXAI        Provider = "xai"
+	ProviderGrok       Provider = "grok"
+	ProviderCustom     Provider = "custom"
 )
 
 const (
@@ -71,12 +73,22 @@ var AllProviders = []ProviderPreset{
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
+		ID: ProviderQianfan, DisplayName: "百度千帆 Coding Plan",
+		APIURL: "https://qianfan.baidubce.com/v2/coding", Model: "qianfan-code-latest",
+		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
+	},
+	{
+		ID: ProviderVolcengine, DisplayName: "火山方舟 Coding Plan",
+		APIURL: "https://ark.cn-beijing.volces.com/api/coding/v3", Model: "ark-code-latest",
+		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
+	},
+	{
 		ID: ProviderMiniMax, DisplayName: "MiniMax",
 		APIURL: "https://api.minimax.chat/v1", Model: "MiniMax-M3",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
-		ID: ProviderMimo, DisplayName: "Xiaomi MiMo",
+		ID: ProviderMimo, DisplayName: "Xiaomi MiMo Token Plan / MiMo Claw",
 		APIURL: "https://token-plan-cn.xiaomimimo.com/v1", Model: "mimo-v2.5-pro",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},

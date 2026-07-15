@@ -2,21 +2,25 @@ package harness
 
 import (
 	"ai-edr/internal/analyzer"
+	"ai-edr/internal/security"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
 	"time"
 )
 
 // CheckpointData 会话 checkpoint 快照
 type CheckpointData struct {
-	SessionID    string             `json:"session_id"`
-	StepNum      int                `json:"step_num"`
-	UserGoal     string             `json:"user_goal,omitempty"`
-	State        *AgentState        `json:"state"`
-	History      []analyzer.Message `json:"history"`
-	SavedAt      time.Time          `json:"saved_at"`
+	SessionID string             `json:"session_id"`
+	StepNum   int                `json:"step_num"`
+	UserGoal  string             `json:"user_goal,omitempty"`
+	State     *AgentState        `json:"state"`
+	History   []analyzer.Message `json:"history"`
+	SavedAt   time.Time          `json:"saved_at"`
 }
 
 // CheckpointStore checkpoint 持久化
@@ -25,16 +29,29 @@ type CheckpointStore struct {
 	sessionID string
 }
 
+var sessionIDPattern = regexp.MustCompile(`^session_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+
+func validateSessionID(sessionID string) error {
+	if !sessionIDPattern.MatchString(sessionID) {
+		return fmt.Errorf("非法 session_id: %q", sessionID)
+	}
+	return nil
+}
+
 // NewCheckpointStore 创建 checkpoint 存储
 func NewCheckpointStore(sessionID string) (*CheckpointStore, error) {
+	if err := validateSessionID(sessionID); err != nil {
+		return nil, err
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
 	dir := filepath.Join(home, ".deepsentry", "sessions", sessionID)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
+	_ = os.Chmod(dir, 0o700)
 	return &CheckpointStore{dir: dir, sessionID: sessionID}, nil
 }
 
@@ -51,15 +68,52 @@ func (c *CheckpointStore) Save(data CheckpointData) error {
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(c.dir, "checkpoint.json.tmp")
-	if err := os.WriteFile(tmp, raw, 0600); err != nil {
+	raw = []byte(security.RedactSensitiveText(string(raw)))
+	if !json.Valid(raw) {
+		return fmt.Errorf("checkpoint 脱敏后 JSON 无效，已拒绝写入")
+	}
+	tmpFile, err := os.CreateTemp(c.dir, "checkpoint-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(c.dir, "checkpoint.json"))
+	tmp := tmpFile.Name()
+	defer os.Remove(tmp)
+	if err := tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if _, err := tmpFile.Write(raw); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	return replaceCheckpointFile(tmp, filepath.Join(c.dir, "checkpoint.json"))
+}
+
+func replaceCheckpointFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	} else if runtime.GOOS != "windows" {
+		return err
+	}
+	// Windows cannot atomically replace an existing destination with Rename.
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Rename(src, dst)
 }
 
 // Load 加载 checkpoint
 func LoadCheckpoint(sessionID string) (*CheckpointData, error) {
+	if err := validateSessionID(sessionID); err != nil {
+		return nil, err
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
@@ -82,6 +136,9 @@ func LoadCheckpoint(sessionID string) (*CheckpointData, error) {
 	if data.State.Memory == nil {
 		data.State.Memory = make(map[string]string)
 	}
+	if data.State.CoreClues == nil {
+		data.State.CoreClues = []CoreClue{}
+	}
 	return &data, nil
 }
 
@@ -101,12 +158,13 @@ func ListSessions() ([]string, error) {
 	}
 	var ids []string
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && validateSessionID(e.Name()) == nil {
 			if _, err := os.Stat(filepath.Join(root, e.Name(), "checkpoint.json")); err == nil {
 				ids = append(ids, e.Name())
 			}
 		}
 	}
+	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
 	return ids, nil
 }
 
@@ -134,6 +192,12 @@ func ListSessionSummaries() ([]SessionSummary, error) {
 			ID: id, StepNum: cp.StepNum, SavedAt: cp.SavedAt, Goal: cp.UserGoal,
 		})
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].SavedAt.Equal(out[j].SavedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].SavedAt.After(out[j].SavedAt)
+	})
 	return out, nil
 }
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"ai-edr/internal/config"
 	"ai-edr/internal/executor"
@@ -52,9 +53,20 @@ func (r *Runner) Start(ctx context.Context, interval time.Duration) {
 func (r *Runner) RunDue(now time.Time) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if now.IsZero() {
+		now = time.Now()
+	}
 	if r.Store == nil {
 		r.Store = NewStore(r.Config.SchedulerStore)
 	}
+	release, acquired, err := acquireRunLock(r.Store.Path, now)
+	if err != nil {
+		return "", err
+	}
+	if !acquired {
+		return "已有另一个 DeepSentry 实例正在调度任务，本轮跳过", nil
+	}
+	defer release()
 	due, err := r.Store.Due(now)
 	if err != nil {
 		return "", err
@@ -77,6 +89,20 @@ func (r *Runner) RunDue(now time.Time) (string, error) {
 func (r *Runner) RunNow(id string, now time.Time) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if r.Store == nil {
+		r.Store = NewStore(r.Config.SchedulerStore)
+	}
+	release, acquired, err := acquireRunLock(r.Store.Path, now)
+	if err != nil {
+		return "", err
+	}
+	if !acquired {
+		return "", fmt.Errorf("已有另一个 DeepSentry 实例正在调度任务，请稍后重试")
+	}
+	defer release()
 	tasks, err := r.Store.Load()
 	if err != nil {
 		return "", err
@@ -91,6 +117,47 @@ func (r *Runner) RunNow(id string, now time.Time) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("未找到任务: %s", id)
+}
+
+const staleRunLockAfter = 6 * time.Hour
+
+func acquireRunLock(storePath string, now time.Time) (release func(), acquired bool, err error) {
+	if strings.TrimSpace(storePath) == "" {
+		storePath = DefaultStorePath
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	lockPath := storePath + ".run.lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return nil, false, err
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		f, openErr := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if openErr == nil {
+			_, _ = fmt.Fprintf(f, "pid=%d started=%s\n", os.Getpid(), now.Format(time.RFC3339))
+			_ = f.Close()
+			var once sync.Once
+			return func() { once.Do(func() { _ = os.Remove(lockPath) }) }, true, nil
+		}
+		if !os.IsExist(openErr) {
+			return nil, false, openErr
+		}
+		info, statErr := os.Stat(lockPath)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			return nil, false, statErr
+		}
+		if now.Sub(info.ModTime()) <= staleRunLockAfter {
+			return func() {}, false, nil
+		}
+		if removeErr := os.Remove(lockPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			return nil, false, removeErr
+		}
+	}
+	return func() {}, false, nil
 }
 
 func (r *Runner) runOne(task Task, now time.Time) Task {
@@ -266,9 +333,10 @@ func nextRun(task Task, now time.Time) time.Time {
 
 func writeScheduleReport(id string, now time.Time, content string) (string, error) {
 	dir := filepath.Join("reports", "schedules")
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
+	_ = os.Chmod(dir, 0o700)
 	path := filepath.Join(dir, fmt.Sprintf("report_%s_%s.md", id, now.Format("20060102_150405")))
 	return path, os.WriteFile(path, []byte(content), 0600)
 }
@@ -281,7 +349,21 @@ func truncateReport(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "\n...(报告内容过长已截断)..."
+	return safeTextPrefix(s, max) + "\n...(报告内容过长已截断)..."
+}
+
+func safeTextPrefix(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	end := maxBytes
+	for end > 0 && !utf8.ValidString(s[:end]) {
+		end--
+	}
+	return s[:end]
 }
 
 func emptyDefault(s, def string) string {

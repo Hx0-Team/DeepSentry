@@ -123,8 +123,7 @@ func testIPv4Layer(proto layers.IPProtocol) *layers.IPv4 {
 func serializeLayers(t *testing.T, layersIn ...gopacket.SerializableLayer) []byte {
 	t.Helper()
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	var buf gopacket.SerializeBuffer
-	buf = gopacket.NewSerializeBuffer()
+	buf := gopacket.NewSerializeBuffer()
 	if err := gopacket.SerializeLayers(buf, opts, layersIn...); err != nil {
 		t.Fatal(err)
 	}

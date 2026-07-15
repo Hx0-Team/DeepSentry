@@ -6,15 +6,70 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"ai-edr/internal/executor"
+	"ai-edr/internal/config"
 )
 
+type archiveBudget struct {
+	entries, maxEntries      int
+	total, maxFile, maxTotal int64
+}
+
+func newArchiveBudget() *archiveBudget {
+	entries, fileBytes, totalBytes := config.GlobalConfig.EffectiveArchiveLimits()
+	return &archiveBudget{maxEntries: entries, maxFile: fileBytes, maxTotal: totalBytes}
+}
+
+func (b *archiveBudget) allow(name string, declared int64) (int64, error) {
+	b.entries++
+	if b.entries > b.maxEntries {
+		return 0, fmt.Errorf("归档条目超过上限 %d", b.maxEntries)
+	}
+	if declared < 0 {
+		return 0, fmt.Errorf("归档条目 %s 尺寸非法", name)
+	}
+	if declared > b.maxFile {
+		return 0, fmt.Errorf("归档条目 %s 超过单文件上限 %d 字节", name, b.maxFile)
+	}
+	remaining := b.maxTotal - b.total
+	if declared > remaining {
+		return 0, fmt.Errorf("归档解压总量超过上限 %d 字节", b.maxTotal)
+	}
+	if remaining > b.maxFile {
+		remaining = b.maxFile
+	}
+	return remaining, nil
+}
+
+func (b *archiveBudget) addExtracted(name string, n, allowed int64) error {
+	if n > allowed {
+		return fmt.Errorf("归档条目 %s 实际解压大小超过安全上限", name)
+	}
+	b.total += n
+	return nil
+}
+
+func safeArchiveName(name string) (string, error) {
+	name = filepath.Clean(filepath.FromSlash(strings.TrimSpace(name)))
+	if name == "." || name == "" || filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("非法归档路径: %s", name)
+	}
+	return name, nil
+}
+
+func openArchiveRoot(dest string) (*os.Root, error) {
+	if err := os.MkdirAll(dest, 0o750); err != nil {
+		return nil, err
+	}
+	return os.OpenRoot(dest)
+}
+
 func FileDownload(rt Runtime, remotePath, localPath string, chunkSize int) (string, error) {
-	if executor.Current == nil {
+	if rt.Exec == nil {
 		return "", fmt.Errorf("执行器未初始化")
 	}
 	if remotePath == "" || localPath == "" {
@@ -23,13 +78,13 @@ func FileDownload(rt Runtime, remotePath, localPath string, chunkSize int) (stri
 	if chunkSize <= 0 {
 		chunkSize = 4 << 20
 	}
-	out, err := executor.Current.Run("download " + shellQuote(remotePath) + " " + shellQuote(localPath))
+	out, err := rt.Exec.Run("download " + shellQuote(remotePath) + " " + shellQuote(localPath))
 	logPath := writeToolExecLog("file_download", fmt.Sprintf("%s -> %s chunk=%d", remotePath, localPath, chunkSize), out, err)
 	return formatTransferResult(rt, "下载", remotePath, localPath, chunkSize, logPath, out, err), err
 }
 
 func FileUpload(rt Runtime, localPath, remotePath string, chunkSize int) (string, error) {
-	if executor.Current == nil {
+	if rt.Exec == nil {
 		return "", fmt.Errorf("执行器未初始化")
 	}
 	if localPath == "" || remotePath == "" {
@@ -38,7 +93,7 @@ func FileUpload(rt Runtime, localPath, remotePath string, chunkSize int) (string
 	if chunkSize <= 0 {
 		chunkSize = 4 << 20
 	}
-	out, err := executor.Current.Run("upload " + shellQuote(localPath) + " " + shellQuote(remotePath))
+	out, err := rt.Exec.Run("upload " + shellQuote(localPath) + " " + shellQuote(remotePath))
 	logPath := writeToolExecLog("file_upload", fmt.Sprintf("%s -> %s chunk=%d", localPath, remotePath, chunkSize), out, err)
 	return formatTransferResult(rt, "上传", localPath, remotePath, chunkSize, logPath, out, err), err
 }
@@ -50,12 +105,12 @@ func ArchivePack(rt Runtime, format, source, dest string) (string, error) {
 	}
 	var out string
 	var err error
-	if executor.Current != nil && executor.Current.IsRemote() {
+	if rt.Exec != nil && rt.Exec.IsRemote() {
 		cmd, cerr := archivePackCommand(format, source, dest)
 		if cerr != nil {
 			return "", cerr
 		}
-		out, err = executor.Current.Run(cmd)
+		out, err = rt.Exec.Run(cmd)
 	} else {
 		err = packLocalArchive(format, source, dest)
 		if err == nil {
@@ -73,12 +128,8 @@ func ArchiveExtract(rt Runtime, format, source, dest string) (string, error) {
 	}
 	var out string
 	var err error
-	if executor.Current != nil && executor.Current.IsRemote() {
-		cmd, cerr := archiveExtractCommand(format, source, dest)
-		if cerr != nil {
-			return "", cerr
-		}
-		out, err = executor.Current.Run(cmd)
+	if rt.Exec != nil && rt.Exec.IsRemote() {
+		return "", fmt.Errorf("远程直接解压已禁用：无法跨所有目标工具链可靠阻止 Zip-Slip、符号链接逃逸和解压炸弹；请先 file_download 到控制端安全解压，检查后再 file_upload")
 	} else {
 		err = extractLocalArchive(format, source, dest)
 		if err == nil {
@@ -205,93 +256,164 @@ func archiveResult(rt Runtime, op, format, source, dest, logPath, out string, er
 }
 
 func packZip(source, dest string) error {
-	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
-		return err
-	}
-	out, err := os.Create(dest)
+	out, err := openPrivateArchiveDest(dest)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 	zw := zip.NewWriter(out)
-	defer zw.Close()
-	base := filepath.Dir(source)
-	return filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+	walkErr := walkPackSource(source, func(name string, _ os.FileInfo, open func() (*os.File, error)) error {
+		w, err := zw.Create(name)
 		if err != nil {
 			return err
 		}
-		if info.IsDir() {
-			return nil
-		}
-		rel, _ := filepath.Rel(base, path)
-		w, err := zw.Create(rel)
+		in, err := open()
 		if err != nil {
 			return err
 		}
-		in, err := os.Open(path)
-		if err != nil {
-			return err
+		_, copyErr := io.Copy(w, in)
+		closeErr := in.Close()
+		if copyErr != nil {
+			return copyErr
 		}
-		defer in.Close()
-		_, err = io.Copy(w, in)
-		return err
+		return closeErr
 	})
+	zipCloseErr := zw.Close()
+	outCloseErr := out.Close()
+	finalErr := firstArchiveError(walkErr, zipCloseErr, outCloseErr)
+	if finalErr != nil {
+		_ = os.Remove(dest)
+	}
+	return finalErr
 }
 
 func packTar(source, dest string) error {
-	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
-		return err
-	}
-	out, err := os.Create(dest)
+	out, err := openPrivateArchiveDest(dest)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 	tw := tar.NewWriter(out)
-	defer tw.Close()
-	return writeTar(source, filepath.Dir(source), tw)
+	writeErr := writeTar(source, tw)
+	tarCloseErr := tw.Close()
+	outCloseErr := out.Close()
+	finalErr := firstArchiveError(writeErr, tarCloseErr, outCloseErr)
+	if finalErr != nil {
+		_ = os.Remove(dest)
+	}
+	return finalErr
 }
 
 func packTarGz(source, dest string) error {
-	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
-		return err
-	}
-	out, err := os.Create(dest)
+	out, err := openPrivateArchiveDest(dest)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 	gw := gzip.NewWriter(out)
-	defer gw.Close()
 	tw := tar.NewWriter(gw)
-	defer tw.Close()
-	return writeTar(source, filepath.Dir(source), tw)
+	writeErr := writeTar(source, tw)
+	tarCloseErr := tw.Close()
+	gzipCloseErr := gw.Close()
+	outCloseErr := out.Close()
+	finalErr := firstArchiveError(writeErr, tarCloseErr, gzipCloseErr, outCloseErr)
+	if finalErr != nil {
+		_ = os.Remove(dest)
+	}
+	return finalErr
 }
 
-func writeTar(source, base string, tw *tar.Writer) error {
-	return filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+func openPrivateArchiveDest(dest string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+		return nil, err
+	}
+	_ = os.Chmod(filepath.Dir(dest), 0o700)
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := out.Chmod(0o600); err != nil {
+		_ = out.Close()
+		return nil, err
+	}
+	return out, nil
+}
+
+func firstArchiveError(errs ...error) error {
+	for _, err := range errs {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() {
-			return nil
-		}
-		rel, _ := filepath.Rel(base, path)
+	}
+	return nil
+}
+
+func writeTar(source string, tw *tar.Writer) error {
+	return walkPackSource(source, func(name string, info os.FileInfo, open func() (*os.File, error)) error {
 		h, err := tar.FileInfoHeader(info, "")
 		if err != nil {
 			return err
 		}
-		h.Name = rel
+		h.Name = name
 		if err := tw.WriteHeader(h); err != nil {
 			return err
 		}
-		in, err := os.Open(path)
+		in, err := open()
 		if err != nil {
 			return err
 		}
-		defer in.Close()
-		_, err = io.Copy(tw, in)
+		_, copyErr := io.Copy(tw, in)
+		closeErr := in.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
+}
+
+// walkPackSource 用 os.Root 把打包读取限定在源目录内。遍历时拒绝链接和
+// 特殊文件，避免取证包因符号链接或 Walk/Open 竞态意外携带目录外数据。
+func walkPackSource(source string, visit func(name string, info os.FileInfo, open func() (*os.File, error)) error) error {
+	source = filepath.Clean(source)
+	info, err := os.Lstat(source)
+	if err != nil {
 		return err
+	}
+	if !info.IsDir() {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("拒绝打包符号链接或特殊文件: %s", source)
+		}
+		root, err := os.OpenRoot(filepath.Dir(source))
+		if err != nil {
+			return err
+		}
+		defer root.Close()
+		base := filepath.Base(source)
+		return visit(filepath.ToSlash(base), info, func() (*os.File, error) { return root.Open(base) })
+	}
+
+	root, err := os.OpenRoot(source)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	prefix := filepath.Base(source)
+	return fs.WalkDir(root.FS(), ".", func(rel string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if rel == "." || entry.IsDir() {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("拒绝打包符号链接或特殊文件: %s", filepath.Join(source, filepath.FromSlash(rel)))
+		}
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !entryInfo.Mode().IsRegular() {
+			return fmt.Errorf("拒绝打包符号链接或特殊文件: %s", filepath.Join(source, filepath.FromSlash(rel)))
+		}
+		archiveName := filepath.ToSlash(filepath.Join(prefix, filepath.FromSlash(rel)))
+		return visit(archiveName, entryInfo, func() (*os.File, error) { return root.Open(filepath.FromSlash(rel)) })
 	})
 }
 
@@ -301,34 +423,63 @@ func extractZip(source, dest string) error {
 		return err
 	}
 	defer r.Close()
+	root, err := openArchiveRoot(dest)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	budget := newArchiveBudget()
 	for _, f := range r.File {
-		target := filepath.Join(dest, f.Name)
-		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(dest)+string(os.PathSeparator)) {
-			return fmt.Errorf("非法 zip 路径: %s", f.Name)
+		name, err := safeArchiveName(f.Name)
+		if err != nil {
+			return err
 		}
 		if f.FileInfo().IsDir() {
-			if err := os.MkdirAll(target, 0755); err != nil {
+			if _, err := budget.allow(name, 0); err != nil {
+				return err
+			}
+			if err := root.MkdirAll(name, 0o750); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		if !f.Mode().IsRegular() {
+			return fmt.Errorf("拒绝解压非普通 zip 条目: %s", f.Name)
+		}
+		if f.UncompressedSize64 > uint64(^uint64(0)>>1) {
+			return fmt.Errorf("拒绝解压尺寸超出 int64 范围的 zip 条目: %s", f.Name)
+		}
+		allowed, err := budget.allow(name, int64(f.UncompressedSize64))
+		if err != nil {
+			return err
+		}
+		if err := root.MkdirAll(filepath.Dir(name), 0o750); err != nil {
 			return err
 		}
 		in, err := f.Open()
 		if err != nil {
 			return err
 		}
-		out, err := os.Create(target)
+		out, err := root.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 		if err != nil {
-			in.Close()
+			_ = in.Close()
 			return err
 		}
-		_, err = io.Copy(out, in)
-		in.Close()
-		out.Close()
-		if err != nil {
-			return err
+		n, copyErr := io.Copy(out, io.LimitReader(in, allowed+1))
+		closeInErr := in.Close()
+		closeOutErr := out.Close()
+		if copyErr == nil {
+			copyErr = closeInErr
+		}
+		if copyErr == nil {
+			copyErr = closeOutErr
+		}
+		if copyErr == nil {
+			copyErr = budget.addExtracted(name, n, allowed)
+		}
+		if copyErr != nil {
+			_ = root.Remove(name)
+			return copyErr
 		}
 	}
 	return nil
@@ -350,6 +501,12 @@ func extractTar(source, dest string, gz bool) error {
 		r = gr
 	}
 	tr := tar.NewReader(r)
+	root, err := openArchiveRoot(dest)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	budget := newArchiveBudget()
 	for {
 		h, err := tr.Next()
 		if err == io.EOF {
@@ -358,27 +515,45 @@ func extractTar(source, dest string, gz bool) error {
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(dest, h.Name)
-		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(dest)+string(os.PathSeparator)) {
-			return fmt.Errorf("非法 tar 路径: %s", h.Name)
+		name, err := safeArchiveName(h.Name)
+		if err != nil {
+			return err
 		}
-		if h.FileInfo().IsDir() {
-			if err := os.MkdirAll(target, 0755); err != nil {
+		switch h.Typeflag {
+		case tar.TypeDir:
+			if _, err := budget.allow(name, 0); err != nil {
+				return err
+			}
+			if err := root.MkdirAll(name, 0o750); err != nil {
 				return err
 			}
 			continue
+		case tar.TypeReg:
+		default:
+			return fmt.Errorf("拒绝解压 tar 链接或特殊文件: %s", h.Name)
 		}
-		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-			return err
-		}
-		out, err := os.Create(target)
+		allowed, err := budget.allow(name, h.Size)
 		if err != nil {
 			return err
 		}
-		_, err = io.Copy(out, tr)
-		out.Close()
+		if err := root.MkdirAll(filepath.Dir(name), 0o750); err != nil {
+			return err
+		}
+		out, err := root.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 		if err != nil {
 			return err
+		}
+		n, copyErr := io.Copy(out, io.LimitReader(tr, allowed+1))
+		closeErr := out.Close()
+		if copyErr == nil {
+			copyErr = closeErr
+		}
+		if copyErr == nil {
+			copyErr = budget.addExtracted(name, n, allowed)
+		}
+		if copyErr != nil {
+			_ = root.Remove(name)
+			return copyErr
 		}
 	}
 }

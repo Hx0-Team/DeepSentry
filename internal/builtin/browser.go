@@ -2,7 +2,7 @@ package builtin
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -133,6 +133,7 @@ func findBrowserBinary() (string, string) {
 			continue
 		}
 		if strings.Contains(cand, string(os.PathSeparator)) {
+			// #nosec G703 -- 候选路径只来自本机管理员设置的 DEEPSENTRY_BROWSER_BINARY 或程序内置安装路径，此处仅做存在性检查。
 			if st, err := os.Stat(cand); err == nil && !st.IsDir() {
 				return cand, ""
 			}
@@ -233,10 +234,11 @@ func captureBrowserScreenshot(bin, u string, waitMs int) (string, error) {
 	if dir == "" {
 		dir = "reports/browser"
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	sum := sha1.Sum([]byte(u + time.Now().Format(time.RFC3339Nano)))
+	_ = os.Chmod(dir, 0o700)
+	sum := sha256.Sum256([]byte(u + time.Now().Format(time.RFC3339Nano)))
 	path := filepath.Join(dir, "browser_"+hex.EncodeToString(sum[:])[:12]+".png")
 	ctx, cancel := context.WithTimeout(context.Background(), browserTimeout())
 	defer cancel()
@@ -274,6 +276,9 @@ func captureBrowserScreenshot(bin, u string, waitMs int) (string, error) {
 			detail = stdout.String()
 		}
 		return "", fmt.Errorf("%v: %s", err, truncateOneLine(strings.ToValidUTF8(detail, ""), 400))
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", fmt.Errorf("收紧浏览器截图权限失败: %w", err)
 	}
 	return path, nil
 }
@@ -348,7 +353,7 @@ func selectRenderedFragment(html, selector string) string {
 	}
 	re := regexp.MustCompile(pattern)
 	loc := re.FindStringSubmatchIndex(html)
-	if loc == nil || len(loc) < 4 {
+	if len(loc) < 4 {
 		return ""
 	}
 	start := loc[0]

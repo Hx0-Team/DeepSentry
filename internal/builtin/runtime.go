@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // Runtime 工具运行时上下文
@@ -113,5 +114,9 @@ func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "\n...(输出已截断)..."
+	end := max
+	for end > 0 && !utf8.ValidString(s[:end]) {
+		end--
+	}
+	return s[:end] + "\n...(输出已截断)..."
 }

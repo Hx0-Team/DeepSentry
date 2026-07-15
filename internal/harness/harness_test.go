@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestParseActionInfersTool(t *testing.T) {
@@ -21,6 +22,26 @@ func TestParseActionInfersTool(t *testing.T) {
 	})
 	if action.Type != ActionTool {
 		t.Fatalf("expected ActionTool, got %s", action.Type)
+	}
+}
+
+func TestBuildSystemPromptAdaptsDensityToModelProfile(t *testing.T) {
+	original := config.GlobalConfig
+	t.Cleanup(func() { config.GlobalConfig = original })
+	agent := &DeepAgent{}
+
+	config.GlobalConfig = config.Config{Provider: "ollama", ModelName: "qwen-14b-32k"}
+	compact := agent.BuildSystemPrompt("")
+	config.GlobalConfig = config.Config{Provider: "google", ModelName: "gemini-3.1-pro", ContextWindowTokens: 1_048_576}
+	full := agent.BuildSystemPrompt("")
+
+	if len(compact) >= len(full) {
+		t.Fatalf("compact prompt was not reduced: compact=%d full=%d", len(compact), len(full))
+	}
+	for _, required := range []string{"tool_catalog", "config_manage", "风险确认", "验证结果"} {
+		if !strings.Contains(compact, required) {
+			t.Fatalf("compact prompt lost required rule %q", required)
+		}
 	}
 }
 
@@ -133,6 +154,34 @@ func TestIsEmptyAction(t *testing.T) {
 	}
 }
 
+func TestAppendSudoGuidanceExplainsRemotePasswordPolicy(t *testing.T) {
+	out := appendSudoGuidance("sudo: a password is required", true, false)
+	for _, want := range []string{"SUDO_REQUIRED", "SSH 密码", "NOPASSWD"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("sudo guidance missing %q: %s", want, out)
+		}
+	}
+	if got := appendSudoGuidance("ok", true, false); got != "ok" {
+		t.Fatalf("successful sudo output should be unchanged: %q", got)
+	}
+}
+
+func TestHandleExecuteForcesRemoteSudoNonInteractive(t *testing.T) {
+	ex := &capturingSudoExecutor{}
+	agent := &DeepAgent{}
+	action := AgentAction{Type: ActionExecute, Command: "sudo du -sh /root"}
+	result, err := agent.HandleAction(&StepContext{Executor: ex}, &action)
+	if err != nil {
+		t.Fatalf("HandleAction sudo: %v", err)
+	}
+	if ex.command != "sudo -n du -sh /root" {
+		t.Fatalf("remote sudo command=%q", ex.command)
+	}
+	if result == nil || !strings.Contains(result.Output, "SUDO_REQUIRED") || !strings.Contains(result.Output, "NOPASSWD") {
+		t.Fatalf("missing safe remote sudo guidance: %#v", result)
+	}
+}
+
 func TestUnknownUploadActionGuidance(t *testing.T) {
 	got := unknownActionGuidance(AgentAction{Type: ActionType("upload")})
 	for _, want := range []string{`action="execute"`, "upload <本地路径> <远程路径>", "不是独立 action"} {
@@ -184,6 +233,7 @@ func TestBlockDeepSentryConfigShell(t *testing.T) {
 		"sed -i 's/a/b/' /root/config.yaml",
 		"cat ./config.yaml",
 		"python3 - <<'PY'\nopen('config.yaml').read()\nPY",
+		"local_run cat /tmp/.deepsentry_backups/config_20260714_105154_000000000.yaml",
 	}
 	for _, cmd := range cases {
 		out, blocked := blockDeepSentryConfigShell(cmd, fakeRemoteExecutor{})
@@ -197,6 +247,9 @@ func TestBlockDeepSentryConfigShell(t *testing.T) {
 
 	if _, blocked := blockDeepSentryConfigShell("cat /var/www/app/config.yaml", fakeRemoteExecutor{}); blocked {
 		t.Fatal("business config path should not be blocked")
+	}
+	if !isProtectedPath("/tmp/.deepsentry_backups/config_20260714_105154_000000000.yaml") {
+		t.Fatal("managed config backup must be a protected path")
 	}
 }
 
@@ -246,6 +299,32 @@ func TestResolveFleetExecRiskUsesInnerCommand(t *testing.T) {
 	}
 }
 
+func TestToolDiscoveryAndInvalidCallsDoNotRequestRiskApproval(t *testing.T) {
+	for _, action := range []AgentAction{
+		{Type: ActionTool, ToolName: "tool_catalog", ToolArgs: map[string]string{"name": "config_manage"}},
+		{Type: ActionTool, ToolName: "config_manage", ToolArgs: map[string]string{"action": "ssh_add_target"}},
+		{Type: ActionTool, ToolName: "config_manage", ToolArgs: map[string]string{"action": "status"}},
+	} {
+		risk, reason := classifyToolRisk(action)
+		if risk != tools.RiskLow {
+			t.Fatalf("%s should be low risk before execution, got %s (%s)", action.ToolName, risk, reason)
+		}
+	}
+	write := AgentAction{Type: ActionTool, ToolName: "config_manage", ToolArgs: map[string]string{
+		"action": "add_target", "protocol": "ssh", "host": "10.0.0.8", "port": "2222", "user": "root",
+	}}
+	if risk, _ := classifyToolRisk(write); risk != tools.RiskHigh {
+		t.Fatalf("valid config mutation should still require approval, got %s", risk)
+	}
+}
+
+func TestClassifyUnknownToolRequiresConfirmation(t *testing.T) {
+	risk, reason := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: "not_registered_anywhere"})
+	if risk != tools.RiskHigh || !strings.Contains(reason, "未知工具") {
+		t.Fatalf("unknown tool risk=%q reason=%q", risk, reason)
+	}
+}
+
 func TestResolveFleetFileRiskUsesAction(t *testing.T) {
 	tool, ok := tools.Get("fleet_file")
 	if !ok {
@@ -272,11 +351,21 @@ func TestResolveFleetFileRiskUsesAction(t *testing.T) {
 	}
 }
 
+func TestSafeUTF8BytePrefixNeverSplitsRune(t *testing.T) {
+	got := safeUTF8BytePrefix("你好abc", 4)
+	if got != "你" {
+		t.Fatalf("safe prefix=%q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("safe prefix is invalid UTF-8: %q", got)
+	}
+}
+
 func TestEnrichActionExecutionTargetLocalRunOverridesRemote(t *testing.T) {
 	origExecutor := executor.Current
 	origHost := config.GlobalConfig.SSHHost
 	executor.Current = fakeSSHExecutor{}
-	config.GlobalConfig.SSHHost = "8.137.114.242:2222"
+	config.GlobalConfig.SSHHost = "198.51.100.42:2222"
 	defer func() {
 		executor.Current = origExecutor
 		config.GlobalConfig.SSHHost = origHost
@@ -290,7 +379,7 @@ func TestEnrichActionExecutionTargetLocalRunOverridesRemote(t *testing.T) {
 
 	remote := AgentAction{Type: ActionExecute, Command: "hostname"}
 	enrichActionExecutionTarget(&remote)
-	if remote.TargetProtocol != "ssh" || remote.TargetHost != "8.137.114.242:2222" {
+	if remote.TargetProtocol != "ssh" || remote.TargetHost != "198.51.100.42:2222" {
 		t.Fatalf("remote target = proto=%q host=%q, want ssh host", remote.TargetProtocol, remote.TargetHost)
 	}
 }
@@ -310,3 +399,18 @@ func (fakeRemoteExecutor) Close()         {}
 type fakeSSHExecutor struct{ fakeRemoteExecutor }
 
 func (fakeSSHExecutor) Mode() string { return "ssh" }
+
+type capturingSudoExecutor struct{ command string }
+
+func (e *capturingSudoExecutor) Run(command string) (string, error) {
+	e.command = command
+	return "sudo: a password is required", nil
+}
+func (*capturingSudoExecutor) ReadTargetFile(string) ([]byte, error) {
+	return nil, errors.New("unused")
+}
+func (*capturingSudoExecutor) ListTargetDir(string) ([]string, error) {
+	return nil, errors.New("unused")
+}
+func (*capturingSudoExecutor) IsRemote() bool { return true }
+func (*capturingSudoExecutor) Close()         {}

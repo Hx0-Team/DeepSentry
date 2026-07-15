@@ -16,12 +16,12 @@ func TestRenderWelcomeBannerFitsWidth(t *testing.T) {
 		BuildTime:  "2026-06-26",
 		ModelInfo:  "lmstudio / local-model",
 		ConnInfo:   "Fleet 多目标: 2 台",
-		ConfigPath: "/Users/kaka/安全工具/自研工具/DeepSentry-deepagent/build/config.yaml",
-		ReportPath: "/Users/kaka/安全工具/自研工具/DeepSentry-deepagent/build/reports/report.md",
+		ConfigPath: "/opt/deepsentry/config.yaml",
+		ReportPath: "/opt/deepsentry/reports/report.md",
 		OS:         "Darwin",
 		Arch:       "arm64",
-		Username:   "kaka",
-		WorkDir:    "/Users/kaka/安全工具/自研工具/DeepSentry-deepagent",
+		Username:   "demo",
+		WorkDir:    "/opt/deepsentry",
 		ModeLine:   "🔌 [模式切换] 本地执行模式",
 		ToolCount:  51,
 		Tip:        "Tab 聚焦输入框，Enter 发送安全任务",
@@ -82,6 +82,21 @@ func TestBannerAndInputBoxAlign(t *testing.T) {
 	}
 }
 
+func TestCompactWelcomeBannerNeverExceedsNarrowWidth(t *testing.T) {
+	info := StartupInfo{
+		Version: "2.0", ModelInfo: "provider / very-long-model-name", ConnInfo: "Fleet 多目标: 12 台", AwaitGoal: true,
+		Tip: "这是一条很长的使用提示，需要在窄窗口内截断",
+	}
+	for _, width := range []int{20, 30, 48, 79} {
+		out := renderWelcomeBanner(info, width)
+		for row, line := range strings.Split(out, "\n") {
+			if got := lipgloss.Width(line); got != width {
+				t.Fatalf("width=%d row=%d got=%d line=%q", width, row, got, stripANSIForTest(line))
+			}
+		}
+	}
+}
+
 func TestBannerColumnRatio(t *testing.T) {
 	cw := ChromeContentWidth(100)
 	inner := cw - 2
@@ -100,7 +115,7 @@ func TestRobotLogoSymmetric(t *testing.T) {
 	if len(lines) != 9 {
 		t.Fatalf("expected 9 robot lines, got %d", len(lines))
 	}
-	wantW := 15
+	wantW := 16
 	for i, line := range lines {
 		if strings.TrimSpace(line) == "" {
 			t.Fatalf("empty robot line at %d", i)
@@ -118,8 +133,28 @@ func TestRobotLogoSymmetric(t *testing.T) {
 }
 
 func TestRandomUsageTipStablePool(t *testing.T) {
-	if len(bannerTips) < 20 {
+	if len(bannerTips) < 120 {
 		t.Fatalf("expected a rich tip pool, got %d", len(bannerTips))
+	}
+	joined := strings.Join(bannerTips, "\n")
+	for _, feature := range []string{
+		"ctx=", "64K、128K", "context_window_tokens", "tool_catalog", "config_manage",
+		"fleet_inventory", "parallel_tasks", "核心线索", "schedule_task", "headless_browser",
+		"pcap_analyze", "db_config_audit", "MCP", "Native Tool schema", "checkpoint",
+	} {
+		if !strings.Contains(joined, feature) {
+			t.Fatalf("tip pool missing latest capability %q", feature)
+		}
+	}
+	seenExact := map[string]bool{}
+	for index, tip := range bannerTips {
+		if strings.TrimSpace(tip) == "" {
+			t.Fatalf("empty tip at index %d", index)
+		}
+		if seenExact[tip] {
+			t.Fatalf("duplicate tip: %q", tip)
+		}
+		seenExact[tip] = true
 	}
 	seen := map[string]struct{}{}
 	for i := 0; i < 80; i++ {
@@ -159,8 +194,9 @@ func TestStartupTipPinnedAtInit(t *testing.T) {
 			t.Fatalf("refresh %d: startupInfo.Tip changed", i)
 		}
 		banner := stripANSIForTest(m.cachedWelcomeBanner(m.viewport.Width))
-		if !strings.Contains(banner, pinned) {
-			t.Fatalf("refresh %d: cached banner lost pinned tip %q", i, pinned)
+		visiblePrefix := runewidth.Truncate(pinned, 12, "")
+		if !strings.Contains(banner, visiblePrefix) {
+			t.Fatalf("refresh %d: cached banner lost pinned tip prefix %q (tip=%q)", i, visiblePrefix, pinned)
 		}
 		if !strings.Contains(banner, startedAt) {
 			t.Fatalf("refresh %d: cached banner lost pinned StartedAt %q", i, startedAt)

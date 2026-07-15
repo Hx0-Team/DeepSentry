@@ -1,6 +1,9 @@
 package analyzer
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 // extractJSONPayload 从混合文本/Markdown 中提取 JSON 对象，并返回前置说明文字
 func extractJSONPayload(s string) (jsonPart, prose string) {
@@ -94,8 +97,142 @@ func normalizeProseThought(prose string) string {
 	// 去掉常见前缀符号
 	prose = strings.TrimPrefix(prose, "💭")
 	prose = strings.TrimSpace(prose)
-	if len(prose) > 500 {
-		prose = prose[:500] + "..."
+	if runes := []rune(prose); len(runes) > 500 {
+		prose = string(runes[:500]) + "..."
 	}
 	return prose
+}
+
+// recoverPlainTextResponse handles providers that occasionally ignore the
+// requested JSON envelope and answer with ordinary Markdown.  A readable
+// answer must never be turned into a fatal "JSON parse failed" report.
+func recoverPlainTextResponse(raw string) (AgentResponse, bool) {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return AgentResponse{}, false
+	}
+
+	// A response that is clearly trying to be JSON is more likely truncated
+	// than conversational. Let the harness request a corrected action instead
+	// of exposing parser internals to the user.
+	if looksLikeJSONEnvelope(text) {
+		return AgentResponse{
+			Thought:   "模型响应 JSON 不完整，正在自动请求重新输出。",
+			RiskLevel: "low",
+		}, true
+	}
+
+	if question := extractClarificationQuestion(text); question != "" {
+		return AgentResponse{
+			Thought:   "需要用户补充信息后继续任务",
+			Action:    "ask_user",
+			Question:  question,
+			RiskLevel: "low",
+		}, true
+	}
+
+	if looksLikeExecutionIntent(text) {
+		if command := extractMarkdownShellCommand(text); command != "" {
+			thought := normalizeProseThought(textBeforeFirstFence(text))
+			if thought == "" {
+				thought = "模型返回了自然语言步骤，已从代码块恢复待执行命令。"
+			}
+			return finalizeResponse(AgentResponse{
+				Thought:   thought,
+				Action:    "execute",
+				Command:   command,
+				RiskLevel: "low",
+			}), true
+		}
+		// The model announced another step but omitted the machine-readable
+		// action. Ask it to continue rather than presenting an unfinished plan
+		// as a final report.
+		return AgentResponse{
+			Thought:   "模型已说明下一步但未给出可执行指令，正在自动请求补全。",
+			RiskLevel: "low",
+		}, true
+	}
+
+	// Plain prose without a pending action is already a valid user-facing
+	// answer. Preserve its Markdown and finish cleanly.
+	return AgentResponse{
+		Thought:     "模型返回了自然语言结论，已直接呈现。",
+		Action:      "finish",
+		FinalReport: text,
+		IsFinished:  true,
+		RiskLevel:   "low",
+	}, true
+}
+
+func looksLikeJSONEnvelope(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return strings.HasPrefix(trimmed, "{") ||
+		strings.HasPrefix(strings.ToLower(trimmed), "```json") ||
+		strings.Contains(trimmed, `"action"`)
+}
+
+func looksLikeExecutionIntent(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"让我", "我来", "我先", "接下来", "下一步", "先从", "重新来", "开始排查",
+		"开始检查", "准备执行", "执行下面", "运行下面", "运行以下", "用下面",
+		"let me", "i'll run", "i will run", "next,", "next step", "starting with",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func textBeforeFirstFence(text string) string {
+	if idx := strings.Index(text, "```"); idx >= 0 {
+		return strings.TrimSpace(text[:idx])
+	}
+	return text
+}
+
+func extractMarkdownShellCommand(text string) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	inFence := false
+	shellFence := false
+	var command []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			if !inFence {
+				lang := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(trimmed, "```")))
+				shellFence = lang == "" || lang == "sh" || lang == "bash" || lang == "shell" || lang == "zsh" || lang == "console"
+				inFence = true
+				command = command[:0]
+				continue
+			}
+			if shellFence {
+				candidate := strings.TrimSpace(strings.Join(command, "\n"))
+				if candidate != "" {
+					return stripShellPrompt(candidate)
+				}
+			}
+			inFence = false
+			shellFence = false
+			command = command[:0]
+			continue
+		}
+		if inFence && shellFence {
+			command = append(command, line)
+		}
+	}
+	return ""
+}
+
+func stripShellPrompt(command string) string {
+	lines := strings.Split(command, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimLeftFunc(line, unicode.IsSpace)
+		if strings.HasPrefix(trimmed, "$ ") || strings.HasPrefix(trimmed, "> ") {
+			indent := line[:len(line)-len(trimmed)]
+			lines[i] = indent + trimmed[2:]
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }

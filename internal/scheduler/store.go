@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -131,15 +132,37 @@ func (s *Store) loadUnlocked() ([]Task, error) {
 
 func (s *Store) saveUnlocked(tasks []Task) error {
 	sortTasks(tasks)
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
 		return err
 	}
+	_ = os.Chmod(filepath.Dir(s.Path), 0o700)
 	data, err := json.MarshalIndent(tasks, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := s.Path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0600); err != nil {
+	tmpFile, err := os.CreateTemp(filepath.Dir(s.Path), "tasks-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
+	defer os.Remove(tmp)
+	if err := tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if _, err := tmpFile.Write(append(data, '\n')); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.Path); err == nil {
+		return nil
+	} else if runtime.GOOS != "windows" {
+		return err
+	}
+	if err := os.Remove(s.Path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return os.Rename(tmp, s.Path)

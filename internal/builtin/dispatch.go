@@ -147,6 +147,8 @@ func Run(name string, args map[string]string, rt Runtime) (string, error) {
 		return FlagScan(rt, arg(args, "root", "path"), arg(args, "pattern", "grep"), argInt(args, "limit", 80, 500))
 	case "awd_service_check":
 		return AWDServiceCheck(rt, arg(args, "targets", "target", "urls"), argInt(args, "timeout", 3, 15))
+	case "tsecbench":
+		return TSecBench(rt, args)
 	case "script_run":
 		return ScriptRun(rt, arg(args, "language", "lang"), arg(args, "content", "script"), arg(args, "path", "file"), arg(args, "args"), argInt(args, "timeout", 30, 300))
 	case "file_download":
@@ -200,7 +202,7 @@ func tracerouteNative(rt Runtime, host string) (string, error) {
 
 func firewallNative(rt Runtime) (string, error) {
 	if rt.IsWindows {
-		return "", fmt.Errorf("Windows 防火墙请使用 execute netsh advfirewall show allprofiles")
+		return "", fmt.Errorf("当前 Windows 防火墙请使用 execute netsh advfirewall show allprofiles")
 	}
 	paths := []string{"/proc/net/ip_tables_names", "/proc/sys/net/ipv4/ip_forward"}
 	var b strings.Builder

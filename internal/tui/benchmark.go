@@ -9,6 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 )
 
 type benchProgressMsg struct {
@@ -85,21 +86,38 @@ func (m BenchmarkModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m BenchmarkModel) View() string {
+	w, h := m.width, m.height
+	if w <= 0 {
+		w = 80
+	}
+	if h <= 0 {
+		h = 24
+	}
+	renderW := TerminalRenderWidth(w)
+	if w < 8 || h < 4 {
+		return styleApp.Width(renderW).Height(h).MaxHeight(h).Render(runewidth.Truncate("Benchmark", renderW, ""))
+	}
 	var b strings.Builder
-	b.WriteString(styleHeader.Width(max(60, m.width-2)).Render(" " + ui.Prefix("📊", "[BENCH]") + "DeepSentry Benchmark"))
+	headerW := max(1, renderW-styleHeader.GetHorizontalFrameSize())
+	header := runewidth.Truncate(ui.Prefix("📊", "[BENCH]")+"DeepSentry Benchmark", headerW, "…")
+	b.WriteString(styleHeader.Width(renderW).Render(header))
 	b.WriteString("\n\n")
 	if m.running && m.total > 0 {
 		pct := float64(m.current) / float64(m.total) * 100
-		bar := progressBar(pct, 40)
+		bar := progressBar(pct, max(4, min(40, renderW-20)))
 		b.WriteString(styleInfo.Render(fmt.Sprintf("  进度 %d/%d  %s", m.current, m.total, bar)) + "\n\n")
 	}
-	for _, ln := range m.lines {
+	logLines := m.lines
+	if available := max(1, h-7); len(logLines) > available {
+		logLines = logLines[len(logLines)-available:]
+	}
+	for _, ln := range logLines {
 		b.WriteString("  " + ln + "\n")
 	}
 	if m.report != nil {
-		divider := strings.Repeat("─", 50)
+		divider := strings.Repeat("─", max(1, min(50, renderW)))
 		if ui.PlainTextMode() {
-			divider = strings.Repeat("-", 50)
+			divider = strings.Repeat("-", max(1, min(50, renderW)))
 		}
 		b.WriteString("\n" + divider + "\n")
 		b.WriteString(styleSuccess.Render(fmt.Sprintf("  综合得分: %.1f / 100  %s\n", m.report.OverallScore, m.report.Grade)))
@@ -118,20 +136,29 @@ func (m BenchmarkModel) View() string {
 	} else if m.err != nil {
 		b.WriteString(styleError.Render("  错误: " + m.err.Error()))
 	}
-	return styleApp.Render(b.String())
+	rows := strings.Split(b.String(), "\n")
+	if len(rows) > h {
+		rows = append(rows[:1], rows[len(rows)-(h-1):]...)
+	}
+	for i := range rows {
+		rows[i] = fitStyledLine(rows[i], renderW)
+	}
+	return styleApp.Width(renderW).Height(h).MaxHeight(h).Render(strings.Join(rows, "\n"))
 }
 
 func progressBar(pct float64, width int) string {
+	if pct < 0 {
+		pct = 0
+	}
 	if pct > 100 {
 		pct = 100
 	}
-	n := int(pct / 100 * float64(width))
-	if n > width {
-		n = width
-	}
 	if ui.PlainTextMode() {
-		return "[" + strings.Repeat("#", n) + strings.Repeat(".", width-n) + "]"
+		inner := max(0, width-2)
+		n := min(inner, int(pct/100*float64(inner)))
+		return "[" + strings.Repeat("#", n) + strings.Repeat(".", inner-n) + "]"
 	}
+	n := min(width, int(pct/100*float64(width)))
 	return lipgloss.NewStyle().Foreground(colorGreen).Render(strings.Repeat("█", n)) +
 		lipgloss.NewStyle().Foreground(colorBorder).Render(strings.Repeat("░", width-n))
 }

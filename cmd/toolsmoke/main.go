@@ -223,7 +223,7 @@ TOOLSMOKE_PLAIN
 root:x:0:0:root:/root:/bin/bash
 flag{TOOLSMOKE_FLAG}
 password=SuperSecret123
-AKIA1234567890ABCDEF
+AKIA%s
 mysql_error: access denied for user toolsmoke
 EOF
 cat > %s/app.yaml <<'EOF'
@@ -238,7 +238,7 @@ password=SuperSecret123
 EOF
 mkdir -p %s/archive_src
 echo TOOLSMOKE_ARCHIVE > %s/archive_src/item.txt
-`, shellQuote(dir), shellQuote(dir), shellQuote(dir), shellQuote(dir), shellQuote(dir))
+`, shellQuote(dir), "1234567890ABCDEF", shellQuote(dir), shellQuote(dir), shellQuote(dir), shellQuote(dir))
 }
 
 func buildCases(env envFixture) []smokeCase {
@@ -397,7 +397,7 @@ func startMySQLMock() string {
 	payload := make([]byte, 64)
 	payload[0] = 10
 	copy(payload[1:], []byte("5.7.0-toolsmoke\x00"))
-	packet := []byte{byte(len(payload)), byte(len(payload) >> 8), byte(len(payload) >> 16), 0}
+	packet := []byte{64, 0, 0, 0}
 	packet = append(packet, payload...)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -1,7 +1,6 @@
 package builtin
 
 import (
-	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -148,7 +147,7 @@ func findForwardListen(t *testing.T, kind string) string {
 func listenPort(addr string) string {
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		return fmt.Sprintf("%s", addr)
+		return addr
 	}
 	return port
 }

@@ -6,8 +6,8 @@ import (
 
 // 可通过 -ldflags "-X ai-edr/internal/ui.Version=... -X ai-edr/internal/ui.BuildTime=..." 注入
 var (
-	Version   = "2.0"
-	BuildTime = "2026-06-25"
+	Version   = "2.0.1"
+	BuildTime = "dev"
 )
 
 // LogoArt DeepSentry ASCII 标识（CLI / TUI 共用）— 定义见 logo.go

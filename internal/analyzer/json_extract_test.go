@@ -49,6 +49,50 @@ func TestExtractClarificationQuestion(t *testing.T) {
 	}
 }
 
+func TestRecoverPlainTextResponseExtractsPendingShellBlock(t *testing.T) {
+	raw := "让我重新来，先从硬件和存储开始。\n\n```bash\n$ system_profiler SPHardwareDataType | head -80\n```\n"
+	resp, ok := recoverPlainTextResponse(raw)
+	if !ok {
+		t.Fatal("expected plain text response to be recovered")
+	}
+	if resp.Action != "execute" || resp.Command != "system_profiler SPHardwareDataType | head -80" {
+		t.Fatalf("unexpected recovered response: %#v", resp)
+	}
+	if resp.IsFinished {
+		t.Fatal("pending shell step must not be treated as a final report")
+	}
+}
+
+func TestRecoverPlainTextResponsePresentsNaturalLanguageConclusion(t *testing.T) {
+	raw := "检查完成：系统运行正常。\n\n- CPU 正常\n- 磁盘正常"
+	resp, ok := recoverPlainTextResponse(raw)
+	if !ok || !resp.IsFinished || resp.Action != "finish" {
+		t.Fatalf("plain conclusion should finish cleanly: %#v", resp)
+	}
+	if resp.FinalReport != raw || strings.Contains(resp.FinalReport, "解析失败") {
+		t.Fatalf("plain conclusion was not preserved: %q", resp.FinalReport)
+	}
+}
+
+func TestRecoverPlainTextResponseRetriesTruncatedJSON(t *testing.T) {
+	raw := `{"action":"execute","command":"uname -a"`
+	resp, ok := recoverPlainTextResponse(raw)
+	if !ok || resp.Action != "" || resp.IsFinished {
+		t.Fatalf("truncated JSON should request a retry: %#v", resp)
+	}
+	if !strings.Contains(resp.Thought, "自动") {
+		t.Fatalf("retry thought should explain recovery: %q", resp.Thought)
+	}
+}
+
+func TestRecoverPlainTextResponseKeepsClarificationAsQuestion(t *testing.T) {
+	raw := "继续连接前，请提供服务器地址和用户名。"
+	resp, ok := recoverPlainTextResponse(raw)
+	if !ok || resp.Action != "ask_user" || resp.Question != raw {
+		t.Fatalf("clarification should remain interactive: %#v", resp)
+	}
+}
+
 func TestDecodeJSONUnicodeEscapesInCommand(t *testing.T) {
 	got := decodeJSONUnicodeEscapes(`chmod +x /opt/scripts/cpu_monitor.sh \u0026\u0026 ls -la /opt/scripts/cpu_monitor.sh`)
 	if got != "chmod +x /opt/scripts/cpu_monitor.sh && ls -la /opt/scripts/cpu_monitor.sh" {
@@ -103,5 +147,40 @@ func TestAgentToolSchemaConstrainsSubAgentTasks(t *testing.T) {
 	}
 	if len(required) != 2 || required[0] != "task_name" || required[1] != "task_prompt" {
 		t.Fatalf("unexpected parallel task required fields: %#v", required)
+	}
+}
+
+func TestAgentToolDefinitionsExposeBuiltinsDirectly(t *testing.T) {
+	defs := AgentToolDefinitions()
+	byName := map[string]FunctionDef{}
+	for _, def := range defs {
+		byName[def.Function.Name] = def.Function
+	}
+	for _, name := range []string{"agent_action", "tool_catalog", "config_manage", "fleet_inventory", "fleet_exec", "fleet_file"} {
+		if _, ok := byName[name]; !ok {
+			t.Fatalf("native tool %s missing; got %d definitions", name, len(defs))
+		}
+	}
+	configProps, ok := byName["config_manage"].Parameters["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("config_manage properties missing: %#v", byName["config_manage"].Parameters)
+	}
+	if _, ok := configProps["port"]; !ok {
+		t.Fatalf("config_manage native schema must teach host+port: %#v", configProps)
+	}
+	for _, def := range defs {
+		if got := len([]rune(def.Function.Description)); got > 1024 {
+			t.Fatalf("native description for %s too large for compatible providers: %d runes", def.Function.Name, got)
+		}
+	}
+}
+
+func TestParseNamedToolCallMapsToHarnessAction(t *testing.T) {
+	resp, err := ParseNamedToolCall("fleet_exec", `{"selector":"prod","command":"uptime","concurrency":3}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Action != "tool" || resp.ToolName != "fleet_exec" || resp.ToolArgs["concurrency"] != "3" {
+		t.Fatalf("unexpected mapped response: %#v", resp)
 	}
 }

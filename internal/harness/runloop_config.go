@@ -21,6 +21,7 @@ type RunLoopConfig struct {
 	PlanMode         bool // 先澄清/规划，再按计划执行
 	ConfirmFn        func(*AgentAction) bool
 	AwaitUserFn      func(*AgentAction) (string, bool)
+	SudoAuthFn       func() bool // TUI 暂停渲染并由系统 sudo 安全读取密码
 	UI               UISink
 	Stop             <-chan struct{}
 }

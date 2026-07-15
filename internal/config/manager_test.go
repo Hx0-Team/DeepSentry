@@ -37,6 +37,35 @@ func TestManageConfigAddSkillSourceCreatesConfig(t *testing.T) {
 	}
 }
 
+func TestValidateManagedModelAdaptationScalars(t *testing.T) {
+	valid := map[string]string{
+		"model_profile":          "compact",
+		"model_parameter_b":      "14",
+		"context_window_tokens":  "1048576",
+		"context_utilization":    "0.82",
+		"reserved_output_tokens": "16384",
+		"native_tool_limit":      "8",
+	}
+	for key, value := range valid {
+		if err := validateManagedScalar(key, value); err != nil {
+			t.Fatalf("valid %s=%s rejected: %v", key, value, err)
+		}
+	}
+	invalid := map[string]string{
+		"model_profile":          "giant",
+		"model_parameter_b":      "fourteen",
+		"context_window_tokens":  "2048",
+		"context_utilization":    "1.0",
+		"reserved_output_tokens": "10",
+		"native_tool_limit":      "-1",
+	}
+	for key, value := range invalid {
+		if err := validateManagedScalar(key, value); err == nil {
+			t.Fatalf("invalid %s=%s accepted", key, value)
+		}
+	}
+}
+
 func TestManageConfigPathArgDoesNotOverrideConfigPath(t *testing.T) {
 	old := GlobalConfig
 	defer func() { GlobalConfig = old }()
@@ -110,6 +139,25 @@ func TestManageConfigGetAction(t *testing.T) {
 	}
 	if !strings.Contains(statusOut, "配置文件:") {
 		t.Fatalf("get_config should return config status, got %q", statusOut)
+	}
+}
+
+func TestManageConfigViewAndListAliases(t *testing.T) {
+	old := GlobalConfig
+	defer func() { GlobalConfig = old }()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("skill_sources:\n  - skills\n"), 0o600); err != nil {
+		t.Fatalf("write seed config: %v", err)
+	}
+	for _, action := range []string{"view", "show", "list", "overview"} {
+		out, err := ManageConfig(map[string]string{"config_path": path, "action": action})
+		if err != nil {
+			t.Fatalf("ManageConfig alias %q: %v", action, err)
+		}
+		if !strings.Contains(out, "配置文件:") || !strings.Contains(out, "skills") {
+			t.Fatalf("alias %q returned unexpected output: %q", action, out)
+		}
 	}
 }
 
@@ -189,19 +237,77 @@ func TestManageConfigAddTargetUpsertsByHost(t *testing.T) {
 	}
 }
 
+func TestManageConfigAddTargetAcceptsSeparatePortAndRepairsLegacyHost(t *testing.T) {
+	old := GlobalConfig
+	defer func() { GlobalConfig = old }()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	seed := `target_protocol: local
+targets:
+  - name: ssh-10.0.0.9
+    protocol: ssh
+    host: 10.0.0.9
+    user: root
+    password: old-secret
+  - name: ssh-10.0.0.9-2222
+    protocol: ssh
+    host: 10.0.0.9:2222
+    user: root
+    password: duplicate-secret
+`
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := ManageConfig(map[string]string{
+		"config_path": path,
+		"action":      "add_target",
+		"protocol":    "ssh",
+		"host":        "10.0.0.9",
+		"port":        "2222",
+		"user":        "admin",
+		"password":    "new-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "ssh 10.0.0.9:2222") {
+		t.Fatalf("success output must echo canonical endpoint: %q", out)
+	}
+	if len(GlobalConfig.Targets) != 1 {
+		t.Fatalf("legacy bare host should be replaced, not duplicated: %#v", GlobalConfig.Targets)
+	}
+	target := GlobalConfig.Targets[0]
+	if target.Host != "10.0.0.9:2222" || target.User != "admin" || target.Password != "new-secret" {
+		t.Fatalf("unexpected normalized target: %#v", target)
+	}
+}
+
+func TestNormalizeManagedEndpointRejectsConflictingOrInvalidPort(t *testing.T) {
+	for _, tc := range []struct {
+		host, port string
+	}{{"10.0.0.8:22", "2222"}, {"10.0.0.8", "0"}, {"10.0.0.8", "abc"}} {
+		if _, err := normalizeManagedEndpoint("ssh", tc.host, tc.port); err == nil {
+			t.Fatalf("normalizeManagedEndpoint(%q,%q) should fail", tc.host, tc.port)
+		}
+	}
+	if got, err := normalizeManagedEndpoint("ssh", "2001:db8::1", "2222"); err != nil || got != "[2001:db8::1]:2222" {
+		t.Fatalf("IPv6 normalization got=%q err=%v", got, err)
+	}
+}
+
 func TestManageConfigEnableFleetPromotesSingleTarget(t *testing.T) {
 	old := GlobalConfig
 	defer func() { GlobalConfig = old }()
 
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	seed := `target_protocol: ssh
-ssh_host: 8.137.114.242:2222
+ssh_host: 198.51.100.42:2222
 ssh_user: root
 ssh_password: single-secret
 targets:
-  - name: ssh-10.204.1.249
+  - name: ssh-192.0.2.49
     protocol: ssh
-    host: 10.204.1.249:2222
+    host: 192.0.2.49:2222
     user: root
     password: target-secret
 `

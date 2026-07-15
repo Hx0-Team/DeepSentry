@@ -47,3 +47,21 @@ func TestRunFleetRejectsFTPShellExec(t *testing.T) {
 		t.Fatalf("expected ftp shell rejection, got %#v", results[0])
 	}
 }
+
+func TestRunFleetStopCancelsQueuedTargetsWithoutConnecting(t *testing.T) {
+	stop := make(chan struct{})
+	close(stop)
+	targets := []config.TargetConfig{
+		{Name: "a", Protocol: "ssh", Host: "192.0.2.1:22"},
+		{Name: "b", Protocol: "telnet", Host: "192.0.2.2:23"},
+	}
+	results := RunFleetWithProgressAndStop(targets, "all", "sleep 60", 1, nil, stop)
+	if len(results) != len(targets) {
+		t.Fatalf("expected canceled result per target, got %#v", results)
+	}
+	for _, result := range results {
+		if result.Success || !strings.Contains(result.Error, "取消") {
+			t.Fatalf("target was not canceled: %#v", result)
+		}
+	}
+}

@@ -9,19 +9,24 @@ import (
 	"ai-edr/internal/memory"
 	"ai-edr/internal/security"
 	"ai-edr/internal/skills"
+	"ai-edr/internal/tools"
+	termui "ai-edr/internal/ui"
 	"fmt"
 	"strings"
+	"sync/atomic"
 )
 
 // SubAgentRunner 子 Agent 运行器（复用 harness middleware，无 sub-sub-agent）
 type SubAgentRunner struct {
 	Middleware   []Middleware
 	State        *AgentState
+	SharedState  *AgentState // 主 Agent 会话线索板；并发子 Agent 只共享高信号线索，不共享原始对话
 	Catalog      *skills.SkillCatalog
 	MemoryStore  *memory.Store
 	UseNative    bool
 	UI           UISink
 	ConfirmFn    func(*AgentAction) bool
+	Stop         <-chan struct{}
 	MaxStepsCap  int
 	TaskMaxSteps int
 	StepFn       func(analyzer.StepOptions) (analyzer.AgentResponse, error)
@@ -35,11 +40,17 @@ var makeSubAgentRunner = func(parent *DeepAgent) *SubAgentRunner {
 	return NewSubAgentRunner(parent)
 }
 
+var subAgentRunSequence atomic.Uint64
+
 // NewSubAgentRunner 创建子 Agent 运行器
 func NewSubAgentRunner(parent *DeepAgent) *SubAgentRunner {
+	state := NewAgentStateWithSession(parent.State.WorkspaceDir,
+		fmt.Sprintf("%s-sub-%d", parent.SessionID, subAgentRunSequence.Add(1)))
+	state.ReplaceCoreClues(parent.State.CoreCluesSnapshot())
 	return &SubAgentRunner{
 		Middleware:  SubAgentMiddlewareStack(parent.Catalog, parent.MemoryStore),
-		State:       NewAgentStateWithSession(parent.State.WorkspaceDir, parent.SessionID),
+		State:       state,
+		SharedState: parent.State,
 		Catalog:     parent.Catalog,
 		MemoryStore: parent.MemoryStore,
 		UseNative:   parent.UseNativeTools,
@@ -52,24 +63,29 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 		{Role: "user", Content: taskPrompt},
 	}
 	if r.Target.Name != "" || r.Target.Host != "" {
-		targetPrompt := fmt.Sprintf("【当前子 Agent 目标】name=%s protocol=%s host=%s user=%s\n所有 execute/read_file/grep/ls/tool 的 target 视角都限定在这台机器；不要操作其他目标。",
+		targetPrompt := fmt.Sprintf("【当前子 Agent 目标】name=%s protocol=%s host=%s user=%s\n所有 execute/read_file/grep/ls/tool 的 target 视角都限定在这台机器；不要操作其他目标。共享线索中来自其他 target 的事实只能用于关联分析，不得未经本目标复核就当作本机事实。",
 			r.Target.Name, r.Target.Protocol, r.Target.Host, r.Target.User)
 		subHistory = append([]analyzer.Message{{Role: "system", Content: targetPrompt}}, subHistory...)
 	}
 
-	maxSteps := resolveSubAgentMaxSteps(spec, taskPrompt, r.TaskMaxSteps, r.MaxStepsCap)
+	maxSteps := resolveSubAgentMaxSteps(spec, subAgentAssignmentForEstimate(taskPrompt), r.TaskMaxSteps, r.MaxStepsCap)
 
 	extraBase := spec.SystemPrompt + `
 【子 Agent 模式】
 - Shell-first：优先使用 execute 执行目标机原生 Shell 直接排查；原生命令能完成时不要先调用 tool/tool_catalog
 - read_file/grep/ls 可用于文件类低风险观察；只有目标机缺少命令、输出格式复杂、需要结构化 Go 原生能力或控制端探测时，才先 tool_catalog 调研，再按需调用具体 tool
 - 禁止委派子 Agent (task)
-- 完成后 action="finish" 并给出 final_report
+- 已知核心线索会随上下文提供。不要重复无意义探测；需要复核时说明复核目的
+- 完成后 action="finish"，final_report 必须按以下顺序交接：任务状态、核心结论、关键证据、冲突/不确定项、建议主 Agent 下一步
+- 结论必须区分“已验证事实”和“推断”，证据注明命令、目标、路径或原始指标
 `
 
 	var results []string
 
 	for step := 0; step < maxSteps; step++ {
+		if shouldStop(r.Stop) {
+			return fmt.Sprintf("子 Agent [%s] 已按用户请求停止。", spec.Name), nil
+		}
 		if r.UI != nil {
 			r.UI.Emit(UIEvent{
 				Kind:           EventSubAgentStep,
@@ -80,6 +96,11 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 				TargetHost:     r.Target.Host,
 			})
 		}
+		// Pull the latest bounded clue board before every model turn. This gives
+		// parallel workers useful cross-agent evidence without merging raw histories.
+		if r.SharedState != nil {
+			r.State.ReplaceCoreClues(r.SharedState.CoreCluesSnapshot())
+		}
 		extraPrompt := extraBase
 		for _, mw := range r.Middleware {
 			extraPrompt = mw.EnhancePrompt(extraPrompt, r.State)
@@ -89,23 +110,31 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 		if stepFn == nil {
 			stepFn = analyzer.RunAgentStepWithOptions
 		}
+		llmCtx, cancelLLM := contextFromStop(r.Stop)
 		resp, err := stepFn(analyzer.StepOptions{
+			Context:        llmCtx,
 			SysCtx:         sysCtx,
 			History:        &subHistory,
 			ExtraPrompt:    extraPrompt,
 			UseNativeTools: r.UseNative,
 		})
+		cancelLLM()
+		if shouldStop(r.Stop) {
+			return fmt.Sprintf("子 Agent [%s] 已按用户请求停止。", spec.Name), nil
+		}
 		if err != nil {
-			return "", fmt.Errorf("子 Agent [%s] 第 %d 步失败: %w", spec.Name, step+1, err)
+			return "", fmt.Errorf("子 Agent [%s] 第 %d 步失败: %s", spec.Name, step+1, security.RedactSensitiveText(err.Error()))
 		}
 
 		action := ParseAction(resp)
 
 		if action.Type == ActionFinish || action.IsFinished {
 			if action.FinalReport != "" {
+				r.observeCoreClues(action.FinalReport, "subagent/"+spec.Name)
 				return action.FinalReport, nil
 			}
 			if action.Thought != "" {
+				r.observeCoreClues(action.Thought, "subagent/"+spec.Name)
 				return action.Thought, nil
 			}
 			return "子 Agent 任务完成", nil
@@ -123,7 +152,7 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 			continue
 		}
 		if r.UI != nil {
-			actCopy := action
+			actCopy := RedactedAction(action)
 			enrichActionExecutionTargetFor(&actCopy, r.Target)
 			r.UI.Emit(UIEvent{Kind: EventSubAgentAction, Message: spec.Name, Action: &actCopy, TargetName: r.Target.Name, TargetProtocol: r.Target.Protocol, TargetHost: r.Target.Host})
 		}
@@ -142,7 +171,7 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 			if question == "" {
 				question = "缺少必要信息"
 			}
-			return fmt.Sprintf("子 Agent [%s] 需要主流程补充信息后才能继续: %s", spec.Name, question), nil
+			return fmt.Sprintf("子 Agent [%s] 需要主流程补充信息后才能继续: %s", spec.Name, security.RedactSensitiveText(question)), nil
 		}
 
 		// 子 Agent execute 风控：与主 Agent 一致，先 AI 复核，再按需人工确认。
@@ -156,6 +185,11 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 				})
 				continue
 			}
+		} else if allowed, feedback := authorizeSubAgentMutation(&action, batchMode, r.UI, r.ConfirmFn); !allowed {
+			msg := fmt.Sprintf("[步骤 %d] 中高风险动作未执行: %s", step+1, action.Type)
+			results = append(results, msg)
+			subHistory = append(subHistory, analyzer.Message{Role: "user", Content: feedback})
+			continue
 		}
 
 		stepCtx := &StepContext{
@@ -168,6 +202,7 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 			MemoryStore: r.MemoryStore,
 			UI:          r.UI,
 			ConfirmFn:   r.ConfirmFn,
+			Stop:        r.Stop,
 			Executor:    firstExecutor(r.Executor),
 			TargetName:  r.Target.Name,
 			TargetProto: r.Target.Protocol,
@@ -184,26 +219,74 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 			return result.FinalReport, nil
 		}
 
-		out := result.Output
+		out := security.RedactSensitiveText(result.Output)
+		r.observeCoreClues(out, "subagent/"+spec.Name+"/"+string(action.Type))
 		if len(out) > 4000 {
-			out = out[:4000] + "\n...(输出已截断)..."
+			out = safeUTF8BytePrefix(out, 4000) + "\n...(输出已截断)..."
 		}
 		results = append(results, fmt.Sprintf("[步骤 %d] %s\n%s", step+1, action.Type, out))
 
 		subHistory = append(subHistory, analyzer.Message{
 			Role:    "assistant",
-			Content: actionToJSON(action),
+			Content: security.RedactSensitiveText(actionToJSON(action)),
 		})
 		subHistory = append(subHistory, analyzer.Message{
-			Role: "user", Content: fmt.Sprintf("Output:\n%s", result.Output),
+			Role: "user", Content: fmt.Sprintf("Output:\n%s", out),
 		})
 	}
 
 	summary := strings.Join(results, "\n---\n")
 	if len(summary) > 6000 {
-		summary = summary[:6000] + "\n...(子 Agent 输出已截断)..."
+		summary = safeUTF8BytePrefix(summary, 6000) + "\n...(子 Agent 输出已截断)..."
 	}
 	return fmt.Sprintf("子 Agent [%s] 达到最大步数，部分结果:\n%s", spec.Name, summary), nil
+}
+
+func (r *SubAgentRunner) observeCoreClues(text, source string) {
+	if r.Target.Name != "" || r.Target.Host != "" {
+		source += "@" + executor.TargetDisplayName(r.Target)
+	}
+	if r.State != nil {
+		r.State.ObserveCoreClues(text, source)
+	}
+	if r.SharedState != nil && r.SharedState != r.State {
+		r.SharedState.ObserveCoreClues(text, source)
+	}
+}
+
+func authorizeSubAgentMutation(action *AgentAction, batchMode bool, ui UISink, confirmFn func(*AgentAction) bool) (bool, string) {
+	if action == nil {
+		return false, "动作为空，请重新规划。"
+	}
+	needsConfirm := false
+	switch action.Type {
+	case ActionWriteFile, ActionEditFile:
+		action.RiskLevel = tools.RiskHigh
+		action.Reason = "子 Agent 将修改文件"
+		needsConfirm = true
+	case ActionTool:
+		action.RiskLevel, action.Reason = classifyToolRisk(*action)
+		needsConfirm = action.RiskLevel == tools.RiskHigh || action.RiskLevel == tools.RiskMedium
+		if !needsConfirm && ui != nil {
+			ui.Emit(UIEvent{Kind: EventRiskAuto, Message: fmt.Sprintf("%s子 Agent 工具 [%s] 低风险 -> 自动执行", termui.Prefix("🟢", "[LOW]"), action.ToolName)})
+		}
+	default:
+		return true, ""
+	}
+	if !needsConfirm {
+		return true, ""
+	}
+	if batchMode {
+		if ui != nil {
+			ui.Emit(UIEvent{Kind: EventBatchAuto, Message: "Batch 模式已启用：子 Agent 动作自动批准"})
+		}
+		return true, ""
+	}
+	confirmAction := RedactedAction(*action)
+	if confirmFn != nil && confirmFn(&confirmAction) {
+		return true, ""
+	}
+	return false, "用户拒绝该中高风险动作；请采用只读或低风险替代方案。"
 }
 
 func resolveSubAgentMaxSteps(spec subagent.Spec, taskPrompt string, requested, cap int) int {
@@ -249,6 +332,17 @@ func estimateSubAgentSteps(taskPrompt string, base int) int {
 	return estimate
 }
 
+func subAgentAssignmentForEstimate(prompt string) string {
+	const marker = "【你的唯一分工】"
+	if idx := strings.Index(prompt, marker); idx >= 0 {
+		prompt = prompt[idx+len(marker):]
+		if end := strings.Index(prompt, "不要替其他子 Agent"); end >= 0 {
+			prompt = prompt[:end]
+		}
+	}
+	return strings.TrimSpace(prompt)
+}
+
 func authorizeSubAgentExecute(action *AgentAction, sysCtx collector.SystemContext, batchMode bool, ui UISink, confirmFn func(*AgentAction) bool, reviewer commandRiskReviewer) (bool, string) {
 	if action == nil || strings.TrimSpace(action.Command) == "" {
 		return true, ""
@@ -289,7 +383,8 @@ func authorizeSubAgentExecute(action *AgentAction, sysCtx collector.SystemContex
 		}
 	}
 
-	if confirmFn != nil && confirmFn(action) {
+	confirmAction := RedactedAction(*action)
+	if confirmFn != nil && confirmFn(&confirmAction) {
 		security.RecordApproval(action.Command)
 		return true, ""
 	}
@@ -306,15 +401,20 @@ func RunSubAgentLoop(parent *DeepAgent, spec subagent.Spec, taskPrompt string, s
 
 // RunSubAgentLoopWithUI 将子 Agent 内部步骤透传给父级 UI。
 func RunSubAgentLoopWithUI(parent *DeepAgent, spec subagent.Spec, taskPrompt string, sysCtx collector.SystemContext, batchMode bool, ui UISink, confirmFn func(*AgentAction) bool, maxStepsCap, taskMaxSteps int) (string, error) {
+	return RunSubAgentLoopWithUIAndStop(parent, spec, taskPrompt, sysCtx, batchMode, ui, confirmFn, maxStepsCap, taskMaxSteps, nil)
+}
+
+func RunSubAgentLoopWithUIAndStop(parent *DeepAgent, spec subagent.Spec, taskPrompt string, sysCtx collector.SystemContext, batchMode bool, ui UISink, confirmFn func(*AgentAction) bool, maxStepsCap, taskMaxSteps int, stop <-chan struct{}) (string, error) {
 	r := makeSubAgentRunner(parent)
 	r.UI = ui
 	r.ConfirmFn = confirmFn
 	r.MaxStepsCap = maxStepsCap
 	r.TaskMaxSteps = taskMaxSteps
+	r.Stop = stop
 	return r.Run(spec, taskPrompt, sysCtx, batchMode)
 }
 
-func RunSubAgentLoopForTarget(parent *DeepAgent, spec subagent.Spec, taskPrompt string, sysCtx collector.SystemContext, batchMode bool, ui UISink, confirmFn func(*AgentAction) bool, maxStepsCap, taskMaxSteps int, target config.TargetConfig) (string, error) {
+func RunSubAgentLoopForTarget(parent *DeepAgent, spec subagent.Spec, taskPrompt string, sysCtx collector.SystemContext, batchMode bool, ui UISink, confirmFn func(*AgentAction) bool, maxStepsCap, taskMaxSteps int, target config.TargetConfig, stop <-chan struct{}) (string, error) {
 	ex, err := executor.NewEphemeralExecutor(target)
 	if err != nil {
 		return "", err
@@ -325,6 +425,7 @@ func RunSubAgentLoopForTarget(parent *DeepAgent, spec subagent.Spec, taskPrompt 
 	r.ConfirmFn = confirmFn
 	r.MaxStepsCap = maxStepsCap
 	r.TaskMaxSteps = taskMaxSteps
+	r.Stop = stop
 	r.Executor = ex
 	r.Target = target
 	return r.Run(spec, taskPrompt, sysCtx, batchMode)

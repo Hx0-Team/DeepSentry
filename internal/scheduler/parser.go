@@ -1,7 +1,7 @@
 package scheduler
 
 import (
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"regexp"
@@ -503,7 +503,7 @@ func resolveLocation(name string) (*time.Location, string, error) {
 }
 
 func makeTaskID(seed string, now time.Time) string {
-	sum := sha1.Sum([]byte(fmt.Sprintf("%s|%d", seed, now.UnixNano())))
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d", seed, now.UnixNano())))
 	return "sched_" + now.Format("20060102_150405") + "_" + hex.EncodeToString(sum[:])[:8]
 }
 

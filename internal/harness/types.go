@@ -6,6 +6,8 @@ import (
 	"ai-edr/internal/executor"
 	"ai-edr/internal/logger"
 	"ai-edr/internal/memory"
+	"ai-edr/internal/security"
+	"strings"
 )
 
 // ActionType 定义 Agent 可执行的动作类型（对标 deepagents 内置工具）
@@ -84,6 +86,45 @@ type AgentAction struct {
 	IsFinished bool   `json:"is_finished"`
 }
 
+// RedactedAction returns a deep-enough copy that is safe for UI, reports and
+// confirmation dialogs while leaving the executable action untouched.
+func RedactedAction(action AgentAction) AgentAction {
+	out := action
+	out.Command = security.RedactSensitiveText(out.Command)
+	out.TaskPrompt = security.RedactSensitiveText(out.TaskPrompt)
+	out.Content = security.RedactSensitiveText(out.Content)
+	out.Pattern = security.RedactSensitiveText(out.Pattern)
+	out.OldString = security.RedactSensitiveText(out.OldString)
+	out.NewString = security.RedactSensitiveText(out.NewString)
+	out.FinalReport = security.RedactSensitiveText(out.FinalReport)
+	out.Question = security.RedactSensitiveText(out.Question)
+	out.MemoryValue = security.RedactSensitiveText(out.MemoryValue)
+	out.Thought = security.RedactSensitiveText(out.Thought)
+	out.ToolArgs = make(map[string]string, len(action.ToolArgs))
+	for key, value := range action.ToolArgs {
+		tagged := key + "=" + value
+		redacted := security.RedactSensitiveText(tagged)
+		if redacted != tagged {
+			if i := strings.IndexByte(redacted, '='); i >= 0 {
+				out.ToolArgs[key] = redacted[i+1:]
+			} else {
+				out.ToolArgs[key] = "***"
+			}
+			continue
+		}
+		out.ToolArgs[key] = security.RedactSensitiveText(value)
+	}
+	out.ParallelTasks = append([]SubAgentTaskAction(nil), action.ParallelTasks...)
+	for i := range out.ParallelTasks {
+		out.ParallelTasks[i].TaskPrompt = security.RedactSensitiveText(out.ParallelTasks[i].TaskPrompt)
+	}
+	out.Options = append([]string(nil), action.Options...)
+	for i := range out.Options {
+		out.Options[i] = security.RedactSensitiveText(out.Options[i])
+	}
+	return out
+}
+
 // TodoItem 任务清单项（对标 deepagents write_todos）
 type TodoItem struct {
 	ID      string `json:"id"`
@@ -106,6 +147,8 @@ type StepContext struct {
 	Checkpoint       *CheckpointStore
 	UI               UISink // 可选：子 Agent 等中间件回传 UI 事件
 	ConfirmFn        func(*AgentAction) bool
+	SudoAuthFn       func() bool
+	Stop             <-chan struct{}
 	Executor         executor.Executor
 	TargetName       string
 	TargetProto      string

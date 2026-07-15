@@ -8,6 +8,7 @@ import (
 	"ai-edr/internal/ui"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
 )
 
 type pickResultMsg struct {
@@ -20,6 +21,7 @@ type SessionPickerModel struct {
 	items  []harness.SessionSummary
 	cursor int
 	width  int
+	height int
 	done   chan pickResultMsg
 }
 
@@ -33,6 +35,7 @@ func (m SessionPickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		m.height = msg.Height
 		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -63,17 +66,36 @@ func (m SessionPickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m SessionPickerModel) View() string {
+	w, h := m.width, m.height
+	if w <= 0 {
+		w = 80
+	}
+	if h <= 0 {
+		h = 24
+	}
+	renderW := TerminalRenderWidth(w)
+	if w < 8 || h < 4 {
+		return styleApp.Width(renderW).Height(h).MaxHeight(h).Render(runewidth.Truncate("恢复", renderW, ""))
+	}
+	headerW := max(1, renderW-styleHeader.GetHorizontalFrameSize())
 	var b strings.Builder
-	b.WriteString(styleHeader.Width(max(60, m.width-2)).Render(" " + ui.Prefix("♻️", "[RESUME]") + "选择要恢复的会话"))
+	header := sanitizeTUIText(ui.Prefix("♻️", "[RESUME]") + "选择要恢复的会话")
+	b.WriteString(styleHeader.Width(renderW).Render(runewidth.Truncate(header, headerW, "…")))
 	b.WriteString("\n\n")
 	if len(m.items) == 0 {
-		b.WriteString(styleInfo.Render("  无可恢复会话。按 N 开始新任务。"))
+		b.WriteString(styleInfo.Render(runewidth.Truncate("  无可恢复会话。按 N 开始新任务。", max(1, renderW), "…")))
 	} else {
-		for i, it := range m.items {
-			label := fmt.Sprintf(" %s  step:%d  %s", it.ID, it.StepNum, it.SavedAt.Format("01-02 15:04"))
+		visible := max(1, h-5)
+		start := m.cursor - visible/2
+		start = max(0, min(start, max(0, len(m.items)-visible)))
+		end := min(len(m.items), start+visible)
+		for i := start; i < end; i++ {
+			it := m.items[i]
+			label := fmt.Sprintf(" %s  step:%d  %s", shortSessionID(it.ID), it.StepNum, it.SavedAt.Format("01-02 15:04"))
 			if it.Goal != "" {
 				label += "  · " + truncateStr(it.Goal, 40)
 			}
+			label = runewidth.Truncate(sanitizeTUIText(label), max(1, renderW-2), "…")
 			if i == m.cursor {
 				cursor := "▸ "
 				if ui.PlainTextMode() {
@@ -85,8 +107,9 @@ func (m SessionPickerModel) View() string {
 			}
 		}
 	}
-	b.WriteString("\n" + styleHelp.Render("  ↑↓ 选择 · Enter 恢复 · N 新会话 · Esc 取消"))
-	return styleApp.Render(b.String())
+	help := runewidth.Truncate("↑↓ 选择 · Enter 恢复 · N 新会话 · Esc 取消", max(1, renderW-2), "…")
+	b.WriteString("\n" + styleHelp.Render("  "+help))
+	return styleApp.Width(renderW).Height(h).MaxHeight(h).Render(b.String())
 }
 
 // PickSession 返回 sessionID（空=新会话），cancelled 表示用户取消

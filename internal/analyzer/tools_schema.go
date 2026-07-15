@@ -1,7 +1,11 @@
 package analyzer
 
 import (
+	deepsentrytools "ai-edr/internal/tools"
 	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
 )
 
 // ToolDefinition OpenAI 兼容 tools schema
@@ -18,7 +22,15 @@ type FunctionDef struct {
 
 // AgentToolDefinitions 返回 Deep Agent 原生 tool calling schema
 func AgentToolDefinitions() []ToolDefinition {
-	return []ToolDefinition{
+	return AgentToolDefinitionsForContext(0, "")
+}
+
+// AgentToolDefinitionsForContext limits schema fan-out for smaller models and
+// ranks task-relevant tools first. agent_action and tool_catalog are always
+// present, so omitted tools remain discoverable/invokable via the compatibility
+// path after tool_catalog describes them.
+func AgentToolDefinitionsForContext(limit int, contextText string) []ToolDefinition {
+	definitions := []ToolDefinition{
 		{
 			Type: "function",
 			Function: FunctionDef{
@@ -66,8 +78,8 @@ func AgentToolDefinitions() []ToolDefinition {
 						"memory_key":      map[string]string{"type": "string"},
 						"memory_value":    map[string]string{"type": "string"},
 						"memory_scope":    map[string]string{"type": "string"},
-						"tool_name":       map[string]string{"type": "string", "description": "Built-in/MCP tool name. Use only after native shell is insufficient; use tool_catalog first to discover built-in tools when unsure."},
-						"tool_args":       map[string]interface{}{"type": "object", "description": "For tool_catalog use category/query filters; for discovered tools use their documented args.", "additionalProperties": map[string]string{"type": "string"}},
+						"tool_name":       map[string]string{"type": "string", "description": "MCP tool name, or a built-in name only when direct native functions are unavailable. Prefer the separately exposed built-in native functions because their parameters are validated."},
+						"tool_args":       map[string]interface{}{"type": "object", "description": "MCP arguments, or documented built-in arguments on compatibility paths.", "additionalProperties": map[string]string{"type": "string"}},
 						"question":        map[string]string{"type": "string", "description": "Question to ask the user when required information is missing. Use with action=ask_user."},
 						"options":         map[string]interface{}{"type": "array", "description": "Optional short answer choices for action=ask_user.", "items": map[string]string{"type": "string"}},
 						"final_report":    map[string]string{"type": "string"},
@@ -89,6 +101,116 @@ func AgentToolDefinitions() []ToolDefinition {
 			},
 		},
 	}
+
+	// Expose every enabled built-in as a real native function. This gives the
+	// provider the exact argument names/types/enums instead of asking the model
+	// to guess inside agent_action.tool_args.
+	definitions = append(definitions, ToolDefinition{
+		Type: "function",
+		Function: FunctionDef{
+			Name:        "tool_catalog",
+			Description: "Discover DeepSentry built-in tools or inspect one tool's full workflow and examples before calling it.",
+			Parameters:  deepsentrytools.JSONSchema("tool_catalog"),
+		},
+	})
+	names := selectNativeToolNames(deepsentrytools.ListNames(), limit, contextText)
+	for _, name := range names {
+		tool, ok := deepsentrytools.Get(name)
+		if !ok {
+			continue
+		}
+		description := fmt.Sprintf("DeepSentry built-in [%s, %s]. %s", tool.Category, tool.Perspective, tool.Description)
+		if help := deepsentrytools.FormatToolHelp(name); help != "" {
+			description += "\n" + truncateToolDescription(help, 800)
+		}
+		definitions = append(definitions, ToolDefinition{
+			Type: "function",
+			Function: FunctionDef{
+				Name:        name,
+				Description: description,
+				Parameters:  deepsentrytools.JSONSchema(name),
+			},
+		})
+	}
+	return definitions
+}
+
+func selectNativeToolNames(names []string, limit int, contextText string) []string {
+	sort.Strings(names)
+	if limit <= 0 || len(names) <= limit {
+		return names
+	}
+	query := strings.ToLower(contextText)
+	coreOrder := []string{"config_manage", "fleet_inventory", "fleet_exec", "fleet_file", "target_health_summary", "read_log"}
+	selected := make([]string, 0, limit)
+	seen := map[string]bool{}
+	for _, name := range coreOrder {
+		if len(selected) >= limit {
+			break
+		}
+		if containsToolName(names, name) {
+			selected = append(selected, name)
+			seen[name] = true
+		}
+	}
+	type scoredTool struct {
+		name  string
+		score int
+	}
+	var scored []scoredTool
+	terms := strings.FieldsFunc(query, func(r rune) bool {
+		return r == ' ' || r == ',' || r == '，' || r == '/' || r == ':' || r == '\n' || r == '\t'
+	})
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		tool, ok := deepsentrytools.Get(name)
+		if !ok {
+			continue
+		}
+		haystack := strings.ToLower(name + " " + tool.Category + " " + tool.Description + " " + tool.ArgsHint)
+		score := 0
+		if strings.Contains(query, strings.ToLower(name)) {
+			score += 100
+		}
+		for _, term := range terms {
+			if len([]rune(term)) >= 2 && strings.Contains(haystack, term) {
+				score += 5
+			}
+		}
+		scored = append(scored, scoredTool{name: name, score: score})
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].score == scored[j].score {
+			return scored[i].name < scored[j].name
+		}
+		return scored[i].score > scored[j].score
+	})
+	for _, item := range scored {
+		if len(selected) >= limit {
+			break
+		}
+		selected = append(selected, item.name)
+	}
+	return selected
+}
+
+func containsToolName(names []string, want string) bool {
+	for _, name := range names {
+		if name == want {
+			return true
+		}
+	}
+	return false
+}
+
+func truncateToolDescription(text string, maxRunes int) string {
+	runes := []rune(text)
+	if maxRunes <= 0 || len(runes) <= maxRunes {
+		return text
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 // ParseToolCallResponse 从 native tool_calls 解析 AgentResponse
@@ -133,4 +255,28 @@ func ParseToolCallResponse(toolCallArgs string) (AgentResponse, error) {
 	}
 	// edit_file / glob fields via json unmarshal into compat — copy manually from raw if needed
 	return resp, nil
+}
+
+// ParseNamedToolCall maps a directly exposed built-in native function back to
+// the existing harness action protocol so risk review and approvals remain in
+// one place.
+func ParseNamedToolCall(name, toolCallArgs string) (AgentResponse, error) {
+	if name == "" || name == "agent_action" {
+		return ParseToolCallResponse(toolCallArgs)
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(toolCallArgs), &raw); err != nil {
+		return AgentResponse{}, err
+	}
+	if name != "tool_catalog" {
+		if _, ok := deepsentrytools.Get(name); !ok {
+			return AgentResponse{}, fmt.Errorf("unknown native built-in tool: %s", name)
+		}
+	}
+	return AgentResponse{
+		Thought:  "调用已校验的内置工具 " + name,
+		Action:   "tool",
+		ToolName: name,
+		ToolArgs: parseToolArgs(raw),
+	}, nil
 }

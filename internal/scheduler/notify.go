@@ -26,7 +26,7 @@ func SendDingTalkMarkdown(webhook, secret, title, markdown string) error {
 		title = "DeepSentry 定时任务通知"
 	}
 	if len(markdown) > 12000 {
-		markdown = markdown[:12000] + "\n\n...(内容过长已截断，请查看本地报告)..."
+		markdown = safeTextPrefix(markdown, 12000) + "\n\n...(内容过长已截断，请查看本地报告)..."
 	}
 	target := webhook
 	if strings.TrimSpace(secret) != "" {
@@ -70,7 +70,7 @@ func SendFeishuMarkdown(webhook, secret, title, markdown string) error {
 		title = "DeepSentry 定时任务通知"
 	}
 	if len(markdown) > 12000 {
-		markdown = markdown[:12000] + "\n\n...(内容过长已截断，请查看本地报告)..."
+		markdown = safeTextPrefix(markdown, 12000) + "\n\n...(内容过长已截断，请查看本地报告)..."
 	}
 	text := title + "\n\n" + markdown
 	body := map[string]any{
@@ -116,7 +116,7 @@ func SendEmailGatewayMarkdown(gatewayURL, token, headerName, to, from, subject, 
 		subject = "DeepSentry 定时任务通知"
 	}
 	if len(markdown) > 30000 {
-		markdown = markdown[:30000] + "\n\n...(内容过长已截断，请查看本地报告)..."
+		markdown = safeTextPrefix(markdown, 30000) + "\n\n...(内容过长已截断，请查看本地报告)..."
 	}
 	body := map[string]any{
 		"to":       splitRecipients(to),

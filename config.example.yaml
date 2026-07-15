@@ -1,11 +1,12 @@
 # DeepSentry 配置示例 — 复制为 config.yaml 后修改
-# 支持 provider: openai | anthropic | google | deepseek | qwen | hunyuan | tencent_hy | teleai | ctyun | minimax | mimo | glm | xai | grok | ollama | lmstudio | custom
+# 支持 provider: openai | anthropic | google | deepseek | qwen | qianfan | volcengine | hunyuan | tencent_hy | teleai | ctyun | minimax | mimo | glm | xai | grok | ollama | lmstudio | custom
 # 支持 api_protocol: auto | openai_chat | anthropic_messages | openai_responses
 
 # 各 provider 默认最新模型（model_name 留空时自动使用）:
 #   openai: gpt-5.5 | anthropic: claude-opus-4-8 | google: gemini-3.5-flash
 #   deepseek: deepseek-v4-pro | qwen: qwen-plus | hunyuan/tencent_hy: hunyuan-turbos-latest
-#   teleai/ctyun: GLM-5-Pro | minimax: MiniMax-M3 | glm: glm-5.2 | mimo: mimo-v2.5-pro
+#   qianfan: qianfan-code-latest | volcengine: ark-code-latest | teleai/ctyun: GLM-5-Pro
+#   minimax: MiniMax-M3 | glm: glm-5.2 | mimo Token Plan / MiMo Claw: mimo-v2.5-pro
 #   xai/grok: grok-4 | ollama: llama3.3 | lmstudio: local-model
 
 provider: mimo
@@ -13,6 +14,27 @@ api_protocol: auto
 api_url: https://token-plan-cn.xiaomimimo.com/v1   # 可只填 base /v1，自动补 /chat/completions
 api_key: YOUR_API_KEY
 model_name: mimo-v2.5-pro                          # 留空则用 provider 预设默认模型（见下表）
+
+# 订阅套餐预设（三选一替换上方 provider/api_url/model_name）：
+# 百度千帆 Coding Plan:
+# provider: qianfan
+# api_url: https://qianfan.baidubce.com/v2/coding
+# model_name: qianfan-code-latest
+# 火山方舟 Coding Plan:
+# provider: volcengine
+# api_url: https://ark.cn-beijing.volces.com/api/coding/v3
+# model_name: ark-code-latest
+# Xiaomi MiMo 官方名称为 Token Plan，MiMo Claw/Agent 场景共用该接口；目前无独立 Agent Plan Base URL。
+
+# 模型能力与上下文适配。auto 会分别处理本地小模型和云端长上下文模型。
+model_profile: auto                 # auto | compact | balanced | full
+model_parameter_b: 0                # 可选：参数量（B）；模型名含 14b/70b 时可自动识别
+context_window_tokens: 0            # 最重要：服务端实际窗口；0=自动/安全默认
+context_utilization: 0              # 0=自动；可选 0.40~0.90，为输出和 provider 开销留余量
+reserved_output_tokens: 0           # 0=按窗口自动；也是 API 的输出上限建议值
+native_tool_limit: 0                # 0=按 profile 自动；compact=8, balanced=20, full=全部
+# 例：Gemini 1M 可显式填 1048576。Ollama/LM Studio 必须填实际 num_ctx/max_model_len，
+# 不要只按模型卡的理论上限；未配置的本地服务会先按 32768 安全窗口运行。
 
 use_native_tools: true
 # 内置 Go 原生工具支持热插拔：
@@ -37,6 +59,9 @@ controller_proxy: ""
 browser_binary: ""
 browser_timeout_sec: 20
 browser_artifact_dir: reports/browser
+archive_max_entries: 10000                 # 本地解压最大条目数
+archive_max_file_bytes: 536870912           # 单文件最大 512 MiB
+archive_max_total_bytes: 2147483648          # 总解压量最大 2 GiB
 
 # 本地控制端定时任务（可选）。任务保存在 scheduler_store；进程运行时会按 interval 检查到期任务。
 # 支持自然语言创建：如“明天9点巡检服务器并生成报告发钉钉和飞书通知”。
@@ -64,6 +89,11 @@ email_gateway_header: Authorization
 email_to: ""
 email_from: ""
 
+# TSecBench 跑分平台（可选）：配置后 agent 可直接通过内置 tsecbench 工具拉题、启动容器、提交 flag、关闭容器。
+# 也兼容大写 YAML key: BENCHMARK_BASE_URL / BENCHMARK_TOKEN，以及环境变量 BENCHMARK_BASE_URL / BENCHMARK_TOKEN。
+benchmark_base_url: ""
+benchmark_token: ""
+
 # 目标连接模式：local | ssh | telnet | ftp
 # 为空时兼容旧配置：优先 ssh_host，其次 telnet_host / ftp_host，否则本地模式
 target_protocol: ssh
@@ -73,6 +103,8 @@ ssh_host: "1.2.3.4:2222"
 ssh_user: root
 ssh_password: ""
 ssh_key_path: ""
+ssh_host_key_policy: accept-new            # strict | accept-new | insecure；正式环境禁止 insecure
+ssh_known_hosts_path: ~/.deepsentry/known_hosts
 
 # Telnet 远程模式（老设备/极简环境，无端口时默认 :23）
 telnet_host: ""

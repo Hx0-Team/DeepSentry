@@ -187,7 +187,7 @@ func (f *FTPExecutor) downloadFile(remotePath, localPath string) (string, error)
 		dataConn.Close()
 		return "", err
 	}
-	dst, err := os.Create(localPath)
+	dst, err := createPrivateOutputFile(localPath)
 	if err != nil {
 		dataConn.Close()
 		return "", err

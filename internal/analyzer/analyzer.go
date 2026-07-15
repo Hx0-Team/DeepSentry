@@ -4,10 +4,12 @@ import (
 	"ai-edr/internal/collector"
 	"ai-edr/internal/config"
 	"ai-edr/internal/security"
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 type Message struct {
@@ -20,6 +22,7 @@ type ChatRequest struct {
 	Messages      []Message        `json:"messages"`
 	Stream        bool             `json:"stream"`
 	Temperature   float64          `json:"temperature"`
+	MaxTokens     int              `json:"max_tokens,omitempty"`
 	Tools         []ToolDefinition `json:"tools,omitempty"`
 	ToolChoice    interface{}      `json:"tool_choice,omitempty"`
 	StreamOptions *StreamOptions   `json:"stream_options,omitempty"`
@@ -187,12 +190,15 @@ type CompatibilityResponse struct {
 
 // StepOptions Agent 单步选项
 type StepOptions struct {
+	Context        context.Context
 	SysCtx         collector.SystemContext
 	History        *[]Message
 	ExtraPrompt    string
+	PinnedContext  string
 	UseNativeTools bool
 	OnStream       func(delta string) // 非 nil 且模型支持时启用 SSE 流式输出
 	OnUsage        func(TokenUsage)   // 模型返回真实 usage 时回调
+	OnContextEvent func(compacted bool, fallback bool, beforeTokens int, afterTokens int)
 }
 
 // RunAgentStep 执行 Agent 的单步思考
@@ -239,11 +245,31 @@ func RunAgentStepWithOptions(opts StepOptions) (AgentResponse, error) {
 `
 	systemPrompt := basePrompt + selfProtectionPrompt
 
-	// Context 自动管理：防止 Token 超限，同时保留前情提要和最近步骤。
-	if compacted, err := ManageHistoryContext(history); err != nil {
-		TruncateHistoryFallback(history, 8)
-	} else if compacted {
-		// harness 会在调用前主动提示；这里保持兼容旧调用路径。
+	capabilities := config.GlobalConfig.EffectiveModelCapabilities()
+	systemPrompt = fitSystemPrompt(systemPrompt, capabilities.SystemPromptBudgetTokens())
+	requestOverheadTokens := EstimateTextTokens(systemPrompt)
+	if opts.UseNativeTools && config.GlobalConfig.IsOpenAICompatible() {
+		toolContext := recentToolSelectionContext(*history, 12000)
+		if encodedTools, encodeErr := json.Marshal(AgentToolDefinitionsForContext(capabilities.NativeToolLimit, toolContext)); encodeErr == nil {
+			requestOverheadTokens += EstimateTextTokens(string(encodedTools))
+		}
+	}
+	historyBudgetTokens := capabilities.HistoryBudgetTokens(requestOverheadTokens)
+	beforeTokens := EstimateMessagesTokens(*history)
+	compacted, compactErr := ManageHistoryContextWithOptions(history, ContextManageOptions{
+		Context:             opts.Context,
+		PinnedContext:       opts.PinnedContext,
+		HistoryBudgetTokens: historyBudgetTokens,
+		KeepRecent:          capabilities.KeepRecentMessages,
+		SummaryChunkTokens:  capabilities.SummaryChunkTokens,
+	})
+	fallback := false
+	if compactErr != nil {
+		fallback = true
+		truncateHistoryFallbackToBudget(history, maxAnalyzerInt(4, capabilities.KeepRecentMessages/2), opts.PinnedContext, historyBudgetTokens)
+	}
+	if opts.OnContextEvent != nil && (compacted || fallback) {
+		opts.OnContextEvent(compacted, fallback, beforeTokens, EstimateMessagesTokens(*history))
 	}
 
 	messages := []Message{
@@ -251,7 +277,20 @@ func RunAgentStepWithOptions(opts StepOptions) (AgentResponse, error) {
 	}
 	messages = append(messages, *history...)
 
-	llmResult, err := CallLLMWithRetry(messages, opts.UseNativeTools, opts.OnStream)
+	llmResult, err := CallLLMWithRetryContext(opts.Context, messages, opts.UseNativeTools, opts.OnStream)
+	if err != nil && isContextLimitError(err) && history != nil {
+		// Runtime context settings on local servers can be lower than the
+		// model card. Recover once mechanically, preserve goal/clues/tail, and
+		// retry instead of repeating the same oversized request.
+		before := EstimateMessagesTokens(*history)
+		truncateHistoryFallbackToBudget(history, maxAnalyzerInt(4, capabilities.KeepRecentMessages/2), opts.PinnedContext, historyBudgetTokens/2)
+		messages = []Message{{Role: "system", Content: systemPrompt}}
+		messages = append(messages, *history...)
+		if opts.OnContextEvent != nil {
+			opts.OnContextEvent(false, true, before, EstimateMessagesTokens(*history))
+		}
+		llmResult, err = CallLLMWithRetryContext(opts.Context, messages, opts.UseNativeTools, opts.OnStream)
+	}
 	if err != nil {
 		return AgentResponse{}, err
 	}
@@ -262,7 +301,7 @@ func RunAgentStepWithOptions(opts StepOptions) (AgentResponse, error) {
 	toolCallArgs := llmResult.ToolCallArgs
 
 	if toolCallArgs != "" {
-		resp, perr := ParseToolCallResponse(toolCallArgs)
+		resp, perr := ParseNamedToolCall(llmResult.ToolCallName, toolCallArgs)
 		if perr == nil {
 			return finalizeResponse(resp), nil
 		}
@@ -308,20 +347,10 @@ func RunAgentStepWithOptions(opts StepOptions) (AgentResponse, error) {
 			compat.RiskLevel = "high"
 			err = nil
 		} else {
-			if question := extractClarificationQuestion(rawResp); question != "" {
-				return AgentResponse{
-					Thought:   "需要用户补充信息后继续任务",
-					Action:    "ask_user",
-					Question:  question,
-					RiskLevel: "low",
-				}, nil
+			if recovered, ok := recoverPlainTextResponse(rawResp); ok {
+				return recovered, nil
 			}
-			return AgentResponse{
-				Thought:     "AI 响应格式完全不可读",
-				FinalReport: fmt.Sprintf("❌ 解析失败: %v\n原始响应:\n%s", err, rawResp),
-				IsFinished:  true,
-				RiskLevel:   "low",
-			}, nil
+			return AgentResponse{Thought: "模型响应为空，正在自动请求重新输出。", RiskLevel: "low"}, nil
 		}
 	}
 
@@ -433,23 +462,44 @@ func finalizeResponse(resp AgentResponse) AgentResponse {
 }
 
 const (
-	contextCompactMessageThreshold = 24
-	contextCompactCharBudget       = 60000
-	contextCompactKeepRecent       = 10
+	contextCompactKeepRecent  = 12
+	defaultHistoryTokenBudget = 18000
+	defaultSummaryChunkTokens = 12000
 )
 
 // ManageHistoryContext 自动压缩历史上下文，提供接近“无限上下文”的滚动体验。
 func ManageHistoryContext(history *[]Message) (bool, error) {
+	return ManageHistoryContextWithOptions(history, ContextManageOptions{})
+}
+
+// ContextManageOptions 为长上下文压缩提供可取消调用和不可丢失的会话线索。
+type ContextManageOptions struct {
+	Context             context.Context
+	PinnedContext       string
+	HistoryBudgetTokens int
+	KeepRecent          int
+	SummaryChunkTokens  int
+	Summarize           func(context.Context, []Message) (string, error)
+}
+
+func ManageHistoryContextWithOptions(history *[]Message, opts ContextManageOptions) (bool, error) {
 	if history == nil || len(*history) == 0 {
 		return false, nil
 	}
-	if len(*history) <= contextCompactMessageThreshold && estimateHistoryChars(*history) <= contextCompactCharBudget {
+	budget := opts.HistoryBudgetTokens
+	if budget <= 0 {
+		budget = defaultHistoryTokenBudget
+	}
+	if EstimateMessagesTokens(*history) <= budget {
 		return false, nil
 	}
-	if len(*history) <= contextCompactKeepRecent {
-		return false, nil
+	keepRecent := opts.KeepRecent
+	if keepRecent <= 0 {
+		keepRecent = contextCompactKeepRecent
 	}
-	if err := compressHistory(history); err != nil {
+	// Token pressure, not message count, is authoritative. A single packet
+	// capture, log dump or tool result can exceed a local model's whole window.
+	if err := compressHistoryWithOptions(history, opts); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -463,34 +513,335 @@ func estimateHistoryChars(history []Message) int {
 	return n
 }
 
-// compressHistory 压缩历史记录
-func compressHistory(history *[]Message) error {
-	keepRecent := contextCompactKeepRecent
-	if keepRecent < 4 {
-		keepRecent = 4
+// EstimateTextTokens is a conservative tokenizer-independent estimate. CJK
+// runes are close to one token each; ASCII prose/code averages roughly three
+// bytes per token. Overestimation is intentional to protect local runtimes.
+func EstimateTextTokens(text string) int {
+	if text == "" {
+		return 0
 	}
-	if len(*history) <= keepRecent {
-		return nil
+	ascii, nonASCII := 0, 0
+	for _, r := range text {
+		if r <= 0x7f {
+			ascii++
+		} else {
+			nonASCII++
+		}
+	}
+	return (ascii+2)/3 + nonASCII
+}
+
+func EstimateMessagesTokens(messages []Message) int {
+	total := 0
+	for _, message := range messages {
+		total += 4 + EstimateTextTokens(message.Role) + EstimateTextTokens(message.Content)
+	}
+	return total
+}
+
+func compressHistoryWithOptions(history *[]Message, opts ContextManageOptions) error {
+	keepRecent := opts.KeepRecent
+	if keepRecent <= 0 {
+		keepRecent = contextCompactKeepRecent
+	}
+	if keepRecent >= len(*history) {
+		keepRecent = len(*history) - 1
+	}
+	if keepRecent < 0 {
+		keepRecent = 0
+	}
+	budget := opts.HistoryBudgetTokens
+	if budget <= 0 {
+		budget = defaultHistoryTokenBudget
+	}
+	// Do not let a handful of recent giant messages prevent compaction. Keep a
+	// token-bounded tail; if even the newest message dominates the budget, fold
+	// it into the hierarchical summary too.
+	for keepRecent > 0 {
+		tail := (*history)[len(*history)-keepRecent:]
+		if EstimateMessagesTokens(tail) <= maxAnalyzerInt(512, budget/2) {
+			break
+		}
+		keepRecent--
 	}
 	cutIndex := len(*history) - keepRecent
-	toSummarize := (*history)[:cutIndex]
-	remaining := (*history)[cutIndex:]
-	summaryPrompt := []Message{
-		{Role: "system", Content: "你是 DeepSentry 的上下文压缩器。请将以下历史压缩成可继续执行任务的【前情提要】。必须保留：用户目标、已确认配置/凭证占位说明、已执行命令、关键输出结论、已创建/修改的文件路径、未完成 TODO、失败原因、下一步。不要编造。"},
+	toSummarize := append([]Message(nil), (*history)[:cutIndex]...)
+	remaining := append([]Message(nil), (*history)[cutIndex:]...)
+	goal := firstHistoryUserGoal(*history)
+	latestDirective := latestHistoryUserDirective(*history)
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	summaryPrompt = append(summaryPrompt, toSummarize...)
-	summaryPrompt = append(summaryPrompt, Message{Role: "user", Content: "请生成紧凑但可续跑的前情提要。"})
-
-	summaryText, err := compressCallLLM(summaryPrompt)
+	summarize := opts.Summarize
+	if summarize == nil {
+		summarize = compressCallLLMContext
+	}
+	chunkTokens := opts.SummaryChunkTokens
+	if chunkTokens <= 0 {
+		chunkTokens = defaultSummaryChunkTokens
+	}
+	chunks := splitHistoryByTokenBudget(toSummarize, chunkTokens)
+	if len(chunks) == 0 {
+		return nil
+	}
+	summaries := make([]string, 0, len(chunks))
+	for index, chunk := range chunks {
+		summaryPrompt := buildSummaryPrompt(chunk, goal, latestDirective, opts.PinnedContext, index+1, len(chunks))
+		summaryText, err := summarize(ctx, summaryPrompt)
+		if err != nil {
+			return err
+		}
+		summaryText = strings.TrimSpace(summaryText)
+		if summaryText == "" {
+			return fmt.Errorf("上下文摘要为空")
+		}
+		summaries = append(summaries, summaryText)
+	}
+	summaryText := strings.Join(summaries, "\n\n")
+	var err error
+	if len(summaries) > 1 && EstimateTextTokens(summaryText) > maxAnalyzerInt(2_000, chunkTokens/3) {
+		reducePrompt := []Message{
+			{Role: "system", Content: "合并以下分段摘要为一份可续跑的 DeepSentry 前情提要。保留每段的目标、约束、证据、命令结果、失败原因、未完成事项和下一步；不得遗漏冲突或编造。"},
+			{Role: "user", Content: summaryText},
+		}
+		summaryText, err = summarize(ctx, reducePrompt)
+	}
 	if err != nil {
 		return err
 	}
+	summaryText = strings.TrimSpace(summaryText)
+	if summaryText == "" {
+		return fmt.Errorf("上下文摘要为空")
+	}
+	var envelope strings.Builder
+	envelope.WriteString("【分层上下文摘要】\n")
+	if goal != "" {
+		envelope.WriteString("\n【原始用户目标】\n")
+		envelope.WriteString(trimContextText(goal, 3000))
+		envelope.WriteString("\n")
+	}
+	if latestDirective != "" && latestDirective != goal {
+		envelope.WriteString("\n【最新用户补充/修正】\n")
+		envelope.WriteString(trimContextText(latestDirective, 3000))
+		envelope.WriteString("\n")
+	}
+	if strings.TrimSpace(opts.PinnedContext) != "" {
+		envelope.WriteString("\n")
+		envelope.WriteString(trimContextText(opts.PinnedContext, 8000))
+		envelope.WriteString("\n")
+	}
+	envelope.WriteString("\n【前情提要】\n")
+	envelope.WriteString(strings.TrimSpace(summaryText))
 	newHistory := []Message{
-		{Role: "system", Content: fmt.Sprintf("【前情提要】:\n%s", summaryText)},
+		{Role: "system", Content: envelope.String()},
 	}
 	newHistory = append(newHistory, remaining...)
 	*history = newHistory
 	return nil
+}
+
+func buildSummaryPrompt(chunk []Message, goal, latestDirective, pinned string, index, total int) []Message {
+	prompt := []Message{{Role: "system", Content: fmt.Sprintf("你是 DeepSentry 上下文压缩器，正在处理第 %d/%d 段。必须保留：用户目标、约束和批准边界、已执行命令、关键输出结论及证据、IP/URL/CVE/哈希/文件路径、已修改文件、TODO、失败原因、冲突、不确定项和下一步。合并重复信息，不要编造。", index, total)}}
+	if strings.TrimSpace(goal) != "" {
+		prompt = append(prompt, Message{Role: "system", Content: "【不可丢失的原始目标】\n" + trimContextText(goal, 3000)})
+	}
+	if latestDirective != "" && latestDirective != goal {
+		prompt = append(prompt, Message{Role: "system", Content: "【不可丢失的最新用户补充/修正】\n" + trimContextText(latestDirective, 3000)})
+	}
+	if strings.TrimSpace(pinned) != "" {
+		prompt = append(prompt, Message{Role: "system", Content: "【不可丢失的结构化线索】\n" + trimContextText(pinned, 10000)})
+	}
+	prompt = append(prompt, chunk...)
+	prompt = append(prompt, Message{Role: "user", Content: "请生成紧凑但可续跑的本段前情提要。"})
+	return prompt
+}
+
+func splitHistoryByTokenBudget(history []Message, budget int) [][]Message {
+	if budget <= 0 {
+		budget = defaultSummaryChunkTokens
+	}
+	var chunks [][]Message
+	current := make([]Message, 0)
+	used := 0
+	for _, message := range history {
+		pieces := []string{message.Content}
+		if 4+EstimateTextTokens(message.Role)+EstimateTextTokens(message.Content) > budget {
+			pieces = splitTextByTokenBudget(message.Content, maxAnalyzerInt(256, budget-16))
+		}
+		for index, piece := range pieces {
+			part := message
+			if len(pieces) > 1 {
+				part.Content = fmt.Sprintf("【原消息分片 %d/%d】\n%s", index+1, len(pieces), piece)
+			} else {
+				part.Content = piece
+			}
+			cost := 4 + EstimateTextTokens(part.Role) + EstimateTextTokens(part.Content)
+			if len(current) > 0 && used+cost > budget {
+				chunks = append(chunks, current)
+				current = make([]Message, 0)
+				used = 0
+			}
+			current = append(current, part)
+			used += cost
+		}
+	}
+	if len(current) > 0 {
+		chunks = append(chunks, current)
+	}
+	return chunks
+}
+
+func splitTextByTokenBudget(text string, maxTokens int) []string {
+	if maxTokens <= 0 || EstimateTextTokens(text) <= maxTokens {
+		return []string{text}
+	}
+	var parts []string
+	remaining := text
+	for remaining != "" {
+		if EstimateTextTokens(remaining) <= maxTokens {
+			parts = append(parts, remaining)
+			break
+		}
+		low, high := 1, minAnalyzerInt(len(remaining), maxTokens*3)
+		best := 0
+		for low <= high {
+			mid := (low + high) / 2
+			for mid > 0 && !utf8.ValidString(remaining[:mid]) {
+				mid--
+			}
+			if mid == 0 {
+				low++
+				continue
+			}
+			if EstimateTextTokens(remaining[:mid]) <= maxTokens {
+				best = mid
+				low = mid + 1
+			} else {
+				high = mid - 1
+			}
+		}
+		if best <= 0 {
+			_, size := utf8.DecodeRuneInString(remaining)
+			best = size
+		}
+		parts = append(parts, remaining[:best])
+		remaining = remaining[best:]
+	}
+	return parts
+}
+
+func trimContextTextToTokens(text string, maxTokens int) string {
+	if maxTokens <= 0 || EstimateTextTokens(text) <= maxTokens {
+		return text
+	}
+	// Binary search a UTF-8-safe byte budget, then preserve both evidence
+	// prefixes and error/result tails via trimContextText.
+	low, high := 1, len(text)
+	for low < high {
+		mid := (low + high + 1) / 2
+		candidate := trimContextText(text, mid)
+		if EstimateTextTokens(candidate) <= maxTokens {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	return trimContextText(text, low)
+}
+
+func fitSystemPrompt(prompt string, maxTokens int) string {
+	if maxTokens <= 0 || EstimateTextTokens(prompt) <= maxTokens {
+		return prompt
+	}
+	trimmed := trimContextTextToTokens(prompt, maxTokens)
+	return trimmed + "\n【系统提示已按模型上下文能力压缩；安全边界与末尾规则仍有效】"
+}
+
+func isContextLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, marker := range []string{"context length", "context_length", "maximum context", "max context", "prompt too long", "too many tokens", "token limit", "num_ctx", "max_model_len"} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func maxAnalyzerInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minAnalyzerInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func firstHistoryUserGoal(history []Message) string {
+	for _, message := range history {
+		if message.Role != "user" {
+			continue
+		}
+		content := strings.TrimSpace(message.Content)
+		if content == "" || strings.HasPrefix(content, "Output:") || strings.HasPrefix(content, "上一步执行失败:") {
+			continue
+		}
+		return content
+	}
+	return ""
+}
+
+func latestHistoryUserDirective(history []Message) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		message := history[i]
+		if message.Role != "user" {
+			continue
+		}
+		content := strings.TrimSpace(message.Content)
+		if content == "" || strings.HasPrefix(content, "Output:") || strings.HasPrefix(content, "上一步执行失败:") {
+			continue
+		}
+		return content
+	}
+	return ""
+}
+
+func latestHistorySummary(history []Message) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role != "system" {
+			continue
+		}
+		content := strings.TrimSpace(history[i].Content)
+		if strings.Contains(content, "前情提要") || strings.Contains(content, "分层上下文摘要") {
+			return content
+		}
+	}
+	return ""
+}
+
+func trimContextText(text string, maxBytes int) string {
+	text = strings.TrimSpace(text)
+	if maxBytes <= 0 || len(text) <= maxBytes {
+		return text
+	}
+	head := maxBytes * 2 / 3
+	tail := maxBytes - head
+	for head > 0 && !utf8.ValidString(text[:head]) {
+		head--
+	}
+	start := len(text) - tail
+	for start < len(text) && !utf8.ValidString(text[start:]) {
+		start++
+	}
+	return text[:head] + "\n...(中间大段输出已压缩；保留首尾证据)...\n" + text[start:]
 }
 
 func inferThoughtFromCommand(cmd string) string {
@@ -618,17 +969,12 @@ func decodeJSONUnicodeEscapes(s string) string {
 	return b.String()
 }
 
-func compressCallLLM(messages []Message) (string, error) {
-	res, err := CallLLMWithRetry(messages, false, nil)
+func compressCallLLMContext(ctx context.Context, messages []Message) (string, error) {
+	res, err := CallLLMWithRetryContext(ctx, messages, false, nil)
 	if err != nil {
 		return "", err
 	}
 	return res.Content, nil
-}
-
-// callLLM 兼容旧调用（摘要等）
-func callLLM(_ string, messages []Message) (string, error) {
-	return compressCallLLM(messages)
 }
 
 func parseToolArgs(raw map[string]interface{}) map[string]string {

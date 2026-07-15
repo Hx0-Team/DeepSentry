@@ -103,11 +103,11 @@ var (
 	styleInfo    = lipgloss.NewStyle().Foreground(colorMuted)
 
 	styleConfirmBox = lipgloss.NewStyle().
-			Border(lipgloss.DoubleBorder()).
+			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorYellow).
 			Background(colorSurface).
 			Padding(1, 2).
-			Width(60)
+			MarginLeft(2)
 
 	styleHelp = lipgloss.NewStyle().
 			Foreground(colorMuted).
@@ -144,7 +144,7 @@ func ConfigureTerminalPreferences() {
 	styleSuccess = lipgloss.NewStyle()
 	styleError = lipgloss.NewStyle()
 	styleInfo = lipgloss.NewStyle()
-	styleConfirmBox = lipgloss.NewStyle().Border(lipgloss.DoubleBorder()).Padding(1, 2).Width(60)
+	styleConfirmBox = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1, 2).MarginLeft(2)
 	styleHelp = lipgloss.NewStyle().Italic(true)
 	styleHelpHint = lipgloss.NewStyle()
 

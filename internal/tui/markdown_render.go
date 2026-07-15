@@ -4,11 +4,11 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"ai-edr/internal/ui"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mattn/go-runewidth"
 )
 
 var (
@@ -29,14 +29,38 @@ func renderMarkdownReport(markdown string, width int) string {
 		width = 80
 	}
 	innerW := width - styleAnswer.GetHorizontalFrameSize()
-	if innerW < 20 {
-		innerW = 20
-	}
+	innerW = max(1, innerW)
 	rendered := renderMarkdownBlocks(markdown, innerW)
-	return styleAnswer.Width(innerW).Render(rendered)
+	return styleAnswer.Width(styleRenderWidth(styleAnswer, width)).Render(fitRenderedBlock(rendered, innerW))
+}
+
+func renderMarkdownAsk(markdown, timestamp string, width int) string {
+	if width <= 0 {
+		width = 80
+	}
+	innerW := width - styleToolBox.GetHorizontalFrameSize()
+	innerW = max(1, innerW)
+	header := mdH1Style.Render(sanitizeTUIText(timestamp) + "? 需要用户补充")
+	body := renderMarkdownBlocks(markdown, innerW)
+	if body == "" {
+		body = mdMutedStyle.Render("请补充继续任务所需的信息。")
+	}
+	return styleToolBox.Width(styleRenderWidth(styleToolBox, width)).Render(fitRenderedBlock(header+"\n\n"+body, innerW))
+}
+
+func renderMarkdownConfirm(markdown, timestamp string, width int) string {
+	if width <= 0 {
+		width = 80
+	}
+	innerW := max(1, width-styleConfirmBox.GetHorizontalFrameSize())
+	header := mdH2Style.Render(sanitizeTUIText(timestamp) + "⚠ 需要确认")
+	body := renderMarkdownBlocks(markdown, innerW)
+	footer := mdBoldStyle.Render("Y 批准  ·  N / Esc 拒绝  ·  Enter 不执行")
+	return styleConfirmBox.Width(styleRenderWidth(styleConfirmBox, width)).Render(fitRenderedBlock(header+"\n\n"+body+"\n\n"+footer, innerW))
 }
 
 func renderMarkdownBlocks(markdown string, width int) string {
+	markdown = sanitizeTUIText(markdown)
 	markdown = strings.ReplaceAll(markdown, "\r\n", "\n")
 	markdown = strings.ReplaceAll(markdown, "\r", "\n")
 	lines := strings.Split(strings.TrimSpace(markdown), "\n")
@@ -56,7 +80,7 @@ func renderMarkdownBlocks(markdown string, width int) string {
 			code := make([]string, 0)
 			i++
 			for i < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[i]), "```") {
-				code = append(code, runewidth.Truncate(lines[i], width, "…"))
+				code = append(code, lines[i])
 				i++
 			}
 			out = append(out, renderCodeBlock(code, width))
@@ -89,13 +113,11 @@ func renderMarkdownBlocks(markdown string, width int) string {
 		}
 
 		plain := markdownInlinePlain(trimmed)
-		if runewidth.StringWidth(plain) <= width {
+		if displayWidth(plain) <= width {
 			out = append(out, renderInlineMarkdown(trimmed))
 			continue
 		}
-		for _, wrapped := range strings.Split(wrapDisplay(plain, width), "\n") {
-			out = append(out, wrapped)
-		}
+		out = append(out, strings.Split(wrapDisplay(plain, width), "\n")...)
 	}
 	return strings.TrimRight(strings.Join(out, "\n"), "\n")
 }
@@ -119,15 +141,15 @@ func renderMarkdownHeading(level int, text string, width int) string {
 	switch {
 	case level <= 1:
 		marker := "=="
-		label := runewidth.Truncate(text, max(4, width-runewidth.StringWidth(marker)-1), "…")
+		label := truncateDisplay(text, max(4, width-displayWidth(marker)-1), "…")
 		return mdH1Style.Render(marker + " " + label)
 	case level == 2:
 		marker := "--"
-		label := runewidth.Truncate(text, max(4, width-runewidth.StringWidth(marker)-1), "…")
+		label := truncateDisplay(text, max(4, width-displayWidth(marker)-1), "…")
 		return mdH2Style.Render(marker + " " + label)
 	default:
 		marker := ">"
-		label := runewidth.Truncate(text, max(4, width-runewidth.StringWidth(marker)-1), "…")
+		label := truncateDisplay(text, max(4, width-displayWidth(marker)-1), "…")
 		return mdH3Style.Render(marker + " " + label)
 	}
 }
@@ -137,27 +159,28 @@ func normalizeMarkdownHeadingText(text string) string {
 	if text == "" {
 		return text
 	}
-	runes := []rune(text)
-	if len(runes) < 2 {
+	cluster, rest := firstDisplayCluster(text)
+	if cluster == "" || rest == "" {
 		return text
 	}
-	if !isMarkdownIconPrefix(runes[0]) {
+	if !isMarkdownIconPrefix(cluster) {
 		return text
 	}
-	if unicode.IsSpace(runes[1]) {
+	if next, _ := firstDisplayCluster(rest); strings.TrimSpace(next) == "" {
 		return text
 	}
-	return string(runes[0]) + " " + string(runes[1:])
+	return cluster + " " + rest
 }
 
-func isMarkdownIconPrefix(r rune) bool {
+func isMarkdownIconPrefix(cluster string) bool {
+	r, _ := utf8.DecodeRuneInString(cluster)
 	if unicode.IsLetter(r) || unicode.IsDigit(r) {
 		return false
 	}
 	if unicode.IsSymbol(r) {
 		return true
 	}
-	return runewidth.RuneWidth(r) >= 2
+	return displayWidth(cluster) >= 2
 }
 
 func parseMarkdownList(line string) (string, string, bool) {
@@ -174,7 +197,7 @@ func parseMarkdownList(line string) (string, string, bool) {
 }
 
 func renderMarkdownListItem(marker, text string, width int) string {
-	markerW := runewidth.StringWidth(marker) + 2
+	markerW := displayWidth(marker) + 2
 	bodyW := max(8, width-markerW)
 	wrapped := strings.Split(wrapDisplay(markdownInlinePlain(text), bodyW), "\n")
 	for i, line := range wrapped {
@@ -233,7 +256,10 @@ func renderCodeBlock(lines []string, width int) string {
 	}
 	out := make([]string, 0, len(lines))
 	for _, line := range lines {
-		out = append(out, mdCodeStyle.Render(fitPlainLine(line, width)))
+		wrapped := strings.Split(wrapDisplay(sanitizeTUIText(line), max(1, width)), "\n")
+		for _, part := range wrapped {
+			out = append(out, mdCodeStyle.Render(part))
+		}
 	}
 	return strings.Join(out, "\n")
 }
@@ -300,8 +326,20 @@ func renderMarkdownTable(lines []string, width int) []string {
 			rows[i] = rows[i][:cols]
 		}
 	}
-	tableW := max(20, width-2)
+	tableW := max(1, width-2)
+	// A technically valid grid with 1-2 cell columns is unreadable and drops
+	// the values users need to make a decision. Prefer the stacked key/value
+	// form until every column has a useful amount of space.
+	if tableW < cols*7+1 {
+		return renderMarkdownTableStacked(rows, width)
+	}
 	widths := markdownTableWidths(rows, tableW)
+	if markdownTableWouldTruncate(rows, widths) {
+		return renderMarkdownTableStacked(rows, width)
+	}
+	if tableTotalWidth(widths) > tableW {
+		return renderMarkdownTableStacked(rows, width)
+	}
 	out := make([]string, 0, len(rows)+3)
 	prefix := "  "
 	out = append(out, prefix+tableBorderLine("top", widths))
@@ -314,20 +352,55 @@ func renderMarkdownTable(lines []string, width int) []string {
 	return out
 }
 
+func markdownTableWouldTruncate(rows [][]string, widths []int) bool {
+	for _, row := range rows {
+		for i, cell := range row {
+			if i < len(widths) && displayWidth(cell) > widths[i] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func renderMarkdownTableStacked(rows [][]string, width int) []string {
+	if len(rows) == 0 {
+		return nil
+	}
+	headers := rows[0]
+	data := rows[1:]
+	if len(data) == 0 {
+		data = rows[:1]
+	}
+	out := make([]string, 0, len(data))
+	for _, row := range data {
+		parts := make([]string, 0, len(headers))
+		for i, header := range headers {
+			value := ""
+			if i < len(row) {
+				value = row[i]
+			}
+			parts = append(parts, header+": "+value)
+		}
+		out = append(out, strings.Split(wrapDisplay(strings.Join(parts, " · "), max(1, width)), "\n")...)
+	}
+	return out
+}
+
 func markdownTableWidths(rows [][]string, maxWidth int) []int {
 	cols := len(rows[0])
 	widths := make([]int, cols)
 	for _, row := range rows {
 		for i, cell := range row {
-			w := runewidth.StringWidth(cell)
+			w := displayWidth(cell)
 			if w > widths[i] {
 				widths[i] = w
 			}
 		}
 	}
 	for i := range widths {
-		if widths[i] < 4 {
-			widths[i] = 4
+		if widths[i] < 2 {
+			widths[i] = 2
 		}
 		if widths[i] > 32 {
 			widths[i] = 32
@@ -335,7 +408,7 @@ func markdownTableWidths(rows [][]string, maxWidth int) []int {
 	}
 	for tableTotalWidth(widths) > maxWidth && len(widths) > 0 {
 		idx := widestColumn(widths)
-		if widths[idx] <= 6 {
+		if widths[idx] <= 2 {
 			break
 		}
 		widths[idx]--
@@ -411,10 +484,10 @@ func tableRow(cells []string, widths []int, header bool) string {
 
 func fitPlainLine(s string, width int) string {
 	s = ui.TerminalText(s)
-	if runewidth.StringWidth(s) > width {
-		s = runewidth.Truncate(s, width, "…")
+	if displayWidth(s) > width {
+		s = truncateDisplay(s, width, "…")
 	}
-	if gap := width - runewidth.StringWidth(s); gap > 0 {
+	if gap := width - displayWidth(s); gap > 0 {
 		s += strings.Repeat(" ", gap)
 	}
 	return s

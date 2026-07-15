@@ -1,9 +1,11 @@
 package memory
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -39,6 +41,34 @@ func TestStoreSetAndLoad(t *testing.T) {
 	path := filepath.Join(tmp, ".deepsentry", "memory", "store.json")
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("store file not created: %v", err)
+	}
+}
+
+func TestStoreSupportsConcurrentSubAgentMemoryUpdates(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := NewStore(ScopeLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const workers = 32
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := store.Set(fmt.Sprintf("finding_%02d", i), fmt.Sprintf("value-%02d", i), "agent"); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if got := store.Count(); got != workers {
+		t.Fatalf("concurrent updates retained %d/%d entries", got, workers)
 	}
 }
 
@@ -82,6 +112,29 @@ func TestMemoryPromptExplainsAutoAgentsMDPolicy(t *testing.T) {
 	}
 }
 
+func TestMemoryPromptHasBoundedContextBudget(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := NewStore(ScopeLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.agentsMD["/huge/AGENTS.md"] = strings.Repeat("长期规则和项目背景。", 10000)
+	store.mu.Unlock()
+	for i := 0; i < 20; i++ {
+		if err := store.Set(fmt.Sprintf("note_%02d", i), strings.Repeat("高信号记忆", 150), "agent"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prompt := store.FormatPromptBudget(8000)
+	if len(prompt) > 8200 {
+		t.Fatalf("memory prompt exceeded bounded budget: %d", len(prompt))
+	}
+	if !strings.Contains(prompt, "记忆管理") || !strings.Contains(prompt, "因上下文预算省略") || !strings.Contains(prompt, BuiltinAgentsMDPath) {
+		t.Fatalf("bounded prompt lost policy or omission marker:\n%s", prompt)
+	}
+}
+
 func TestStoreScopeIsolation(t *testing.T) {
 	tmp := t.TempDir()
 	oldHome := os.Getenv("HOME")
@@ -102,6 +155,24 @@ func TestStoreScopeIsolation(t *testing.T) {
 	sshEntries := ssh.ActiveEntries()
 	if len(sshEntries) != 2 {
 		t.Fatalf("ssh scope should see 2 entries, got %d", len(sshEntries))
+	}
+}
+
+func TestTargetMemoryDeterministicallyOverridesGlobalKey(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := NewStore("ssh:demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetGlobal("report_lang", "en-US", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set("report_lang", "zh-CN", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	entries := store.ActiveEntries()
+	if len(entries) != 1 || entries[0].Value != "zh-CN" || entries[0].Scope != "ssh:demo" {
+		t.Fatalf("target override failed: %#v", entries)
 	}
 }
 

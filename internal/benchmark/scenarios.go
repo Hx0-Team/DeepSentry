@@ -697,7 +697,7 @@ func runHarnessMemory(ctx *Context) Result {
 
 func runHarnessCheckpoint(ctx *Context) Result {
 	start := time.Now()
-	sid := fmt.Sprintf("bench_%d", time.Now().UnixNano())
+	sid := fmt.Sprintf("session_bench_%d", time.Now().UnixNano())
 	cp, err := harness.NewCheckpointStore(sid)
 	if err != nil {
 		return mkResult(false, false, 0, 0, err.Error(), "")

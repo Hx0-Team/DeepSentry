@@ -4,9 +4,41 @@ import (
 	"ai-edr/internal/config"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
+
+func TestTruncateOutputPreservesUTF8(t *testing.T) {
+	got := truncateOutput(strings.Repeat("你", 10), 4)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated output is invalid UTF-8: %q", got)
+	}
+	if !strings.HasPrefix(got, "你") {
+		t.Fatalf("truncated output lost readable prefix: %q", got)
+	}
+}
+
+func TestLocalExecutorStopTerminatesShellProcessGroup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX sleep to verify process-group cancellation")
+	}
+	stop := make(chan struct{})
+	time.AfterFunc(100*time.Millisecond, func() { close(stop) })
+	start := time.Now()
+	out, err := (&LocalExecutor{}).RunWithStreamingAndStop("printf 'started\\n'; sleep 10; printf 'finished\\n'", nil, stop)
+	if err == nil || !strings.Contains(err.Error(), "中断") {
+		t.Fatalf("stopped command err=%v output=%q", err, out)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("stop took too long: %s", time.Since(start))
+	}
+	if !strings.Contains(out, "started") || strings.Contains(out, "finished") {
+		t.Fatalf("unexpected stopped output: %q", out)
+	}
+}
 
 func TestOutputCollectorTruncatesAndContinues(t *testing.T) {
 	c := newOutputCollector(10)
@@ -57,14 +89,14 @@ func TestLocalExecutorBlocksRawSSHLikeCommands(t *testing.T) {
 	config.GlobalConfig.Targets = []config.TargetConfig{{
 		Name:     "target-01",
 		Protocol: "ssh",
-		Host:     "10.204.1.249:2222",
+		Host:     "192.0.2.49:2222",
 		User:     "root",
 		Password: "secret",
 		Tags:     []string{"toolbox"},
 	}}
 	t.Cleanup(func() { config.GlobalConfig.Targets = origTargets })
 
-	out, err := (&LocalExecutor{}).RunWithStreaming(`ssh -p 2222 root@10.204.1.249 "echo ok"`, nil)
+	out, err := (&LocalExecutor{}).RunWithStreaming(`ssh -p 2222 root@192.0.2.49 "echo ok"`, nil)
 	if err != nil {
 		t.Fatalf("raw ssh should return guidance, not hard fail: %v", err)
 	}
@@ -89,13 +121,13 @@ func TestLocalExecutorBlocksRawSCPCommand(t *testing.T) {
 
 func TestRawSSHLikeCommandBlocksOnlyRemoteConnections(t *testing.T) {
 	blockedCases := []string{
-		`ssh -p 2222 root@10.204.1.249 "echo ok"`,
-		`timeout 5 ssh root@10.204.1.249 true`,
-		`env SSHPASS=x sshpass -e ssh root@10.204.1.249 true`,
-		`scp ./flag.zip root@10.204.1.249:/tmp/flag.zip`,
-		`scp -- ./flag.zip root@10.204.1.249:/tmp/flag.zip`,
-		`sftp root@10.204.1.249`,
-		`ssh root@10.204.1.249 echo -G`,
+		`ssh -p 2222 root@192.0.2.49 "echo ok"`,
+		`timeout 5 ssh root@192.0.2.49 true`,
+		`env SSHPASS=x sshpass -e ssh root@192.0.2.49 true`,
+		`scp ./flag.zip root@192.0.2.49:/tmp/flag.zip`,
+		`scp -- ./flag.zip root@192.0.2.49:/tmp/flag.zip`,
+		`sftp root@192.0.2.49`,
+		`ssh root@192.0.2.49 echo -G`,
 	}
 	for _, cmd := range blockedCases {
 		if _, blocked := blockRawSSHLikeCommand(cmd); !blocked {
@@ -105,7 +137,7 @@ func TestRawSSHLikeCommandBlocksOnlyRemoteConnections(t *testing.T) {
 
 	allowedCases := []string{
 		`ssh -V`,
-		`ssh -G root@10.204.1.249`,
+		`ssh -G root@192.0.2.49`,
 		`scp -h`,
 		`sftp -h`,
 		`sftp -P 2222`,
@@ -172,8 +204,12 @@ func TestCopyLocalFileExpandsTildeDestination(t *testing.T) {
 		t.Fatalf("copyLocalFile failed: %v", err)
 	}
 	want := filepath.Join(home, "Downloads", "test_flag.txt")
-	if _, err := os.Stat(want); err != nil {
+	info, err := os.Stat(want)
+	if err != nil {
 		t.Fatalf("expected expanded destination to exist: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("downloaded evidence mode=%o want 600", got)
 	}
 	if strings.Contains(out, "~/Downloads") {
 		t.Fatalf("result should report expanded destination, got %q", out)

@@ -47,22 +47,6 @@ func (m *AgentModel) selectedPlainText() string {
 	return extractPlainSelection(m.viewportPlain, m.selRow1, m.selCol1, m.selRow2, m.selCol2)
 }
 
-func (m *AgentModel) visiblePlainText() string {
-	lines := strings.Split(m.viewportPlain, "\n")
-	if len(lines) == 0 {
-		return ""
-	}
-	start := m.viewport.YOffset
-	if start >= len(lines) {
-		return ""
-	}
-	end := start + m.viewport.Height
-	if end > len(lines) {
-		end = len(lines)
-	}
-	return strings.Join(lines[start:end], "\n")
-}
-
 func (m *AgentModel) copyTextCmd(text string) tea.Cmd {
 	if strings.TrimSpace(text) == "" {
 		return nil

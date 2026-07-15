@@ -22,7 +22,7 @@ func newTelnetExecutor(cfg config.Config) (*TelnetExecutor, error) {
 	host := normalizeHostPort(cfg.TelnetHost, "23")
 	conn, err := net.DialTimeout("tcp", host, 10*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("Telnet 连接失败: %v", err)
+		return nil, fmt.Errorf("建立 Telnet 连接失败: %v", err)
 	}
 	t := &TelnetExecutor{conn: conn, reader: bufio.NewReader(conn), prompt: cfg.TelnetPrompt}
 	if t.prompt == "" {
@@ -66,6 +66,9 @@ func (t *TelnetExecutor) RunWithStreaming(cmd string, onLine func(string)) (stri
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
 		return "(空命令)", nil
+	}
+	if CommandUsesSudo(cmd) {
+		cmd = ForceNonInteractiveSudo(cmd)
 	}
 	if strings.Contains(cmd, "local_run ") {
 		return (&LocalExecutor{}).RunWithStreaming(strings.ReplaceAll(cmd, "local_run ", ""), onLine)

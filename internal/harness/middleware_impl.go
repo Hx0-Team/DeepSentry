@@ -1,17 +1,20 @@
 package harness
 
 import (
+	"ai-edr/internal/analyzer"
 	"ai-edr/internal/config"
 	"ai-edr/internal/executor"
 	"ai-edr/internal/harness/subagent"
 	"ai-edr/internal/mcp"
 	"ai-edr/internal/memory"
+	"ai-edr/internal/security"
 	"ai-edr/internal/skills"
 	"ai-edr/internal/tools"
 	"ai-edr/internal/ui"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +35,14 @@ func (m *MemoryMiddleware) EnhancePrompt(base string, _ *AgentState) string {
 	if m.Store == nil {
 		return base
 	}
-	return base + m.Store.FormatPrompt()
+	budget := 18000
+	switch config.GlobalConfig.EffectiveModelCapabilities().PromptProfile {
+	case config.ModelProfileCompact:
+		budget = 3000
+	case config.ModelProfileBalanced:
+		budget = 8000
+	}
+	return base + m.Store.FormatPromptBudget(budget)
 }
 
 func (m *MemoryMiddleware) HandleAction(_ *StepContext, action *AgentAction) (*ActionResult, bool, error) {
@@ -108,7 +118,7 @@ func truncateMem(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "..."
+	return safeUTF8BytePrefix(s, max) + "..."
 }
 
 // SkillsMiddleware 按需加载 Skill（对标 deepagents SkillsMiddleware）
@@ -126,12 +136,38 @@ func (m *SkillsMiddleware) EnhancePrompt(base string, state *AgentState) string 
 	if m.Catalog == nil {
 		return base
 	}
-	prompt := base + m.Catalog.FormatCatalogPrompt()
+	capabilities := config.GlobalConfig.EffectiveModelCapabilities()
+	catalogPrompt := m.Catalog.FormatCatalogPrompt()
+	if capabilities.PromptProfile == config.ModelProfileCompact {
+		catalogPrompt = compactPromptText(catalogPrompt, 3000)
+	}
+	prompt := base + catalogPrompt
 
 	if len(state.LoadedSkills) > 0 {
 		prompt += "\n【已加载 Skills】\n"
-		for name, content := range state.LoadedSkills {
-			prompt += fmt.Sprintf("\n--- Skill: %s ---\n%s\n", name, content)
+		names := make([]string, 0, len(state.LoadedSkills))
+		for name := range state.LoadedSkills {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		remaining := 64000
+		if capabilities.PromptProfile == config.ModelProfileCompact {
+			remaining = 7000
+		} else if capabilities.PromptProfile == config.ModelProfileBalanced {
+			remaining = 18000
+		}
+		for _, name := range names {
+			content := state.LoadedSkills[name]
+			section := fmt.Sprintf("\n--- Skill: %s ---\n%s\n", name, content)
+			if len(section) > remaining {
+				section = compactPromptText(section, remaining)
+			}
+			prompt += section
+			remaining -= len(section)
+			if remaining <= 0 {
+				prompt += "\n...(其余已加载 Skill 因当前模型上下文受限暂未注入；需要时重新 load_skill)...\n"
+				break
+			}
 		}
 	}
 	return prompt
@@ -175,7 +211,16 @@ func NewToolsMiddleware() *ToolsMiddleware { return &ToolsMiddleware{} }
 func (m *ToolsMiddleware) Name() string { return "ToolsMiddleware" }
 
 func (m *ToolsMiddleware) EnhancePrompt(base string, _ *AgentState) string {
-	return base + tools.FormatCatalogPrompt() + mcp.Global().FormatPrompt()
+	capabilities := config.GlobalConfig.EffectiveModelCapabilities()
+	toolPrompt := tools.FormatCatalogPrompt()
+	mcpPrompt := mcp.Global().FormatPrompt()
+	if capabilities.PromptProfile == config.ModelProfileCompact {
+		toolPrompt = tools.FormatCompactCatalogPrompt()
+		mcpPrompt = compactPromptText(mcpPrompt, 2500)
+	} else if capabilities.PromptProfile == config.ModelProfileBalanced {
+		mcpPrompt = compactPromptText(mcpPrompt, 6000)
+	}
+	return base + toolPrompt + mcpPrompt
 }
 
 func (m *ToolsMiddleware) HandleAction(ctx *StepContext, action *AgentAction) (*ActionResult, bool, error) {
@@ -188,6 +233,15 @@ func (m *ToolsMiddleware) HandleAction(ctx *StepContext, action *AgentAction) (*
 		return &ActionResult{Output: "tool_name 不能为空", SkipApproval: true}, true, nil
 	}
 	if name == "tool_catalog" {
+		if err := tools.ValidateCall(name, action.ToolArgs); err != nil {
+			return &ActionResult{Output: err.Error(), SkipApproval: true}, true, nil
+		}
+		if exact := strings.TrimSpace(action.ToolArgs["name"]); exact != "" {
+			if _, ok := tools.Get(exact); !ok {
+				return &ActionResult{Output: fmt.Sprintf("未找到工具 %q。可用工具: %s", exact, strings.Join(tools.ListNames(), ", ")), SkipApproval: true}, true, nil
+			}
+			return &ActionResult{Output: tools.FormatCatalogDetail("all", exact), SkipApproval: true}, true, nil
+		}
 		category := action.ToolArgs["category"]
 		if category == "" {
 			category = "all"
@@ -198,13 +252,14 @@ func (m *ToolsMiddleware) HandleAction(ctx *StepContext, action *AgentAction) (*
 		}, true, nil
 	}
 	if name == "fleet_exec" {
+		if err := tools.ValidateCall(name, action.ToolArgs); err != nil {
+			return &ActionResult{Output: err.Error(), SkipApproval: true}, true, nil
+		}
 		return m.fleetExec(ctx, action), true, nil
 	}
 
 	// MCP 工具: tool_name 为 mcp:xxx 或直接匹配 MCP 注册名
-	if strings.HasPrefix(name, "mcp:") {
-		name = strings.TrimPrefix(name, "mcp:")
-	}
+	name = strings.TrimPrefix(name, "mcp:")
 	if _, handler, ok := mcp.Global().Get(name); ok && handler != nil {
 		out, err := mcp.Global().Run(name, action.ToolArgs)
 		if err != nil {
@@ -214,6 +269,14 @@ func (m *ToolsMiddleware) HandleAction(ctx *StepContext, action *AgentAction) (*
 			Output:       fmt.Sprintf("【MCP 工具 %s 结果】\n%s", name, out),
 			SkipApproval: true,
 		}, true, nil
+	}
+
+	if _, ok := tools.Get(name); !ok {
+		err := tools.ValidateCall(name, action.ToolArgs)
+		return &ActionResult{Output: err.Error(), SkipApproval: true}, true, nil
+	}
+	if err := tools.ValidateCall(name, action.ToolArgs); err != nil {
+		return &ActionResult{Output: err.Error(), SkipApproval: true}, true, nil
 	}
 
 	isWindows := strings.Contains(strings.ToLower(ctx.SysCtx.OS), "windows")
@@ -246,16 +309,17 @@ func (m *ToolsMiddleware) fleetExec(ctx *StepContext, action *AgentAction) *Acti
 	if raw := firstToolArg(action.ToolArgs, "concurrency"); raw != "" {
 		fmt.Sscanf(raw, "%d", &concurrency)
 	}
-	results := executor.RunFleetWithProgress(config.GlobalConfig.Targets, selector, command, concurrency, func(p executor.FleetProgress) {
+	safeCommand := security.RedactSensitiveText(command)
+	results := executor.RunFleetWithProgressAndStop(config.GlobalConfig.Targets, selector, command, concurrency, func(p executor.FleetProgress) {
 		status := p.Status
-		detail := p.Error
+		detail := security.RedactSensitiveText(p.Error)
 		if detail == "" {
-			detail = truncate(p.Output, 160)
+			detail = truncate(security.RedactSensitiveText(p.Output), 160)
 		}
-		emitTargetStatus(ctx.UI, status, "fleet_exec "+command, p.Target, detail)
-	})
+		emitTargetStatus(ctx.UI, status, "fleet_exec "+safeCommand, p.Target, detail)
+	}, ctx.Stop)
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("【工具 fleet_exec | 视角:控制端 结果】\nFleet Exec selector=%s command=%s\n", emptyDefault(selector, "all"), command))
+	b.WriteString(fmt.Sprintf("【工具 fleet_exec | 视角:控制端 结果】\nFleet Exec selector=%s command=%s\n", emptyDefault(selector, "all"), safeCommand))
 	b.WriteString(executor.FormatFleetResults(results))
 	return &ActionResult{Output: b.String(), SkipApproval: false}
 }
@@ -326,13 +390,17 @@ func (m *SubAgentMiddleware) HandleAction(ctx *StepContext, action *AgentAction)
 	if strings.TrimSpace(action.TargetSelector) != "" {
 		return m.runTargetSubAgents(ctx, *spec, action)
 	}
-	result, err := RunSubAgentLoopWithUI(m.Parent, *spec, action.TaskPrompt, ctx.SysCtx, ctx.BatchMode, ctx.UI, ctx.ConfirmFn, ctx.SubAgentMaxSteps, action.TaskMaxSteps)
+	brief := subAgentMissionBrief(ctx, action.TaskPrompt, spec.Name)
+	result, err := RunSubAgentLoopWithUIAndStop(m.Parent, *spec, brief, ctx.SysCtx, ctx.BatchMode, ctx.UI, ctx.ConfirmFn, ctx.SubAgentMaxSteps, action.TaskMaxSteps, ctx.Stop)
 	if err != nil {
 		return &ActionResult{Output: fmt.Sprintf("子 Agent 失败: %v", err), SkipApproval: true}, true, err
 	}
 
 	if ctx.UI != nil {
 		ctx.UI.Emit(UIEvent{Kind: EventSubAgentResult, Message: spec.Name, Detail: result})
+	}
+	if ctx.State != nil {
+		ctx.State.ObserveCoreClues(result, "subagent/"+spec.Name)
 	}
 
 	return &ActionResult{
@@ -346,6 +414,10 @@ func (m *SubAgentMiddleware) runParallelSubAgents(ctx *StepContext, action *Agen
 		return &ActionResult{Output: "子 Agent harness 未初始化", SkipApproval: true}, true, nil
 	}
 
+	var cluesBefore []CoreClue
+	if ctx.State != nil {
+		cluesBefore = ctx.State.CoreCluesSnapshot()
+	}
 	type parallelResult struct {
 		idx  int
 		task SubAgentTaskAction
@@ -361,10 +433,7 @@ func (m *SubAgentMiddleware) runParallelSubAgents(ctx *StepContext, action *Agen
 		return &ActionResult{Output: msg, SkipApproval: true}, true, nil
 	}
 
-	concurrency := 3
-	if len(tasks) < concurrency {
-		concurrency = len(tasks)
-	}
+	concurrency := adaptiveSubAgentConcurrency(tasks)
 	results := make([]parallelResult, len(tasks))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, concurrency)
@@ -373,7 +442,12 @@ func (m *SubAgentMiddleware) runParallelSubAgents(ctx *StepContext, action *Agen
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Stop:
+				results[i] = parallelResult{idx: i, task: task, err: fmt.Errorf("已按用户请求停止")}
+				return
+			}
 			defer func() { <-sem }()
 			start := time.Now()
 			spec, found := subagent.Find(task.TaskName)
@@ -386,20 +460,27 @@ func (m *SubAgentMiddleware) runParallelSubAgents(ctx *StepContext, action *Agen
 			}
 			var out string
 			var err error
+			brief := subAgentMissionBrief(ctx, task.TaskPrompt, spec.Name)
 			if strings.TrimSpace(task.TargetSelector) != "" {
 				subAction := &AgentAction{
 					TaskName:       task.TaskName,
-					TaskPrompt:     task.TaskPrompt,
+					TaskPrompt:     brief,
 					TargetSelector: task.TargetSelector,
 					TaskMaxSteps:   task.TaskMaxSteps,
 				}
-				result, _, runErr := m.runTargetSubAgents(ctx, *spec, subAction)
+				result, _, runErr := m.runTargetSubAgentsWithConcurrency(ctx, *spec, subAction, 1)
 				if result != nil {
 					out = result.Output
 				}
 				err = runErr
 			} else {
-				out, err = RunSubAgentLoopWithUI(m.Parent, *spec, task.TaskPrompt, ctx.SysCtx, ctx.BatchMode, ctx.UI, ctx.ConfirmFn, ctx.SubAgentMaxSteps, task.TaskMaxSteps)
+				out, err = RunSubAgentLoopWithUIAndStop(m.Parent, *spec, brief, ctx.SysCtx, ctx.BatchMode, ctx.UI, ctx.ConfirmFn, ctx.SubAgentMaxSteps, task.TaskMaxSteps, ctx.Stop)
+			}
+			if err == nil && shouldStop(ctx.Stop) {
+				err = fmt.Errorf("已按用户请求停止")
+			}
+			if ctx.State != nil && out != "" {
+				ctx.State.ObserveCoreClues(out, "subagent/"+spec.Name)
 			}
 			results[i] = parallelResult{idx: i, task: task, out: out, err: err, dur: time.Since(start)}
 			if ctx.UI != nil {
@@ -413,8 +494,21 @@ func (m *SubAgentMiddleware) runParallelSubAgents(ctx *StepContext, action *Agen
 	}
 	wg.Wait()
 
+	succeeded, failed := 0, 0
+	for _, result := range results {
+		if result.err != nil {
+			failed++
+		} else {
+			succeeded++
+		}
+	}
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("【并行子 Agent 协作结果】共 %d 个任务，并发 %d，用户步数上限 %d\n\n", len(tasks), concurrency, subAgentCap(ctx.SubAgentMaxSteps)))
+	b.WriteString(fmt.Sprintf("【并行子 Agent 协作结果】任务 %d · 成功 %d · 失败 %d · 并发 %d · 用户步数上限 %d",
+		len(tasks), succeeded, failed, concurrency, subAgentCap(ctx.SubAgentMaxSteps)))
+	if skipped := len(action.ParallelTasks) - len(tasks); skipped > 0 {
+		b.WriteString(fmt.Sprintf(" · 去重/忽略 %d", skipped))
+	}
+	b.WriteString("\n\n")
 	for _, r := range results {
 		name := firstNonEmpty(r.task.TaskName, fmt.Sprintf("task-%d", r.idx+1))
 		b.WriteString(fmt.Sprintf("## [%d] %s (%s)\n", r.idx+1, name, r.dur.Round(time.Millisecond)))
@@ -423,15 +517,44 @@ func (m *SubAgentMiddleware) runParallelSubAgents(ctx *StepContext, action *Agen
 			continue
 		}
 		b.WriteString("状态: 完成\n")
-		b.WriteString(strings.TrimSpace(r.out))
+		b.WriteString(truncate(strings.TrimSpace(r.out), 5000))
 		b.WriteString("\n\n")
 	}
-	b.WriteString("协作提示: 请主 Agent 综合以上子 Agent 输出，合并证据链、去重结论、标记冲突点后继续下一步。\n")
+	if ctx.State != nil {
+		if delta := newCoreClues(cluesBefore, ctx.State.CoreCluesSnapshot()); len(delta) > 0 {
+			b.WriteString("【本轮汇聚的新核心线索】\n")
+			for _, clue := range delta {
+				b.WriteString(fmt.Sprintf("- [%s] %s", clue.Kind, clue.Value))
+				if clue.Source != "" {
+					b.WriteString(" (来源: " + clue.Source + ")")
+				}
+				b.WriteString("\n")
+			}
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("【主 Agent 交接要求】合并已验证事实与证据链；相同线索只保留一次；显式列出冲突、不确定项、失败任务和仍需补充的信息，然后更新 TODO 再继续。\n")
 	return &ActionResult{Output: b.String(), SkipApproval: true}, true, nil
+}
+
+func newCoreClues(before, after []CoreClue) []CoreClue {
+	seen := make(map[string]bool, len(before))
+	for _, clue := range before {
+		seen[strings.ToLower(clue.Kind+"\x00"+clue.Value)] = true
+	}
+	var out []CoreClue
+	for _, clue := range after {
+		key := strings.ToLower(clue.Kind + "\x00" + clue.Value)
+		if !seen[key] {
+			out = append(out, clue)
+		}
+	}
+	return out
 }
 
 func normalizeParallelTasks(action *AgentAction) []SubAgentTaskAction {
 	tasks := make([]SubAgentTaskAction, 0, len(action.ParallelTasks)+1)
+	seen := make(map[string]bool)
 	for _, task := range action.ParallelTasks {
 		task.TaskName = strings.TrimSpace(task.TaskName)
 		task.TaskPrompt = strings.TrimSpace(task.TaskPrompt)
@@ -439,6 +562,11 @@ func normalizeParallelTasks(action *AgentAction) []SubAgentTaskAction {
 		if strings.TrimSpace(task.TaskName) == "" && strings.TrimSpace(task.TaskPrompt) == "" {
 			continue
 		}
+		key := normalizedParallelTaskKey(task)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		tasks = append(tasks, task)
 	}
 	if len(tasks) == 0 && (strings.TrimSpace(action.TaskName) != "" || strings.TrimSpace(action.TaskPrompt) != "") {
@@ -450,6 +578,76 @@ func normalizeParallelTasks(action *AgentAction) []SubAgentTaskAction {
 		})
 	}
 	return tasks
+}
+
+func normalizedParallelTaskKey(task SubAgentTaskAction) string {
+	parts := []string{task.TaskName, task.TaskPrompt, task.TargetSelector}
+	for i := range parts {
+		parts[i] = strings.ToLower(strings.Join(strings.Fields(parts[i]), " "))
+	}
+	return strings.Join(parts, "\x00")
+}
+
+func adaptiveSubAgentConcurrency(tasks []SubAgentTaskAction) int {
+	if len(tasks) == 0 {
+		return 0
+	}
+	limit := 4
+	targetFanout := 0
+	for _, task := range tasks {
+		if strings.TrimSpace(task.TargetSelector) != "" {
+			targetFanout++
+		}
+	}
+	// Target-aware tasks may each open a remote connection; keep aggregate pressure bounded.
+	if targetFanout > 0 {
+		limit = 3
+	}
+	return min(limit, len(tasks))
+}
+
+func subAgentMissionBrief(ctx *StepContext, assignment, agentName string) string {
+	var b strings.Builder
+	b.WriteString("【主流程协作简报】\n")
+	if ctx != nil && ctx.History != nil {
+		goal, latest := collaborationUserDirectives(*ctx.History)
+		if goal != "" {
+			b.WriteString("主任务目标: " + goal + "\n")
+		}
+		if latest != "" && latest != goal {
+			b.WriteString("用户最新补充/修正: " + latest + "\n")
+		}
+	}
+	if ctx != nil && ctx.State != nil {
+		if len(ctx.State.Todos) > 0 {
+			b.WriteString("当前 TODO:\n")
+			for _, todo := range ctx.State.Todos {
+				b.WriteString(fmt.Sprintf("- [%s] %s: %s\n", todo.Status, todo.ID, todo.Content))
+			}
+		}
+		b.WriteString(ctx.State.CoreCluesPrompt(5000))
+	}
+	b.WriteString("\n【你的唯一分工】\n")
+	b.WriteString(strings.TrimSpace(assignment))
+	b.WriteString("\n\n不要替其他子 Agent 扩大范围。复用简报中的已验证线索，聚焦补齐本分工的证据。")
+	if strings.TrimSpace(agentName) != "" {
+		b.WriteString(" 当前角色: " + agentName + "。")
+	}
+	return b.String()
+}
+
+func collaborationUserDirectives(history []analyzer.Message) (goal, latest string) {
+	for _, message := range history {
+		if !isRealUserTurn(message) {
+			continue
+		}
+		content := strings.TrimSpace(message.Content)
+		if goal == "" {
+			goal = truncate(content, 1200)
+		}
+		latest = truncate(content, 1200)
+	}
+	return goal, latest
 }
 
 func trimSubAgentAction(action *AgentAction) {
@@ -497,6 +695,10 @@ func subAgentCap(cap int) int {
 }
 
 func (m *SubAgentMiddleware) runTargetSubAgents(ctx *StepContext, spec subagent.Spec, action *AgentAction) (*ActionResult, bool, error) {
+	return m.runTargetSubAgentsWithConcurrency(ctx, spec, action, 3)
+}
+
+func (m *SubAgentMiddleware) runTargetSubAgentsWithConcurrency(ctx *StepContext, spec subagent.Spec, action *AgentAction, maxConcurrency int) (*ActionResult, bool, error) {
 	targets := executor.MatchTargets(config.GlobalConfig.Targets, action.TargetSelector)
 	if len(targets) == 0 {
 		return &ActionResult{
@@ -505,7 +707,10 @@ func (m *SubAgentMiddleware) runTargetSubAgents(ctx *StepContext, spec subagent.
 		}, true, nil
 	}
 
-	concurrency := 3
+	concurrency := maxConcurrency
+	if concurrency <= 0 {
+		concurrency = 1
+	}
 	if len(targets) < concurrency {
 		concurrency = len(targets)
 	}
@@ -524,13 +729,23 @@ func (m *SubAgentMiddleware) runTargetSubAgents(ctx *StepContext, spec subagent.
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Stop:
+				mu.Lock()
+				results = append(results, targetResult{target: target, err: fmt.Errorf("已按用户请求停止")})
+				mu.Unlock()
+				return
+			}
 			defer func() { <-sem }()
 			start := time.Now()
 			emitTargetStatus(ctx.UI, "running", "子 Agent 处理中", target, "")
 			prompt := fmt.Sprintf("%s\n\n【目标限定】name=%s protocol=%s host=%s user=%s",
 				action.TaskPrompt, target.Name, target.Protocol, target.Host, target.User)
-			out, err := RunSubAgentLoopForTarget(m.Parent, spec, prompt, ctx.SysCtx, ctx.BatchMode, ctx.UI, ctx.ConfirmFn, ctx.SubAgentMaxSteps, action.TaskMaxSteps, target)
+			out, err := RunSubAgentLoopForTarget(m.Parent, spec, prompt, ctx.SysCtx, ctx.BatchMode, ctx.UI, ctx.ConfirmFn, ctx.SubAgentMaxSteps, action.TaskMaxSteps, target, ctx.Stop)
+			if err == nil && shouldStop(ctx.Stop) {
+				err = fmt.Errorf("已按用户请求停止")
+			}
 			status := "ok"
 			detail := time.Since(start).Round(time.Millisecond).String()
 			if err != nil {
@@ -544,6 +759,14 @@ func (m *SubAgentMiddleware) runTargetSubAgents(ctx *StepContext, spec subagent.
 		}()
 	}
 	wg.Wait()
+	sort.Slice(results, func(i, j int) bool {
+		left := executor.TargetDisplayName(results[i].target)
+		right := executor.TargetDisplayName(results[j].target)
+		if left == right {
+			return results[i].target.Host < results[j].target.Host
+		}
+		return left < right
+	})
 
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("Target-aware 子 Agent [%s] 完成: %d 个目标\n\n", spec.Name, len(results)))
@@ -645,7 +868,7 @@ func (m *FilesystemMiddleware) HandleAction(ctx *StepContext, action *AgentActio
 	case ActionEditFile:
 		return m.editFile(ctx, action.Path, action.OldString, action.NewString, action.ReplaceAll)
 	case ActionGlob:
-		return m.glob(action.Path, action.GlobPattern)
+		return m.glob(ctx, action.Path, action.GlobPattern)
 	case ActionGrep:
 		return m.grep(ctx, action.Path, action.Pattern)
 	case ActionLS:
@@ -716,20 +939,26 @@ func (m *FilesystemMiddleware) editFile(ctx *StepContext, path, oldStr, newStr s
 	return &ActionResult{Output: formatFSResult(pers, msg), SkipApproval: false}, true, nil
 }
 
-func (m *FilesystemMiddleware) glob(root, pattern string) (*ActionResult, bool, error) {
+func (m *FilesystemMiddleware) glob(ctx *StepContext, root, pattern string) (*ActionResult, bool, error) {
 	if pattern == "" {
 		return &ActionResult{Output: "glob_pattern 不能为空", SkipApproval: true}, true, nil
 	}
-	matches, err := executor.GlobTarget(root, pattern, 200)
+	local := isControllerLocalPath(root)
+	var matches []string
+	var err error
+	if local && !memory.IsAgentsMDPath(root) {
+		matches, err = globWorkspace(root, pattern, 200)
+	} else {
+		matches, err = executor.GlobTargetWithExecutor(ctx.Executor, root, pattern, 200)
+	}
 	if err != nil {
 		return &ActionResult{Output: fmt.Sprintf("glob 失败: %v", err), SkipApproval: true}, true, nil
 	}
 	if len(matches) == 0 {
 		return &ActionResult{Output: "(无匹配)", SkipApproval: true}, true, nil
 	}
-	local := isControllerLocalPath(root)
 	return &ActionResult{
-		Output:       formatFSResult(fsPerspective(local), strings.Join(matches, "\n")),
+		Output:       formatFSResult(fsPerspectiveForExecutor(local, ctx.Executor), strings.Join(matches, "\n")),
 		SkipApproval: true,
 	}, true, nil
 }
@@ -747,7 +976,7 @@ func (m *FilesystemMiddleware) grep(ctx *StepContext, path, pattern string) (*Ac
 	var output string
 	var err error
 	if local {
-		data, rerr := executor.ReadLocalFile(expandUserPath(path))
+		data, rerr := readTargetOrLocalWithExecutor(path, ctx.Executor)
 		if rerr != nil {
 			return &ActionResult{Output: fmt.Sprintf("grep 失败: %v", rerr), SkipApproval: true}, true, nil
 		}
@@ -784,7 +1013,13 @@ func (m *FilesystemMiddleware) ls(ctx *StepContext, path string) (*ActionResult,
 	local := isControllerLocalPath(path)
 	var output string
 	if local {
-		entries, err := os.ReadDir(expandUserPath(path))
+		var entries []os.DirEntry
+		var err error
+		if memory.IsAgentsMDPath(path) {
+			entries, err = os.ReadDir(expandUserPath(path))
+		} else {
+			entries, err = readWorkspaceDir(path)
+		}
 		if err != nil {
 			return &ActionResult{Output: fmt.Sprintf("ls 失败: %v", err), SkipApproval: true}, true, nil
 		}
@@ -819,8 +1054,25 @@ func NewContextMiddleware() *ContextMiddleware {
 
 func (m *ContextMiddleware) Name() string { return "ContextMiddleware" }
 
-func (m *ContextMiddleware) EnhancePrompt(base string, _ *AgentState) string {
-	return base
+func (m *ContextMiddleware) EnhancePrompt(base string, state *AgentState) string {
+	if state == nil {
+		return base
+	}
+	budget := 6000
+	switch config.GlobalConfig.EffectiveModelCapabilities().PromptProfile {
+	case config.ModelProfileCompact:
+		budget = 2000
+	case config.ModelProfileBalanced:
+		budget = 4000
+	}
+	return base + state.CoreCluesPrompt(budget)
+}
+
+func compactPromptText(text string, maxBytes int) string {
+	if maxBytes <= 0 || len(text) <= maxBytes {
+		return text
+	}
+	return safeUTF8BytePrefix(text, maxBytes) + "\n...(按当前模型能力精简；完整内容可按需查询/加载)...\n"
 }
 
 func (m *ContextMiddleware) HandleAction(_ *StepContext, _ *AgentAction) (*ActionResult, bool, error) {
@@ -838,11 +1090,11 @@ func (m *ContextMiddleware) OffloadOutput(state *AgentState, label, output strin
 	}
 
 	outputDir := sessionOutputDir(state)
-	_ = os.MkdirAll(outputDir, 0755)
+	_ = os.MkdirAll(outputDir, 0700)
 	filename := fmt.Sprintf("output_%s.txt", label)
 	fullPath := filepath.Join(outputDir, filename)
 
-	if err := os.WriteFile(fullPath, []byte(output), 0644); err != nil {
+	if err := os.WriteFile(fullPath, []byte(output), 0600); err != nil {
 		return output[:m.OutputThreshold] + "\n...(输出过长已截断)..."
 	}
 
@@ -893,12 +1145,17 @@ func isProtectedPath(path string) bool {
 	if memory.IsAgentsMDPath(path) {
 		return false
 	}
+	lower := strings.ToLower(path)
+	// Managed config backups contain the same credentials as config.yaml and
+	// must never become an alternate read path for the Agent.
+	if strings.Contains(lower, ".deepsentry_backups") {
+		return true
+	}
 	// workspace 为控制端可读写区域，不应被 deepsentry 关键字误伤
 	if isControllerLocalPath(path) {
 		return false
 	}
 	protected := []string{"config.yaml", "reports/"}
-	lower := strings.ToLower(path)
 	for _, p := range protected {
 		if strings.Contains(lower, strings.ToLower(p)) {
 			return true
@@ -920,13 +1177,9 @@ func isProtectedPath(path string) bool {
 	return false
 }
 
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
-}
-
 func mwTruncate(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "..."
+	return safeUTF8BytePrefix(s, max) + "..."
 }

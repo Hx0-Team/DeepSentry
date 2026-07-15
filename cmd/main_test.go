@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"ai-edr/internal/config"
@@ -56,5 +59,158 @@ func TestSwitchToLocalModeClearsProtocolAndRemoteFields(t *testing.T) {
 	}
 	if got := executor.CurrentMode(); got != "local" {
 		t.Fatalf("executor mode = %q, want local", got)
+	}
+}
+
+func TestContextWindowWizardChoicesUseExactTokenCounts(t *testing.T) {
+	tests := []struct {
+		choice string
+		want   int
+	}{
+		{contextWindowAutoChoice, 0},
+		{"64K (65,536 tokens)", 65_536},
+		{"128K (131,072 tokens)", 131_072},
+		{"256K (262,144 tokens)", 262_144},
+		{"512K (524,288 tokens)", 524_288},
+		{"1M (1,048,576 tokens)", 1_048_576},
+		{"2M (2,097,152 tokens)", 2_097_152},
+	}
+	for _, test := range tests {
+		got, ok := contextWindowTokensFromChoice(test.choice)
+		if !ok || got != test.want {
+			t.Fatalf("choice %q = %d,%v want %d,true", test.choice, got, ok, test.want)
+		}
+		if gotChoice := contextWindowDefaultChoice(test.want); gotChoice != test.choice {
+			t.Fatalf("default choice for %d = %q want %q", test.want, gotChoice, test.choice)
+		}
+	}
+	if _, ok := contextWindowTokensFromChoice(contextWindowCustomChoice); ok {
+		t.Fatal("custom choice must require a follow-up value")
+	}
+	if got := contextWindowDefaultChoice(200_000); got != contextWindowCustomChoice {
+		t.Fatalf("non-preset existing value should select custom, got %q", got)
+	}
+}
+
+func TestValidateCustomContextWindow(t *testing.T) {
+	for _, value := range []interface{}{"4096", "1048576", 4194304} {
+		if err := validateCustomContextWindow(value); err != nil {
+			t.Fatalf("valid custom context %v rejected: %v", value, err)
+		}
+	}
+	for _, value := range []interface{}{"", "2M", "2048", "4194305"} {
+		if err := validateCustomContextWindow(value); err == nil {
+			t.Fatalf("invalid custom context %v accepted", value)
+		}
+	}
+}
+
+func TestWizardProviderOptionsMapToBuiltInPresets(t *testing.T) {
+	expected := map[string]string{
+		"百度千帆 Coding Plan (qianfan-code-latest)":             "qianfan",
+		"火山方舟 Coding Plan (ark-code-latest)":                 "volcengine",
+		"Xiaomi MiMo Token Plan / MiMo Claw (mimo-v2.5-pro)": "mimo",
+	}
+	for label, wantID := range expected {
+		if got := wizardProviderID(label); got != wantID {
+			t.Fatalf("wizardProviderID(%q) = %q, want %q", label, got, wantID)
+		}
+		preset, ok := config.FindProvider(wantID)
+		if !ok || preset.APIURL == "" || preset.Model == "" {
+			t.Fatalf("wizard option %q has no complete preset: %+v", label, preset)
+		}
+		found := false
+		for _, option := range wizardProviderOptions {
+			if option == label {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("wizard option %q is not selectable", label)
+		}
+	}
+}
+
+func TestCaptureStdoutDrainsLargeStartupOutputAndRestoresStdout(t *testing.T) {
+	original := os.Stdout
+	payload := strings.Repeat("startup-warning\n", 10000)
+	got := captureStdout(func() { fmt.Print(payload) })
+	if got != payload {
+		t.Fatalf("captured %d bytes want %d", len(got), len(payload))
+	}
+	if os.Stdout != original {
+		t.Fatal("stdout was not restored after capture")
+	}
+}
+
+func TestCreateWebShellArtifactsUsesPrivateUniqueFiles(t *testing.T) {
+	tmp := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll("reports", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f1, p1, r1, err := createWebShellArtifacts("same_stamp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f1.Close()
+	f2, p2, r2, err := createWebShellArtifacts("same_stamp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f2.Close()
+	if p1 == p2 || r1 == r2 {
+		t.Fatalf("webshell artifacts collided: %s %s", p1, p2)
+	}
+	for _, path := range []string{p1, p2} {
+		info, err := os.Stat(filepath.Clean(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("progress mode=%o want 600", got)
+		}
+	}
+}
+
+func TestResolvedTUIModeFallsBackForPipes(t *testing.T) {
+	tests := []struct {
+		name                                       string
+		requested, noTUI, nonInteractive           bool
+		explicitTUI, interactiveTerminal, expected bool
+	}{
+		{name: "normal terminal", requested: true, interactiveTerminal: true, expected: true},
+		{name: "redirected defaults classic", requested: true, expected: false},
+		{name: "explicit tui over redirect", requested: true, explicitTUI: true, expected: true},
+		{name: "quiet defaults classic", requested: true, nonInteractive: true, interactiveTerminal: true, expected: false},
+		{name: "no tui wins", requested: true, noTUI: true, explicitTUI: true, interactiveTerminal: true, expected: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolvedTUIMode(tt.requested, tt.noTUI, tt.nonInteractive, tt.explicitTUI, tt.interactiveTerminal)
+			if got != tt.expected {
+				t.Fatalf("resolvedTUIMode()=%v want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestBatchApprovalRequirement(t *testing.T) {
+	if prompt, err := batchApprovalRequirement(true, false, true); err != nil || !prompt {
+		t.Fatalf("interactive batch should prompt once: prompt=%v err=%v", prompt, err)
+	}
+	if prompt, err := batchApprovalRequirement(true, false, false); err == nil || prompt {
+		t.Fatalf("non-interactive batch without -y should fail: prompt=%v err=%v", prompt, err)
+	}
+	if prompt, err := batchApprovalRequirement(true, true, false); err != nil || prompt {
+		t.Fatalf("explicit -y should allow non-interactive batch: prompt=%v err=%v", prompt, err)
 	}
 }

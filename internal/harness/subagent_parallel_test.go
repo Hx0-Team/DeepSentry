@@ -36,6 +36,72 @@ func TestNormalizeParallelTasksSkipsEmptyItems(t *testing.T) {
 	}
 }
 
+func TestNormalizeParallelTasksDeduplicatesEquivalentWork(t *testing.T) {
+	action := &AgentAction{ParallelTasks: []SubAgentTaskAction{
+		{TaskName: " log-analyst ", TaskPrompt: " 分析 auth.log ", TargetSelector: " prod "},
+		{TaskName: "log-analyst", TaskPrompt: "分析 auth.log", TargetSelector: "prod"},
+		{TaskName: "network-analyst", TaskPrompt: "分析连接", TargetSelector: "prod"},
+	}}
+	tasks := normalizeParallelTasks(action)
+	if len(tasks) != 2 {
+		t.Fatalf("duplicate work should run once, got %#v", tasks)
+	}
+}
+
+func TestAdaptiveSubAgentConcurrencyBoundsTargetFanout(t *testing.T) {
+	plain := make([]SubAgentTaskAction, 8)
+	if got := adaptiveSubAgentConcurrency(plain); got != 4 {
+		t.Fatalf("plain concurrency=%d want 4", got)
+	}
+	plain[0].TargetSelector = "prod"
+	if got := adaptiveSubAgentConcurrency(plain); got != 3 {
+		t.Fatalf("target concurrency=%d want 3", got)
+	}
+}
+
+func TestParallelSubAgentsDoNotStartModelAfterStop(t *testing.T) {
+	parent := &DeepAgent{State: NewAgentState(t.TempDir())}
+	mw := &SubAgentMiddleware{Parent: parent}
+	stop := make(chan struct{})
+	close(stop)
+	var calls int32
+	origMake := makeSubAgentRunner
+	makeSubAgentRunner = func(parent *DeepAgent) *SubAgentRunner {
+		runner := origMake(parent)
+		runner.StepFn = func(analyzer.StepOptions) (analyzer.AgentResponse, error) {
+			atomic.AddInt32(&calls, 1)
+			return analyzer.AgentResponse{Action: string(ActionFinish), FinalReport: "unexpected"}, nil
+		}
+		return runner
+	}
+	defer func() { makeSubAgentRunner = origMake }()
+	result, handled, err := mw.HandleAction(&StepContext{State: parent.State, Stop: stop}, &AgentAction{
+		Type: ActionTask,
+		ParallelTasks: []SubAgentTaskAction{
+			{TaskName: "log-analyst", TaskPrompt: "one"},
+			{TaskName: "network-analyst", TaskPrompt: "two"},
+		},
+	})
+	if err != nil || !handled || result == nil {
+		t.Fatalf("stop handling failed handled=%v result=%#v err=%v", handled, result, err)
+	}
+	if atomic.LoadInt32(&calls) != 0 {
+		t.Fatalf("model called %d times after stop", calls)
+	}
+	if !strings.Contains(result.Output, "失败 2") {
+		t.Fatalf("stopped tasks not reported as failed:\n%s", result.Output)
+	}
+}
+
+func TestParallelTargetWorkRequiresTargetedRiskPath(t *testing.T) {
+	if !hasTargetedSubAgentWork(AgentAction{ParallelTasks: []SubAgentTaskAction{{TargetSelector: "prod"}}}) {
+		t.Fatal("nested parallel target selector bypassed targeted sub-agent risk path")
+	}
+	if hasTargetedSubAgentWork(AgentAction{ParallelTasks: []SubAgentTaskAction{{TaskPrompt: "local analysis"}}}) {
+		t.Fatal("local-only parallel work incorrectly marked target-aware")
+	}
+}
+
 func TestSubAgentMiddlewareRejectsMissingTaskName(t *testing.T) {
 	agent := &DeepAgent{State: NewAgentState(t.TempDir())}
 	mw := &SubAgentMiddleware{Parent: agent}

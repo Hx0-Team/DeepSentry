@@ -16,7 +16,7 @@ type procOwner struct {
 // ProcSocketMap 将 /proc/net socket inode 关联到进程，替代 lsof/ss -p。
 func ProcSocketMap(rt Runtime, filter string, limit int) (string, error) {
 	if rt.IsWindows {
-		return "", fmt.Errorf("Windows 暂不支持 /proc socket 映射，请使用 execute netstat -ano")
+		return "", fmt.Errorf("当前 Windows 暂不支持 /proc socket 映射，请使用 execute netstat -ano")
 	}
 	if limit <= 0 {
 		limit = 80

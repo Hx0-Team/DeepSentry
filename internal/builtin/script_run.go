@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"ai-edr/internal/executor"
+	"ai-edr/internal/security"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,7 +24,7 @@ func ScriptRun(rt Runtime, language, content, path, args string, timeoutSec int)
 	if timeoutSec > 300 {
 		timeoutSec = 300
 	}
-	if executor.Current == nil {
+	if rt.Exec == nil {
 		return "", fmt.Errorf("执行器未初始化")
 	}
 
@@ -35,10 +36,10 @@ func ScriptRun(rt Runtime, language, content, path, args string, timeoutSec int)
 			ext = ".sh"
 		}
 		scriptPath = fmt.Sprintf("/tmp/deepsentry_script_%d%s", time.Now().UnixNano(), ext)
-		if !executor.Current.IsRemote() {
+		if !rt.Exec.IsRemote() {
 			scriptPath = filepath.Join(os.TempDir(), filepath.Base(scriptPath))
 		}
-		if err := executor.WriteTargetFile(scriptPath, []byte(content)); err != nil {
+		if err := executor.WriteFileWithExecutor(rt.Exec, scriptPath, []byte(content)); err != nil {
 			return "", err
 		}
 		cleanup = true
@@ -56,10 +57,10 @@ func ScriptRun(rt Runtime, language, content, path, args string, timeoutSec int)
 		cmd = fmt.Sprintf("timeout %d sh %s %s 2>&1", timeoutSec, quotedPath, args)
 	}
 	start := time.Now()
-	out, err := executor.Current.Run(cmd)
+	out, err := rt.Exec.Run(cmd)
 	elapsed := time.Since(start).Round(time.Millisecond)
 	if cleanup {
-		_, _ = executor.Current.Run("rm -f " + quotedPath)
+		_, _ = rt.Exec.Run("rm -f " + quotedPath)
 	}
 
 	logPath := writeToolExecLog("script_run", fmt.Sprintf("language=%s path=%s args=%s timeout=%d", language, scriptPath, args, timeoutSec), out, err)
@@ -79,16 +80,19 @@ func ScriptRun(rt Runtime, language, content, path, args string, timeoutSec int)
 }
 
 func writeToolExecLog(tool, meta, output string, runErr error) string {
-	if err := os.MkdirAll("reports", 0755); err != nil {
+	if err := os.MkdirAll("reports", 0o700); err != nil {
 		return ""
 	}
+	_ = os.Chmod("reports", 0o700)
+	meta = security.RedactSensitiveText(meta)
+	output = security.RedactSensitiveText(output)
 	path := filepath.Join("reports", fmt.Sprintf("tool_exec_%s_%d.log", tool, time.Now().UnixNano()))
 	var b strings.Builder
 	b.WriteString("tool: " + tool + "\n")
 	b.WriteString("time: " + time.Now().Format(time.RFC3339) + "\n")
 	b.WriteString("meta: " + meta + "\n")
 	if runErr != nil {
-		b.WriteString("error: " + runErr.Error() + "\n")
+		b.WriteString("error: " + security.RedactSensitiveText(runErr.Error()) + "\n")
 	}
 	b.WriteString("\noutput:\n")
 	b.WriteString(output)

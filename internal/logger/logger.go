@@ -2,12 +2,15 @@ package logger
 
 import (
 	"ai-edr/internal/analyzer"
+	"ai-edr/internal/security"
+	"ai-edr/internal/ui"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Reporter 负责生成审计报告
@@ -27,44 +30,86 @@ const DefaultReportTitle = "DeepSentry 安全排查报告"
 // NewReporterWithTitle 创建一个新的审计报告文件，并使用任务相关标题。
 func NewReporterWithTitle(title string) (*Reporter, string, error) {
 	fullPath := strings.TrimSpace(os.Getenv("DEEPSENTRY_REPORT_PATH"))
-	if fullPath == "" {
-		timestamp := time.Now().Format("20060102_150405")
-		fullPath = filepath.Join("reports", fmt.Sprintf("report_%s.md", timestamp))
+	autoPath := fullPath == ""
+	if autoPath {
+		fullPath = filepath.Join("reports", fmt.Sprintf("report_%s.md", time.Now().Format("20060102_150405")))
 	}
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+	// #nosec G703 -- DEEPSENTRY_REPORT_PATH 只由本机操作员/受控父进程指定，设计上允许选择报告目录；目录和文件权限在此函数中收紧。
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o700); err != nil {
 		return nil, "", fmt.Errorf("无法创建日志目录: %v", err)
 	}
+	// #nosec G703 -- 与上述操作员指定的报告目录相同，此处只用于把其权限收紧为 0700。
+	_ = os.Chmod(filepath.Dir(fullPath), 0o700)
 
-	// 3. 创建文件
-	file, err := os.Create(fullPath)
+	// 3. 创建文件。默认路径使用 O_EXCL，避免同一秒启动的多个实例
+	// 互相截断报告；报告可能包含敏感取证信息，固定为 0600。
+	// #nosec G703 -- 路径信任边界同上，createReportFile 固定使用 0600 且默认 O_EXCL。
+	file, actualPath, err := createReportFile(fullPath, autoPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("无法创建报告文件: %v", err)
 	}
+	fullPath = actualPath
 
 	// 🟢 [核心修复] 写入 UTF-8 BOM (Byte Order Mark)
 	// Windows 的记事本和部分编辑器在打开没有 BOM 的 UTF-8 文件时，
 	// 可能会错误地将其识别为 GBK 编码，导致中文显示为乱码。
 	// 写入这三个字节 (\xEF\xBB\xBF) 可以显式声明文件为 UTF-8 编码。
-	file.WriteString("\xEF\xBB\xBF")
+	if _, err := file.WriteString("\xEF\xBB\xBF"); err != nil {
+		_ = file.Close()
+		return nil, "", fmt.Errorf("写入报告 BOM 失败: %v", err)
+	}
 
 	// 4. 写入报告头部信息
 	title = NormalizeReportTitle(title)
 	header := fmt.Sprintf("# %s\n\n"+
 		"- **启动时间**: %s\n"+
 		"- **操作员**: %s\n"+
-		"- **工具版本**: v2.0 Ultimate\n\n"+
+		"- **工具版本**: v%s Ultimate\n\n"+
 		"---\n\n",
 		title,
 		time.Now().Format("2006-01-02 15:04:05"),
 		currentUser(),
+		ui.Version,
 	)
-	file.WriteString(header)
+	if _, err := file.WriteString(header); err != nil {
+		_ = file.Close()
+		return nil, "", fmt.Errorf("写入报告头失败: %v", err)
+	}
 
 	return &Reporter{
 		file:  file,
 		path:  fullPath,
 		title: title,
 	}, fullPath, nil
+}
+
+func createReportFile(path string, avoidCollision bool) (*os.File, string, error) {
+	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	if !avoidCollision {
+		// #nosec G703 -- path 已由 NewReporterWithTitle 按本机操作员边界接受，不来自 LLM 或远程目标。
+		file, err := os.OpenFile(path, flags, 0o600)
+		if err == nil {
+			_ = file.Chmod(0o600)
+		}
+		return file, path, err
+	}
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(path, ext)
+	for i := 0; i < 1000; i++ {
+		candidate := path
+		if i > 0 {
+			candidate = fmt.Sprintf("%s_%d%s", base, i+1, ext)
+		}
+		// #nosec G703 -- candidate 仅在受信路径后追加数字后缀，不引入新的路径分量。
+		file, err := os.OpenFile(candidate, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			return file, candidate, nil
+		}
+		if !os.IsExist(err) {
+			return nil, "", err
+		}
+	}
+	return nil, "", fmt.Errorf("同名报告过多: %s", path)
 }
 
 func currentUser() string {
@@ -77,7 +122,7 @@ func currentUser() string {
 // TitleFromHistory 从当前会话里提取适合作为报告标题的任务名。
 func TitleFromHistory(history []analyzer.Message) string {
 	for i := len(history) - 1; i >= 0; i-- {
-		if history[i].Role != "user" {
+		if !isReportTitleUserMessage(history[i]) {
 			continue
 		}
 		if title := NormalizeReportTitle(history[i].Content); title != DefaultReportTitle {
@@ -87,9 +132,22 @@ func TitleFromHistory(history []analyzer.Message) string {
 	return DefaultReportTitle
 }
 
+func isReportTitleUserMessage(message analyzer.Message) bool {
+	if message.Role != "user" {
+		return false
+	}
+	content := strings.TrimSpace(message.Content)
+	for _, prefix := range []string{"Output:", "系统警告:", "【系统】", "上一步执行失败:", "用户拒绝执行"} {
+		if strings.HasPrefix(content, prefix) {
+			return false
+		}
+	}
+	return content != ""
+}
+
 // NormalizeReportTitle 将用户需求整理成简洁的 Markdown 报告标题。
 func NormalizeReportTitle(raw string) string {
-	s := strings.TrimSpace(raw)
+	s := strings.TrimSpace(security.RedactSensitiveText(raw))
 	if s == "" {
 		return DefaultReportTitle
 	}
@@ -186,6 +244,8 @@ func (r *Reporter) Log(title, content string) {
 	if r.file == nil {
 		return
 	}
+	title = security.RedactSensitiveText(title)
+	content = security.RedactSensitiveText(content)
 	timestamp := time.Now().Format("15:04:05")
 	// 使用 Markdown 格式记录
 	entry := fmt.Sprintf("### [%s] %s\n%s\n\n", timestamp, title, content)
@@ -202,17 +262,59 @@ func (r *Reporter) LogCommand(cmd, output string) {
 		return
 	}
 
+	cmd = security.RedactSensitiveText(cmd)
+	output = security.RedactSensitiveText(output)
 	// 对超长输出进行截断，避免报告体积过大导致阅读困难
 	if len(output) > 2000 {
-		output = output[:2000] + "\n... (输出过长已截断) ..."
+		output = safeUTF8Prefix(output, 2000) + "\n... (输出过长已截断) ..."
 	}
 
-	// 格式化为代码块
-	entry := fmt.Sprintf("```bash\n> %s\n```\n**执行结果**:\n```text\n%s\n```\n\n", cmd, output)
+	// Fence must be longer than any backtick run in command/output, otherwise
+	// shell heredocs or Markdown snippets can break the rest of the report.
+	cmdFence := markdownFence(cmd)
+	outFence := markdownFence(output)
+	entry := fmt.Sprintf("%sbash\n> %s\n%s\n**执行结果**:\n%stext\n%s\n%s\n\n", cmdFence, cmd, cmdFence, outFence, output, outFence)
 
 	if _, err := r.file.WriteString(entry); err == nil {
 		r.file.Sync()
 	}
+}
+
+func markdownFence(content string) string {
+	longest := 0
+	current := 0
+	for _, r := range content {
+		if r == '`' {
+			current++
+			if current > longest {
+				longest = current
+			}
+		} else {
+			current = 0
+		}
+	}
+	return strings.Repeat("`", maxInt(3, longest+1))
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func safeUTF8Prefix(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	end := maxBytes
+	for end > 0 && !utf8.ValidString(s[:end]) {
+		end--
+	}
+	return s[:end]
 }
 
 // Close 关闭文件句柄

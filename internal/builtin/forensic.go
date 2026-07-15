@@ -178,9 +178,7 @@ func extractStrings(data []byte, minLen int) []string {
 	flush()
 
 	// UTF-8 片段补充
-	for _, s := range extractUTF8Strings(data, minLen) {
-		results = append(results, s)
-	}
+	results = append(results, extractUTF8Strings(data, minLen)...)
 	return dedupeStrings(results)
 }
 
