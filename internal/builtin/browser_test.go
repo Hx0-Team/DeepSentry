@@ -107,10 +107,16 @@ func TestControlledHeadlessBrowserSession(t *testing.T) {
 	if bin, _ := findBrowserBinary(); bin == "" {
 		t.Skip("Chrome/Chromium is not installed in the test environment")
 	}
+	oldTimeout := config.GlobalConfig.BrowserTimeoutSec
+	config.GlobalConfig.BrowserTimeoutSec = 60
+	t.Cleanup(func() { config.GlobalConfig.BrowserTimeoutSec = oldTimeout })
 	// GitHub-hosted Ubuntu runners disable the user namespaces Chromium needs.
 	// The test only visits the loopback httptest server inside an ephemeral VM.
 	if os.Getenv("CI") != "" {
 		t.Setenv("DEEPSENTRY_BROWSER_NO_SANDBOX", "1")
+		if !browserNoSandboxEnabled() {
+			t.Fatal("CI browser compatibility flag was not applied")
+		}
 	}
 	CloseBrowserSessions()
 	defer CloseBrowserSessions()
