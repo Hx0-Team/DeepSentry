@@ -95,15 +95,24 @@ find "$OUTPUT_DIR" -maxdepth 1 -type f \( -iname 'config*.yaml' -o -name '.env' 
 # 公开校验清单必须与 GitHub Release/ZIP 的 7 个跨平台主程序完全一致。
 # 不列出本机别名和 bin/ 下的内部 benchmark/smoke，否则用户下载 Release
 # 后执行 `shasum -c SHA256SUMS` 会因缺少非发布文件而误报失败。
+release_artifacts=()
+for p in "${platforms[@]}"; do
+  IFS=/ read -r goos goarch <<< "$p"
+  artifact="${APP_NAME}-${goos}-${goarch}"
+  [[ "$goos" == "windows" ]] && artifact="${artifact}.exe"
+  release_artifacts+=("$artifact")
+done
 (
   cd "$OUTPUT_DIR"
-  for p in "${platforms[@]}"; do
-    IFS=/ read -r goos goarch <<< "$p"
-    artifact="${APP_NAME}-${goos}-${goarch}"
-    [[ "$goos" == "windows" ]] && artifact="${artifact}.exe"
-    printf './%s\0' "$artifact"
-  done | sort -z | xargs -0 shasum -a 256
+  printf './%s\0' "${release_artifacts[@]}" | sort -z | xargs -0 shasum -a 256
 ) > "$OUTPUT_DIR/SHA256SUMS"
+
+release_zip="$OUTPUT_DIR/${APP_NAME}-v${APP_VERSION}-all-platforms.zip"
+rm -f "$release_zip"
+(
+  cd "$OUTPUT_DIR"
+  zip -q "$(basename "$release_zip")" "${release_artifacts[@]}"
+)
 
 echo "------------------------------------------"
 echo "✅ 编译完成"
