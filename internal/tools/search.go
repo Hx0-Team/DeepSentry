@@ -86,6 +86,7 @@ func SearchAliases(name string) []string {
 }
 
 var toolSearchAliases = map[string][]string{
+	"config_manage":          {"你自己的配置", "你自己", "自身配置", "你的设置", "你的模型", "给你配置", "给你添加", "调整上下文", "配置状态", "deepsentry", "config.yaml"},
 	"task_wait":              {"等待下载", "下载完成", "等待文件", "等下载", "smart wait", "等待条件"},
 	"task_context":           {"长任务", "任务进度", "恢复任务", "工作记录"},
 	"schedule_task":          {"每分钟", "每30分钟", "两小时后", "2小时后", "周期任务", "定时任务", "延时任务"},
@@ -100,13 +101,16 @@ var toolSearchAliases = map[string][]string{
 	"file_ident":             {"伪装二进制", "文件类型", "魔数", "magic"},
 	"file_hash":              {"伪装二进制", "文件哈希", "sha256", "完整性"},
 	"pcap_analyze":           {"pcap", "恶意域名", "tls sni", "流量线索"},
-	"document_parse":         {"office文档", "docx", "xlsx", "文档元信息"},
+	"document_parse":         {"office文档", "docx", "xlsx", "pptx", "pdf", "读取文档", "阅读附件", "理解文档", "幻灯片", "工作表", "文档元信息"},
+	"document_create":        {"生成文档", "制作报告", "word报告", "生成word", "生成excel", "生成ppt", "生成pdf", "制作ppt", "创建工作表", "导出文档", "商务报告", "安全报告"},
 	"chat_send_file":         {"发给我", "发文件", "微信发文件", "桌面文件", "发送附件"},
 	"zip_password_recover":   {"zipcracker", "zip密码", "压缩包密码", "伪加密", "zipcrypto", "winzip aes", "字典爆破", "掩码爆破", "crc32", "四位数字"},
 	"fleet_inventory":        {"fleet清单", "多目标清单", "目标盘点"},
 	"fleet_exec":             {"fleet批量", "批量端口", "多目标健康", "ssh中断", "批量巡检"},
 	"fleet_file":             {"多目标证据文件", "批量文件", "fleet file"},
 	"web_snapshot":           {"网页表单", "页面脚本", "forms scripts", "网页快照"},
+	"http_fetch":             {"http", "响应正文", "接口正文", "json", "公开暴露", "http状态", "response body", "api response"},
+	"web_search":             {"联网搜索", "网页搜索", "搜索网页", "实时信息", "最新消息", "最新版本", "新闻", "公告", "漏洞预警", "cve", "发布说明", "release notes", "search the web", "web search", "google", "百度"},
 	"computer_use":           {"computer use", "桌面操作", "操作电脑", "电脑操作", "鼠标", "键盘", "桌面截图", "点击屏幕", "desktop", "desktop automation", "打开微信", "微信客户端", "本机微信", "桌面应用", "原生应用", "辅助功能", "ui自动化", "屏幕截图", "屏幕操作"},
 	"browser_browse":         {"分页公告", "跟进链接", "持续浏览", "安全公告", "advisory"},
 	"db_config_audit":        {"redis危险配置", "数据库配置审计"},

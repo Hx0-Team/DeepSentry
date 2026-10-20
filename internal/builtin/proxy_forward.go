@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,8 @@ import (
 )
 
 type forwardSession struct {
+	ctx         context.Context
+	cancel      context.CancelFunc
 	ID          string
 	Kind        string
 	Listen      string
@@ -25,11 +28,25 @@ type forwardSession struct {
 	Listener    net.Listener
 	resourcesMu sync.Mutex
 	stopped     bool
-	resources   map[io.Closer]struct{}
+	resources   map[io.Closer]*forwardResource
+	stopOnce    sync.Once
 }
 
-// Track every socket, including accepted connections and SOCKS BIND/UDP
-// resources. Registering after stop closes it immediately, covering dial races.
+// A second Close on net.Conn/net.Listener can return while the first Close is
+// still releasing its descriptor. Share one completion barrier for every owner.
+type forwardResource struct {
+	closer io.Closer
+	once   sync.Once
+	err    error
+}
+
+func (r *forwardResource) close() error {
+	r.once.Do(func() { r.err = r.closer.Close() })
+	return r.err
+}
+
+// Track accepted sockets and SOCKS BIND/UDP resources. A late registration is
+// closed immediately after stop, covering races with an in-flight dial.
 func (s *forwardSession) track(c io.Closer) bool {
 	s.resourcesMu.Lock()
 	defer s.resourcesMu.Unlock()
@@ -38,27 +55,48 @@ func (s *forwardSession) track(c io.Closer) bool {
 		return false
 	}
 	if s.resources == nil {
-		s.resources = make(map[io.Closer]struct{})
+		s.resources = make(map[io.Closer]*forwardResource)
 	}
-	s.resources[c] = struct{}{}
+	if s.resources[c] == nil {
+		s.resources[c] = &forwardResource{closer: c}
+	}
 	return true
 }
-func (s *forwardSession) forget(c io.Closer) {
+
+func (s *forwardSession) closeResource(c io.Closer) error {
+	s.resourcesMu.Lock()
+	resource := s.resources[c]
+	s.resourcesMu.Unlock()
+	if resource == nil {
+		return c.Close()
+	}
+	err := resource.close()
 	s.resourcesMu.Lock()
 	delete(s.resources, c)
 	s.resourcesMu.Unlock()
+	return err
 }
-func (s *forwardSession) closeResource(c io.Closer) { _ = c.Close(); s.forget(c) }
+
 func (s *forwardSession) stop() {
-	s.resourcesMu.Lock()
-	s.stopped = true
-	resources := s.resources
-	s.resources = nil
-	s.resourcesMu.Unlock()
-	_ = s.Listener.Close()
-	for c := range resources {
-		_ = c.Close()
-	}
+	s.stopOnce.Do(func() {
+		s.resourcesMu.Lock()
+		s.stopped = true
+		if s.cancel != nil {
+			s.cancel()
+		}
+		resources := make([]*forwardResource, 0, len(s.resources))
+		for _, resource := range s.resources {
+			resources = append(resources, resource)
+		}
+		s.resourcesMu.Unlock()
+		_ = s.Listener.Close()
+		for _, resource := range resources {
+			_ = resource.close()
+		}
+		s.resourcesMu.Lock()
+		s.resources = nil
+		s.resourcesMu.Unlock()
+	})
 }
 
 // Wrapping accepted connections also covers HTTP keep-alive and hijacking.
@@ -84,9 +122,7 @@ type forwardConn struct {
 }
 
 func (c *forwardConn) Close() error {
-	err := c.Conn.Close()
-	c.session.forget(c.Conn)
-	return err
+	return c.session.closeResource(c.Conn)
 }
 
 var forwardManager = struct {
@@ -155,7 +191,7 @@ func serveForward(sess *forwardSession) {
 
 func handleForwardConn(sess *forwardSession, src net.Conn) {
 	defer src.Close()
-	dst, err := net.DialTimeout("tcp", sess.Target, 8*time.Second)
+	dst, err := sess.dial(sess.Target, 8*time.Second)
 	if err != nil {
 		return
 	}
@@ -166,23 +202,7 @@ func handleForwardConn(sess *forwardSession, src net.Conn) {
 	forwardManager.Lock()
 	sess.ConnCount++
 	forwardManager.Unlock()
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(dst, src)
-		forwardManager.Lock()
-		sess.BytesOut += n
-		forwardManager.Unlock()
-	}()
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(src, dst)
-		forwardManager.Lock()
-		sess.BytesIn += n
-		forwardManager.Unlock()
-	}()
-	wg.Wait()
+	spliceConns(sess, dst, src)
 }
 
 func listForwards(rt Runtime) string {
@@ -317,7 +337,7 @@ func handleSocks5Conn(sess *forwardSession, src net.Conn, username, password str
 }
 
 func relaySocks5Connect(sess *forwardSession, src net.Conn, targetAddr string) {
-	dst, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	dst, err := sess.dial(targetAddr, 10*time.Second)
 	if err != nil {
 		_, _ = src.Write(socks5Reply(0x05, nil))
 		return
@@ -355,7 +375,7 @@ func relaySocks5Bind(sess *forwardSession, src net.Conn, expectHost string, expe
 	go func() {
 		_, err := io.Copy(pw, src)
 		_ = pw.CloseWithError(err)
-		_ = ln.Close()
+		_ = sess.closeResource(ln)
 	}()
 	if tcpLn, ok := ln.(*net.TCPListener); ok {
 		_ = tcpLn.SetDeadline(time.Now().Add(2 * time.Minute))
@@ -397,7 +417,7 @@ func relaySocks5UDP(sess *forwardSession, src net.Conn, expectHost string, expec
 	noteForwardConn(sess)
 	go func() {
 		_, _ = io.Copy(io.Discard, src)
-		_ = relay.Close()
+		_ = sess.closeResource(relay)
 	}()
 	expectIP := net.ParseIP(expectHost)
 	if expectIP == nil || expectIP.IsUnspecified() {
@@ -451,43 +471,75 @@ func noteForwardConn(sess *forwardSession) {
 	forwardManager.Unlock()
 }
 
-func spliceConns(sess *forwardSession, dst, src net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(dst, src)
-		forwardManager.Lock()
-		sess.BytesOut += n
-		forwardManager.Unlock()
-	}()
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(src, dst)
-		forwardManager.Lock()
-		sess.BytesIn += n
-		forwardManager.Unlock()
-	}()
-	wg.Wait()
+func (s *forwardSession) context() context.Context {
+	s.resourcesMu.Lock()
+	defer s.resourcesMu.Unlock()
+	if s.ctx == nil {
+		s.ctx, s.cancel = context.WithCancel(context.Background())
+		if s.stopped {
+			s.cancel()
+		}
+	}
+	return s.ctx
+}
+func (s *forwardSession) dial(addr string, timeout time.Duration) (net.Conn, error) {
+	d := net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	return d.DialContext(s.context(), "tcp", addr)
+}
+func (c *forwardConn) CloseWrite() error {
+	if half, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return half.CloseWrite()
+	}
+	return c.Conn.Close()
 }
 
+type forwardWriter struct {
+	writer  io.Writer
+	session *forwardSession
+	out     bool
+}
+
+func (w forwardWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	forwardManager.Lock()
+	if w.out {
+		w.session.BytesOut += int64(n)
+	} else {
+		w.session.BytesIn += int64(n)
+	}
+	forwardManager.Unlock()
+	return n, err
+}
+func halfCloseWrite(conn net.Conn) {
+	if c, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = c.CloseWrite()
+	} else {
+		_ = conn.Close()
+	}
+}
+func spliceConns(sess *forwardSession, dst, src net.Conn) { spliceConnReader(sess, dst, src, src) }
 func spliceConnReader(sess *forwardSession, dst net.Conn, src io.Reader, back net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(dst, src)
-		forwardManager.Lock()
-		sess.BytesOut += n
-		forwardManager.Unlock()
-		_ = dst.Close()
+		_, err := io.Copy(forwardWriter{writer: dst, session: sess, out: true}, src)
+		if err != nil {
+			_ = dst.Close()
+			_ = back.Close()
+		} else {
+			halfCloseWrite(dst)
+		}
 	}()
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(back, dst)
-		forwardManager.Lock()
-		sess.BytesIn += n
-		forwardManager.Unlock()
+		_, err := io.Copy(forwardWriter{writer: back, session: sess}, dst)
+		if err != nil {
+			_ = dst.Close()
+			_ = back.Close()
+		} else {
+			halfCloseWrite(back)
+		}
 	}()
 	wg.Wait()
 }

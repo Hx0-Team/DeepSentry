@@ -11,7 +11,7 @@ func Get(name string) (*Tool, bool) {
 	registryMu.RLock()
 	defer registryMu.RUnlock()
 	t, ok := Registry[name]
-	if !ok || !t.Enabled {
+	if !ok || !t.Enabled || !toolFeatureAvailable(t) {
 		return nil, false
 	}
 	return t, true
@@ -23,7 +23,7 @@ func ListNames() []string {
 	defer registryMu.RUnlock()
 	names := make([]string, 0, len(Registry))
 	for n, t := range Registry {
-		if t.Enabled {
+		if t.Enabled && toolFeatureAvailable(t) {
 			names = append(names, n)
 		}
 	}
@@ -75,10 +75,10 @@ func FormatCatalogDetail(category, query string) string {
 	byCat := make(map[string][]*Tool)
 	scores := make(map[string]int)
 	var matched []*Tool
-	catOrder := []string{"网络连通", "连接审计", "系统应急", "取证分析", "文档解析", "端口扫描", "内网发现", "Web探测", "浏览器控制", "抓包分析", "协议探测", "系统关联", "协议指纹", "数据库探测", "数据库取证", "配置取证", "日志取证", "脚本执行", "文件传输", "代理转发", "自动化任务", "配置管理", "批量运维", "比赛辅助"}
+	catOrder := []string{"网络连通", "连接审计", "系统应急", "取证分析", "文档解析", "端口扫描", "内网发现", "Web探测", "联网搜索", "浏览器控制", "抓包分析", "协议探测", "系统关联", "协议指纹", "数据库探测", "数据库取证", "配置取证", "日志取证", "脚本执行", "文件传输", "代理转发", "自动化任务", "配置管理", "批量运维", "比赛辅助"}
 
 	for _, t := range Registry {
-		if !t.Enabled {
+		if !t.Enabled || !toolFeatureAvailable(t) {
 			continue
 		}
 		if category != "" && category != "all" && t.Category != category {

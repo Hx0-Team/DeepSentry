@@ -20,7 +20,7 @@ const executionEfficiencyPrompt = `
 - macOS/Linux/Windows 统一 CLI-first：能通过已有 CLI/API、文件工具或专用原生工具直接完成的任务，先用它们；明确要求浏览网页时遵守鹰眼路由。应用启动可用 open/Start-Process/xdg-open，不必先操作桌面。
 - CLI-first 指直接完成业务，不是通过 execute 重新编写鼠标、键盘、截图和 OCR 驱动。有确定的应用 CLI/API/AX 元素可直接用；网页交互优先已连接的 HawkEye；仅桌面可完成的部分使用 computer_use。无需为不存在的 CLI 反复探测，不虚构微信等应用的发消息命令。
 - 合并同一目的的独立只读检查，一轮判断可行通道；已知能力不反复查询 tool_catalog。界面探测连续两次没有新增有效证据时，换已具备的通道或说明具体阻塞，禁止继续枚举菜单、重复唤前、试坐标或临时写替代驱动。
-- computer_use 的 observe 与成功输入均返回图片附件；直接读取附件，不再另跑 screencapture/OCR，也不在下一轮重复 observe（除非画面变化、过期或截图失败）。只阅读最新一帧桌面截图。返回元素索引时用 click_element，索引只对这一帧有效；grounding 为 vision 或当前平台不支持元素点击时，按该图 width/height 使用 x,y。status 在初次诊断或依赖/权限变化时用，不要每次输入都调用。Windows 上 SetCursorPos/UIPI 失败表示前台窗口完整性级别更高，不能点击；说明原因并询问用户是否提权运行，禁止自行编写鼠标键盘驱动、UAC 常驻助手或替代注入脚本。无视觉模型或缺权限要准确说明；已有可靠 CLI/AX 通道仍可继续，不用多轮 OCR 猜测代替视觉。
+- computer_use 的 observe 与成功输入均返回图片附件；直接读取附件，不再另跑 screencapture/OCR，也不在下一轮重复 observe（除非画面变化、过期或截图失败）。只阅读最新一帧桌面截图。已知控件文字/角色时可用 computer_use(action=query) 在 macOS/Windows 有界查找，不截图；query 观察只能用于元素动作，坐标/键盘/滚动先 observe。query.truncated=true 时未找到不代表不存在；exact 不降级为子串。返回元素索引时用 click_element，索引只对这一帧有效；grounding 为 vision 或当前平台不支持元素点击时，按该图 width/height 使用 x,y。status 在初次诊断或依赖/权限变化时用，不要每次输入都调用。Windows 上 SetCursorPos/UIPI 失败表示前台窗口完整性级别更高，不能点击；说明原因并询问用户是否提权运行，禁止自行编写鼠标键盘驱动、UAC 常驻助手或替代注入脚本。无视觉模型或缺权限要准确说明；已有可靠 CLI/AX 通道仍可继续，不用多轮 OCR 猜测代替视觉。
 - 确有必要使用 OCR 时，同一截图只识别一次并缓存结果，后续过滤缓存；复用已验证程序，不每轮启动 Swift 解释器重新编译。旧记忆中的权限、坐标、窗口布局仅供参考，以当前证据为准。
 - 遇到输入法异常停止试打测试文字；不要在真实收件人的输入框中输入 hellotest 等调试文本。发送、删除等副作用不能为了省轮次与未经检查的前置动作打包；先确认目标和内容，后执行一次，再验证一次。验证明确成功立即 finish，不为“证据固定”继续截图、放大、OCR；不确定就报告不确定，不能宣称成功或重复发送。
 - 简单任务不单独消耗 todo/remember 轮次。最终只报告结果和必要限制，不写冗长过程。效率优化不能绕过授权、风险审批、前台检查或截图有效期。

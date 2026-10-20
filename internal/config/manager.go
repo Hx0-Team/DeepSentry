@@ -18,8 +18,10 @@ import (
 )
 
 // ManageConfig performs controlled config.yaml maintenance for Agent/tool use.
-// Mutating actions always create a timestamped backup before writing.
+// Changed files get a timestamped backup before writing; previews and no-ops do not.
 func ManageConfig(args map[string]string) (string, error) {
+	manageConfigMu.Lock()
+	defer manageConfigMu.Unlock()
 	if args == nil {
 		args = map[string]string{}
 	}
@@ -30,6 +32,8 @@ func ManageConfig(args map[string]string) (string, error) {
 	path := resolveConfigPath(firstConfigArg(args, "config_path", "config_file"))
 
 	switch action {
+	case "describe":
+		return configDescribe(args)
 	case "status", "show", "show_config", "view", "list", "overview":
 		return configStatus(path)
 	case "get", "read", "get_config", "read_config", "export":
@@ -97,6 +101,8 @@ func ManageConfig(args map[string]string) (string, error) {
 		changed, err = manageSetSSH(root, args)
 	case "set", "set_value":
 		changed, err = manageSetScalar(root, args)
+	case "patch":
+		changed, err = managePatch(root, args)
 	default:
 		return "", fmt.Errorf("未知配置管理动作: %s", action)
 	}
@@ -107,20 +113,10 @@ func ManageConfig(args map[string]string) (string, error) {
 		return "", fmt.Errorf("变更后的配置无效，未写入: %w", err)
 	}
 
-	backupPath := "(新建配置，无旧文件)"
-	if existed {
-		if backupPath, err = backupConfig(path); err != nil {
-			return "", err
-		}
+	if ConfigPreview(args) {
+		return "[OK] 预览校验通过，未写入、未备份、未重载\n" + changed + "\n" + configEffectReport(doc), nil
 	}
-	if err := writeConfigNode(path, doc); err != nil {
-		return "", err
-	}
-	if err := reloadManagedConfig(path); err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("[OK] 已更新配置: %s\n[OK] 备份: %s\n[OK] 变更: %s", path, backupPath, changed), nil
+	return commitManagedConfig(path, doc, existed, changed)
 }
 
 func configStatus(path string) (string, error) {
@@ -141,41 +137,33 @@ func configStatus(path string) (string, error) {
 	b.WriteString(fmt.Sprintf("mcp_servers: %s\n", strings.Join(readScalarSeq(root, "mcp_servers"), ", ")))
 	b.WriteString(fmt.Sprintf("mcp_server_configs: %s\n", strings.Join(readMCPServerConfigSummaries(root), ", ")))
 	b.WriteString(fmt.Sprintf("targets: %d 个\n", len(readTargets(root))))
-	configured := GlobalConfig
-	if provider := readScalar(root, "provider"); provider != "" {
-		configured.Provider = provider
+	configured, err := decodeConfigNode(doc)
+	if err != nil {
+		return "", fmt.Errorf("配置语义错误；可用 describe 查询字段，replace_yaml 修复: %w", err)
 	}
-	if apiURL := readScalar(root, "api_url"); apiURL != "" {
-		configured.ApiURL = apiURL
-	}
-	if model := readScalar(root, "model_name"); model != "" {
-		configured.ModelName = model
-	}
-	if profile := readScalar(root, "model_profile"); profile != "" {
-		configured.ModelProfile = profile
-	}
-	if raw := readScalar(root, "context_window_tokens"); raw != "" {
-		configured.ContextWindowTokens, _ = strconv.Atoi(raw)
-	}
-	if raw := readScalar(root, "model_parameter_b"); raw != "" {
-		configured.ModelParameterB, _ = strconv.ParseFloat(raw, 64)
-	}
-	if raw := readScalar(root, "context_utilization"); raw != "" {
-		configured.ContextUtilization, _ = strconv.ParseFloat(raw, 64)
-	}
-	if raw := readScalar(root, "reserved_output_tokens"); raw != "" {
-		configured.ReservedOutputTokens, _ = strconv.Atoi(raw)
-	}
-	if raw := readScalar(root, "native_tool_limit"); raw != "" {
-		configured.NativeToolLimit, _ = strconv.Atoi(raw)
+	primary := configured.EffectiveModels()[0]
+	configured = configured.ConfigForModel(primary)
+	b.WriteString(fmt.Sprintf("配置实际主模型（按文件解析）: id=%s, provider=%s, model_name=%s, api_protocol=%s\n", primary.ID, primary.Provider, primary.ModelName, configured.EffectiveAPIProtocol()))
+	if models := findMapValue(root, "models"); models != nil && len(models.Content) > 0 {
+		b.WriteString("models 优先于顶层模型字段；修改实际主模型请传 model_id=primary。\n")
+		for _, model := range configuredModelList(doc) {
+			b.WriteString(model + "\n")
+		}
 	}
 	capabilities := configured.EffectiveModelCapabilities()
+	b.WriteString(fmt.Sprintf("history_budget_tokens: %d (effective=%d before request overhead)\n", configured.HistoryBudgetTokens, configured.RequestHistoryBudgetTokens(0)))
 	b.WriteString(fmt.Sprintf("model_adaptation: profile=%s, context=%d, output_reserve=%d, native_tool_limit=%d, source=%s\n",
 		capabilities.PromptProfile, capabilities.ContextWindowTokens, capabilities.ReservedOutputTokens,
 		capabilities.NativeToolLimit, capabilities.DetectionSource))
-	if host := readScalar(root, "ssh_host"); host != "" && readScalar(root, "target_protocol") != "local" {
-		b.WriteString(fmt.Sprintf("single ssh: %s@%s\n", valueOr(readScalar(root, "ssh_user"), "root"), host))
+	if host := readScalar(root, "ssh_host"); host != "" {
+		b.WriteString(sshConfigSummary(root) + "\n")
 	}
+	b.WriteString("controller_proxy（保存值）: " + valueOr(redactConfigValue("controller_proxy", readScalar(root, "controller_proxy")), "直连") + "\n")
+	if path == resolveConfigPath("") {
+		active := GlobalConfig.EffectiveModels()[0]
+		b.WriteString(fmt.Sprintf("当前加载主模型（含启动覆盖）: id=%s provider=%s model_name=%s\n", active.ID, active.Provider, active.ModelName))
+	}
+	b.WriteString(managedEnvironmentNotice())
 	return strings.TrimSpace(b.String()), nil
 }
 
@@ -193,23 +181,51 @@ func configGet(path string, args map[string]string) (string, error) {
 	}
 	root := ensureConfigRoot(doc)
 	switch key {
+	case "ssh":
+		return sshConfigSummary(root), nil
 	case "skill_sources", "disabled_skill_sources", "disabled_skills", "mcp_servers":
 		return fmt.Sprintf("%s: %s", key, strings.Join(readScalarSeq(root, key), ", ")), nil
 	case "mcp_server_configs":
-		return fmt.Sprintf("%s: %s", key, strings.Join(readMCPServerConfigSummaries(root), ", ")), nil
+		var details []string
+		servers := findMapValue(root, key)
+		if servers != nil {
+			for _, server := range servers.Content {
+				name := readScalar(server, "name")
+				if want := args["name"]; want != "" && name != want {
+					continue
+				}
+				details = append(details, fmt.Sprintf("name=%s type=%s command=%s url=%s disabled=%s（env/headers/参数不回显）", name, valueOr(readScalar(server, "type"), "stdio"), readScalar(server, "command"), safeManagedURL(readScalar(server, "url")), valueOr(readScalar(server, "disabled"), "false")))
+			}
+		}
+		return key + ":\n" + strings.Join(details, "\n"), nil
 	case "targets":
 		return fmt.Sprintf("targets: %d 个", len(readTargets(root))), nil
 	}
-	node := findMapValue(root, key)
+	target, _, err := configPatchTarget(root, args)
+	if err != nil {
+		return "", err
+	}
+	node := configNodeAt(target, key)
 	if node == nil {
+		if strings.Contains(key, ".") {
+			if _, ok := managedFieldType(key); !ok {
+				return "", fmt.Errorf("未知配置键 %s；请 describe 查询实际键名", key)
+			}
+		}
 		return fmt.Sprintf("%s: (未配置)", key), nil
 	}
 	if node.Kind == yaml.ScalarNode {
-		return fmt.Sprintf("%s: %s", key, redactConfigValue(key, node.Value)), nil
+		return fmt.Sprintf("%s: %s", key, safeConfigNode(key, node)), nil
+	}
+	if strings.HasSuffix(key, "headers") {
+		return key + ": ***", nil
 	}
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
+	if key == "balance_query" || key == "models" {
+		node = redactQueryHeaders(node)
+	}
 	if err := enc.Encode(node); err != nil {
 		return "", err
 	}
@@ -465,19 +481,77 @@ func manageRemoveSkillSource(root *yaml.Node, args map[string]string) (string, e
 }
 
 func manageAddTarget(root *yaml.Node, args map[string]string) (string, error) {
+	args = cloneConfigArgs(args)
+	name := firstConfigArg(args, "name")
+	var existing *yaml.Node
+	if targets := findMapValue(root, "targets"); targets != nil {
+		for _, item := range targets.Content {
+			if name != "" && readScalar(item, "name") == name {
+				existing = item
+				break
+			}
+		}
+	}
 	host := firstConfigArg(args, "host", "ssh_host", "addr", "address")
+	if host == "" && existing != nil {
+		host = readScalar(existing, "host")
+		if args["port"] != "" {
+			host, _ = splitManagedEndpoint(host)
+		}
+	}
 	if host == "" {
 		return "", fmt.Errorf("host 不能为空")
 	}
-	protocol := strings.ToLower(valueOr(firstConfigArg(args, "protocol"), "ssh"))
+	protocol := firstConfigArg(args, "protocol")
+	if protocol == "" && existing != nil {
+		protocol = readScalar(existing, "protocol")
+	}
+	protocol = strings.ToLower(valueOr(protocol, "ssh"))
 	var err error
 	host, err = normalizeManagedEndpoint(protocol, host, firstConfigArg(args, "port"))
 	if err != nil {
 		return "", err
 	}
-	name := firstConfigArg(args, "name")
 	if name == "" {
 		name = defaultTargetName(protocol, host)
+	}
+	if existing == nil {
+		if targets := findMapValue(root, "targets"); targets != nil {
+			for _, item := range targets.Content {
+				if sameManagedEndpoint(protocol, host, readScalar(item, "protocol"), readScalar(item, "host")) {
+					existing = item
+					if args["name"] == "" {
+						name = readScalar(item, "name")
+					}
+					break
+				}
+			}
+		}
+	}
+	if existing != nil {
+		oldHost, _ := splitManagedEndpoint(readScalar(existing, "host"))
+		newHost, _ := splitManagedEndpoint(host)
+		if (strings.EqualFold(oldHost, newHost) || parseBoolArg(args["reuse_auth"])) && strings.EqualFold(protocol, readScalar(existing, "protocol")) {
+			for _, key := range []string{"user", "device_type", "prompt", "auth_prompt_regex", "enable_password", "ftp_tls_mode", "ftp_tls_server_name", "ftp_tls_ca_file", "ftp_tls_insecure_skip_verify", "ftp_data_mode", "ftp_active_address"} {
+				if !hasConfigArg(args, key) {
+					args[key] = readScalar(existing, key)
+				}
+			}
+			if !hasConfigArg(args, "password", "ssh_password", "pass", "key_path", "ssh_key_path", "key") {
+				args["password"] = readScalar(existing, "password")
+				args["key_path"] = readScalar(existing, "key_path")
+				args["key_passphrase"] = readScalar(existing, "key_passphrase")
+			}
+			if !hasConfigArg(args, "tags", "tag") {
+				if tags := findMapValue(existing, "tags"); tags != nil {
+					var values []string
+					for _, v := range tags.Content {
+						values = append(values, v.Value)
+					}
+					args["tags"] = strings.Join(values, ",")
+				}
+			}
+		}
 	}
 	replaced := upsertTarget(root, configTargetFromArgs(name, protocol, host, args))
 	return fmt.Sprintf("已%s targets: %s (%s %s)", mapBool(replaced, "更新", "添加"), name, protocol, host), nil
@@ -521,45 +595,71 @@ func manageEnableFleet(root *yaml.Node, args map[string]string) (string, error) 
 func manageSetSSH(root *yaml.Node, args map[string]string) (string, error) {
 	host := firstConfigArg(args, "host", "ssh_host", "addr", "address")
 	if host == "" {
-		return "", fmt.Errorf("host/ssh_host 不能为空")
+		host = readScalar(root, "ssh_host")
+		if host == "" {
+			return "", fmt.Errorf("首次配置必须提供 host；已有 SSH 可只传要修改的字段")
+		}
+		if firstConfigArg(args, "port") != "" {
+			host, _ = splitManagedEndpoint(host)
+		}
 	}
 	var err error
 	host, err = normalizeManagedEndpoint("ssh", host, firstConfigArg(args, "port"))
 	if err != nil {
 		return "", err
 	}
-	user := valueOr(firstConfigArg(args, "user", "ssh_user", "username"), "root")
-	password := firstConfigArg(args, "password", "ssh_password", "pass")
+	oldHost, _ := splitManagedEndpoint(readScalar(root, "ssh_host"))
+	newHost, _ := splitManagedEndpoint(host)
+	sameHost := oldHost != "" && strings.EqualFold(oldHost, newHost)
+	keepAuth := sameHost || parseBoolArg(args["reuse_auth"])
+	user := firstConfigArg(args, "user", "ssh_user", "username")
+	if user == "" && keepAuth {
+		user = readScalar(root, "ssh_user")
+	}
+	user = valueOr(user, "root")
+	password := rawConfigArg(args, "password", "ssh_password", "pass")
+	oldKeyPath := readScalar(root, "ssh_key_path")
 	keyPath := firstConfigArg(args, "key_path", "ssh_key_path", "key")
-	deviceType := valueOr(firstConfigArg(args, "device_type", "ssh_device_type"), "auto")
+	providedPassword := hasConfigArg(args, "password", "ssh_password", "pass")
+	providedKey := hasConfigArg(args, "key_path", "ssh_key_path", "key")
+	if keepAuth && !providedPassword && !providedKey {
+		password = readScalar(root, "ssh_password")
+		keyPath = readScalar(root, "ssh_key_path")
+	}
+	deviceType := firstConfigArg(args, "device_type", "ssh_device_type")
+	if sameHost && deviceType == "" {
+		deviceType = readScalar(root, "ssh_device_type")
+	}
+	deviceType = valueOr(deviceType, "auto")
 	setScalar(root, "target_protocol", "ssh")
 	setScalar(root, "ssh_host", host)
 	setScalar(root, "ssh_user", user)
 	setScalar(root, "ssh_password", password)
 	setScalar(root, "ssh_key_path", keyPath)
-	if passphrase := firstConfigArg(args, "key_passphrase", "ssh_key_passphrase", "passphrase"); passphrase != "" {
-		setScalar(root, "ssh_key_passphrase", passphrase)
+	if hasConfigArg(args, "key_passphrase", "ssh_key_passphrase", "passphrase") {
+		setScalar(root, "ssh_key_passphrase", rawConfigArg(args, "key_passphrase", "ssh_key_passphrase", "passphrase"))
+	} else if !keepAuth || providedPassword || (providedKey && keyPath != oldKeyPath) {
+		setScalar(root, "ssh_key_passphrase", "")
 	}
 	setScalar(root, "ssh_device_type", deviceType)
-	setScalar(root, "ssh_prompt", firstConfigArg(args, "prompt", "ssh_prompt"))
-	setScalar(root, "ssh_enable_password", firstConfigArg(args, "enable_password", "ssh_enable_password"))
-	return fmt.Sprintf("已设置单目标 SSH: %s@%s", user, host), nil
+	for _, pair := range [][2]string{{"prompt", "ssh_prompt"}, {"enable_password", "ssh_enable_password"}} {
+		if !sameHost || hasConfigArg(args, pair[0], pair[1]) {
+			setScalar(root, pair[1], firstConfigArg(args, pair[0], pair[1]))
+		}
+	}
+	return "已设置单目标 SSH；以下为保存值，实际连接未切换：\n" + sshConfigSummary(root) + fmt.Sprintf("\n未指定的同主机认证保留=%t", keepAuth && !providedPassword && !providedKey), nil
 }
 
 func manageSetScalar(root *yaml.Node, args map[string]string) (string, error) {
 	key := firstConfigArg(args, "key", "name")
-	value := firstConfigArg(args, "value")
 	if key == "" {
 		return "", fmt.Errorf("key 不能为空")
 	}
-	if !allowedScalarConfigKey(key) {
-		return "", fmt.Errorf("不允许通过 set 修改该字段: %s", key)
+	if _, ok := args["value"]; !ok {
+		return "", fmt.Errorf("set 必须提供 value；清空字符串请显式传 value=空字符串")
 	}
-	if err := validateManagedScalar(key, value); err != nil {
-		return "", err
-	}
-	setScalar(root, key, value)
-	return fmt.Sprintf("已设置 %s = %s", key, redactConfigValue(key, value)), nil
+	changes, _ := json.Marshal(map[string]string{key: args["value"]})
+	return managePatch(root, map[string]string{"changes": string(changes), "model_id": args["model_id"]})
 }
 
 func validateManagedScalar(key, value string) error {
@@ -611,6 +711,11 @@ func validateManagedScalar(key, value string) error {
 		if err != nil || n < 0 || n > 1000 {
 			return fmt.Errorf("native_tool_limit 必须是 0-1000 的整数，收到 %q", value)
 		}
+	case "history_budget_tokens", "subagent_history_budget_tokens":
+		n, err := strconv.Atoi(value)
+		if err != nil || (n != -1 && n != 0 && (n < 1_024 || n > 4_194_304)) {
+			return fmt.Errorf("history_budget_tokens 必须是 -1、0 或 1024-4194304 的整数，收到 %q", value)
+		}
 	case "ssh_host_key_policy":
 		switch strings.ToLower(value) {
 		case "strict", "accept-new", "insecure":
@@ -640,6 +745,38 @@ func validateManagedScalar(key, value string) error {
 		if err != nil || n < 1_048_576 || n > 1<<50 {
 			return fmt.Errorf("%s 必须是 1048576-%d 的整数字节，收到 %q", key, int64(1<<50), value)
 		}
+	case "search.count":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 50 {
+			return fmt.Errorf("search.count 必须是 1-50 的整数，收到 %q", value)
+		}
+	case "search.timeout_sec":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 120 {
+			return fmt.Errorf("search.timeout_sec 必须是 1-120 的整数，收到 %q", value)
+		}
+	case "search.base_url":
+		if value != "" {
+			if err := validateHTTPURL("search.base_url", value); err != nil {
+				return err
+			}
+		}
+	case "thinking_mode":
+		switch strings.ToLower(value) {
+		case "auto", "enabled", "enable", "true", "on", "disabled", "disable", "false", "off":
+		default:
+			return fmt.Errorf("thinking_mode 必须是 auto|enabled|disabled，收到 %q", value)
+		}
+	case "reasoning_effort":
+		switch strings.ToLower(value) {
+		case "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+		default:
+			return fmt.Errorf("reasoning_effort 必须是 auto|none|minimal|low|medium|high|xhigh|max|ultra，收到 %q", value)
+		}
+	case "user_id":
+		if value != "" && !regexp.MustCompile(`^[A-Za-z0-9_-]{1,512}$`).MatchString(value) {
+			return fmt.Errorf("user_id 只能包含 A-Z、a-z、0-9、下划线和连字符，长度 1-512")
+		}
 	}
 	return nil
 }
@@ -661,23 +798,14 @@ func manageReplaceYAML(path string, args map[string]string) (string, error) {
 		return "", fmt.Errorf("新配置无效，未写入: %w", err)
 	}
 
-	backupPath := "(新建配置，无旧文件)"
-	if _, err := os.Stat(path); err == nil {
-		var backupErr error
-		backupPath, backupErr = backupConfig(path)
-		if backupErr != nil {
-			return "", backupErr
-		}
-	} else if !os.IsNotExist(err) {
-		return "", fmt.Errorf("检查配置文件失败: %w", err)
+	if ConfigPreview(args) {
+		return "[OK] 新 YAML 校验通过，未写入、未备份、未重载", nil
 	}
-	if err := writeConfigNode(path, &doc); err != nil {
+	_, err := os.Stat(path)
+	if err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
-	if err := reloadManagedConfig(path); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("[OK] 已替换并重载配置: %s\n[OK] 备份: %s", path, backupPath), nil
+	return commitManagedConfig(path, &doc, err == nil, "已替换并重载配置")
 }
 
 func loadConfigNode(path string) (*yaml.Node, bool, error) {
@@ -697,6 +825,9 @@ func loadConfigNode(path string) (*yaml.Node, bool, error) {
 	}
 	if len(doc.Content) == 0 {
 		doc.Content = []*yaml.Node{{Kind: yaml.MappingNode}}
+	}
+	if doc.Content[0].Kind != yaml.MappingNode {
+		return nil, true, fmt.Errorf("配置根节点必须是 YAML mapping，未修改原文件；可用 replace_yaml 修复")
 	}
 	return &doc, true, nil
 }
@@ -725,17 +856,6 @@ func ensureConfigRoot(doc *yaml.Node) *yaml.Node {
 	return root
 }
 
-func writeConfigNode(path string, doc *yaml.Node) error {
-	data, err := encodeConfigNode(doc)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("创建配置目录失败: %w", err)
-	}
-	return os.WriteFile(path, data, 0o600)
-}
-
 func encodeConfigNode(doc *yaml.Node) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
@@ -750,35 +870,31 @@ func encodeConfigNode(doc *yaml.Node) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func validateConfigNode(doc *yaml.Node) error {
+func validateConfigNode(doc *yaml.Node) error { _, err := decodeConfigNode(doc); return err }
+
+func decodeConfigNode(doc *yaml.Node) (Config, error) {
 	data, err := encodeConfigNode(doc)
 	if err != nil {
-		return err
+		return Config{}, err
 	}
 	reader := viper.New()
 	reader.SetConfigType("yaml")
-	reader.SetDefault("provider", "deepseek")
-	reader.SetDefault("api_protocol", "auto")
-	reader.SetDefault("api_url", "https://api.deepseek.com")
-	reader.SetDefault("model_name", "deepseek-flash")
-	reader.SetDefault("model_profile", "auto")
-	reader.SetDefault("ssh_host_key_policy", "accept-new")
-	reader.SetDefault("ssh_known_hosts_path", "~/.deepsentry/known_hosts")
-	reader.SetDefault("ssh_legacy_compat", "true")
-	reader.SetDefault("ssh_connect_timeout_sec", 25)
-	reader.SetDefault("scheduler_timezone", "Local")
+	setReaderDefaults(reader)
 	if err := reader.ReadConfig(bytes.NewReader(data)); err != nil {
-		return fmt.Errorf("解析配置失败: %w", err)
+		return Config{}, fmt.Errorf("解析配置失败: %w", err)
 	}
 	var candidate Config
 	if err := reader.Unmarshal(&candidate); err != nil {
-		return fmt.Errorf("映射配置失败: %w", err)
+		return Config{}, fmt.Errorf("映射配置失败: %w", err)
 	}
 	ApplyProviderDefaults(&candidate)
 	if err := applyRawCaseSensitiveData(data, &candidate); err != nil {
-		return err
+		return Config{}, err
 	}
-	return ValidateRuntimeConfig(candidate)
+	if err := ValidateRuntimeConfig(candidate); err != nil {
+		return Config{}, err
+	}
+	return candidate, nil
 }
 
 func backupConfig(path string) (string, error) {
@@ -1251,13 +1367,13 @@ func configTargetFromArgs(name, protocol, host string, args map[string]string) T
 		Protocol:                 protocol,
 		Host:                     host,
 		User:                     valueOr(firstConfigArg(args, "user", "ssh_user", "username"), defaultUser(protocol)),
-		Password:                 firstConfigArg(args, "password", "ssh_password", "pass"),
+		Password:                 rawConfigArg(args, "password", "ssh_password", "pass"),
 		KeyPath:                  firstConfigArg(args, "key_path", "ssh_key_path", "key"),
-		KeyPassphrase:            firstConfigArg(args, "key_passphrase", "ssh_key_passphrase", "passphrase"),
+		KeyPassphrase:            rawConfigArg(args, "key_passphrase", "ssh_key_passphrase", "passphrase"),
 		Prompt:                   firstConfigArg(args, "prompt"),
 		AuthPromptRegex:          firstConfigArg(args, "auth_prompt_regex", "telnet_auth_prompt_regex"),
 		DeviceType:               valueOr(firstConfigArg(args, "device_type", "ssh_device_type", "telnet_device_type"), "auto"),
-		EnablePassword:           firstConfigArg(args, "enable_password", "ssh_enable_password", "telnet_enable_password"),
+		EnablePassword:           rawConfigArg(args, "enable_password", "ssh_enable_password", "telnet_enable_password"),
 		FTPTLSMode:               firstConfigArg(args, "ftp_tls_mode", "tls_mode"),
 		FTPTLSServerName:         firstConfigArg(args, "ftp_tls_server_name", "tls_server_name"),
 		FTPTLSCAFile:             firstConfigArg(args, "ftp_tls_ca_file", "tls_ca_file"),
@@ -1271,14 +1387,14 @@ func configTargetFromArgs(name, protocol, host string, args map[string]string) T
 func currentSingleTarget(root *yaml.Node) (TargetConfig, bool) {
 	protocol := strings.ToLower(readScalar(root, "target_protocol"))
 	switch protocol {
-	case "", "ssh":
+	case "", "ssh", "sftp":
 		host := readScalar(root, "ssh_host")
 		if host == "" {
 			return TargetConfig{}, false
 		}
 		return TargetConfig{
-			Name:           defaultTargetName("ssh", host),
-			Protocol:       "ssh",
+			Name:           defaultTargetName(valueOr(protocol, "ssh"), host),
+			Protocol:       valueOr(protocol, "ssh"),
 			Host:           host,
 			User:           valueOr(readScalar(root, "ssh_user"), "root"),
 			Password:       readScalar(root, "ssh_password"),
@@ -1448,7 +1564,10 @@ func allowedScalarConfigKey(key string) bool {
 	switch key {
 	case "provider", "api_protocol", "api_url", "model_name", "api_key", "temperature",
 		"model_profile", "model_parameter_b", "context_window_tokens", "context_utilization",
-		"reserved_output_tokens", "native_tool_limit", "agent_runtime", "terminal_theme",
+		"reserved_output_tokens", "history_budget_tokens", "native_tool_limit", "agent_runtime", "terminal_theme",
+		"thinking_mode", "reasoning_effort", "user_id",
+		"subagent_history_budget_tokens", "vision_mode", "trace_enabled", "trace_dir",
+		"telnet_connect_timeout_sec", "telnet_login_timeout_sec", "telnet_command_timeout_sec",
 		"llm_timeout_sec", "llm_retries", "ssh_command_timeout_sec", "ssh_max_output_bytes",
 		"max_steps", "subagent_max_steps", "target_protocol", "ssh_host", "ssh_user",
 		"ssh_password", "ssh_key_path", "ssh_key_passphrase", "ssh_host_key_policy", "ssh_known_hosts_path", "ssh_legacy_compat", "ssh_connect_timeout_sec", "ssh_device_type", "ssh_prompt", "ssh_enable_password", "telnet_host", "telnet_user", "telnet_password",
@@ -1518,13 +1637,37 @@ func mapBool(ok bool, yes, no string) string {
 
 func redactConfigValue(key, value string) string {
 	lower := strings.ToLower(key)
-	if strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "api_key") {
+	if lower == "controller_proxy" && strings.TrimSpace(value) != "" {
+		return ControllerProxySummary(value)
+	}
+	if strings.Contains(lower, "password") || strings.Contains(lower, "secret") || (strings.Contains(lower, "token") && !strings.HasSuffix(lower, "_tokens")) || strings.Contains(lower, "passphrase") || strings.Contains(lower, "api_key") || lower == "authorization" {
 		if value == "" {
 			return ""
 		}
 		return "***"
 	}
 	return value
+}
+
+// A custom balance endpoint may use any header name for authentication. Hide
+// the whole header map when config_get renders it, without modifying the file.
+func redactQueryHeaders(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	out := *node
+	out.Content = make([]*yaml.Node, len(node.Content))
+	for i, child := range node.Content {
+		out.Content[i] = redactQueryHeaders(child)
+	}
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(out.Content); i += 2 {
+			if strings.EqualFold(out.Content[i].Value, "headers") {
+				out.Content[i+1] = &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "***"}
+			}
+		}
+	}
+	return &out
 }
 
 func redactSensitiveText(text string) string {

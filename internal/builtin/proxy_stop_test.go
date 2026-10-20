@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -134,5 +135,44 @@ func TestStopClosesSocksBindAndUDPResources(t *testing.T) {
 				ln.Close()
 			}
 		})
+	}
+}
+
+// Models netFD.Close: concurrent later closes can finish before the first one.
+type delayedForwardCloser struct {
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *delayedForwardCloser) Close() error {
+	if c.calls.Add(1) == 1 {
+		close(c.entered)
+		<-c.release
+	}
+	return nil
+}
+func TestStopWaitsForConcurrentResourceClose(t *testing.T) {
+	sess := &forwardSession{Listener: &dummyListener{}}
+	resource := &delayedForwardCloser{entered: make(chan struct{}), release: make(chan struct{})}
+	if !sess.track(resource) {
+		t.Fatal("track failed")
+	}
+	closed := make(chan struct{})
+	go func() { _ = sess.closeResource(resource); close(closed) }()
+	<-resource.entered
+	stopped := make(chan struct{})
+	go func() { sess.stop(); close(stopped) }()
+	early := false
+	select {
+	case <-stopped:
+		early = true
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(resource.release)
+	<-closed
+	<-stopped
+	if early || resource.calls.Load() != 1 {
+		t.Fatalf("stop returned before resource release or closed twice: early=%v calls=%d", early, resource.calls.Load())
 	}
 }

@@ -16,6 +16,21 @@ api_key: YOUR_API_KEY
 model_name: deepseek-flash                         # 官方 API ID（产品名 V4.1 Flash）：1M 上下文、原生多模态图片输入
 temperature: 0.0                                  # 0~2；安全运维/比赛建议保持 0，减少随机漂移
 
+# TUI 账户余额：启动时查询，每 60 秒后台刷新，本地模型自动跳过。
+# 内置 DeepSeek / StepFun / SiliconFlow / OpenRouter / Novita；没有余额接口的服务显示暂不支持。
+# 查询使用当前主模型的 api_key 和 controller_proxy，不调用模型；enabled: false 可关闭。
+balance_query:
+  enabled: true
+  interval_sec: 60          # 30–3600 秒；失败自动退避
+  # 自定义服务的接口必须与 api_url 同源，填写厂商提供的只读 GET 路径。
+  # path: /api/account/balance
+  # remaining_field: data.remaining  # 点分隔字段，数组元素如 data.0.remaining
+  # currency_field: data.currency    # 可选，接口返回 CNY/USD 等单位
+  # unit: CNY                       # 没有 currency_field 时使用；默认显示“额度”
+  # scale: 1                        # 原始值换算比例，例如万分之一美元填 0.0001
+  # headers:                        # 可选，厂商要求的额外请求头；不要提交真实密钥
+  #   X-Account-ID: example
+
 # Agent 运行时。v3 已是默认；遇到兼容问题可显式设为 legacy 回滚。
 # v3 启用结构化事件、模型 failover、原生流式多工具调用和 checkpoint v3。
 agent_runtime: v3
@@ -47,6 +62,7 @@ terminal_theme: auto                    # auto | dark | light
 # 启用鉴权时填写真实 api_key；未启用时可填 none。上下文长度应填服务实际加载值。
 # model_routing:
 #   failover_on: [rate_limit, timeout, server_error, connection, invalid_output]
+# authentication/quota_exhausted/invalid_request 默认不会自动降级；只有明确配置时才尝试其他模型。
 
 # 订阅套餐预设（三选一替换上方 provider/api_url/model_name）：
 # 百度千帆 Coding Plan:
@@ -64,8 +80,10 @@ model_profile: auto                 # auto | compact | balanced | full
 model_parameter_b: 0                # 可选：参数量（B）；模型名含 14b/70b 时可自动识别
 context_window_tokens: 0            # 0=启动时查询 LM Studio/Ollama 已加载实例的实际窗口；其他服务回退安全默认
 context_utilization: 0              # 0=自动；可选 0.40~0.90，为输出和 provider 开销留余量
-reserved_output_tokens: 0           # 0=按窗口自动；也是 API 的输出上限建议值
-native_tool_limit: 0                # 0=按 profile 自动；compact=8, balanced=20, full=全部
+reserved_output_tokens: 0           # 0=自动；DeepSeek 思考 64K、max 128K、非思考 16K；其它模型按窗口
+history_budget_tokens: 0            # 0=48K 工作历史；正数=自定义预算；-1=按模型容量（长任务更费 token）
+subagent_history_budget_tokens: 0   # 0=子 Agent 16K；正数=独立预算；-1=按模型容量
+native_tool_limit: 0                # 0=按需选择；compact=8, balanced=20, full=16；另有3个固定入口
 vision_mode: auto                   # auto|enabled|disabled；本地视觉模型向导会检测并确认；手动配置时 auto 按目录/名称保守识别
 # auto 已精确识别：deepseek-flash、deepseek-v4-flash-vision-exp、glm-5.3-flash、
 # MiniMax-M3、mimo-v2.6-pro、gpt-6-astra / gpt-6-sol / gpt-6-luna、grok-4.7、gpt-5.6、claude-opus-5-5、
@@ -73,6 +91,26 @@ vision_mode: auto                   # auto|enabled|disabled；本地视觉模型
 # 已知纯文本变体不会因同厂商而误开图片；代理/自定义模型无法识别时再显式设 enabled。
 # 例：Gemini 1M 可显式填 1048576。本地服务使用实际加载窗口而非模型卡理论上限；
 # 查询不到运行时窗口时按 32768 安全窗口运行，可显式填写实际 num_ctx/max_model_len。
+
+# DeepSeek 思考模式（仅 DeepSeek 端点生效）：
+# thinking_mode=auto/enabled 时保持官方默认思考模式；disabled 关闭思考。
+# reasoning_effort 支持 low/high/max，也兼容 minimal/medium/xhigh/ultra 的官方映射；
+# auto 不传该参数，由服务端使用默认 high。开启思考时 temperature 不生效。
+thinking_mode: auto                 # auto|enabled|disabled
+reasoning_effort: auto              # auto|none|minimal|low|medium|high|xhigh|max|ultra
+user_id: ""                         # 可选：DeepSeek 账号内用户隔离与 KV Cache 隔离，[A-Za-z0-9_-]{1,512}
+
+# DeepSeek 联网搜索（官方 Search API，POST /v1/tools/search）。
+# 默认对 DeepSeek 主模型开启；工具按需加载，只在 Agent 需要实时网页证据时调用。
+# TUI 可用 /search on|off 热切换；成功请求按 5 元/1000 次计费，条数不影响单次价格。
+search:
+  enabled: true                 # false 或 /search off 可完全关闭；关闭后 web_search 不出现在工具目录
+  base_url: ""                  # 留空：DeepSeek 主模型使用 https://api.deepseek.com
+  api_key: ""                   # 留空：复用 DeepSeek 主模型 api_key；其它主模型需单独填写
+  count: 8                      # 1-50，默认 8；不影响单次计费
+  need_content: false           # true 时默认返回网页正文；也可在单次 web_search 调用中覆盖
+  timeout_sec: 20               # 1-120 秒；408/429/5xx 会自动重试
+  localization: ""              # 可选：优先本地化搜索结果的 IP 地址
 
 use_native_tools: true
 # 内置 Go 原生工具支持热插拔：
@@ -145,7 +183,7 @@ benchmark_token: ""
 # 目标连接模式：local | ssh | telnet | ftp
 # 发布模板默认 local，避免复制后误连外部主机。切换远程模式时再填写对应 host。
 # 为空时兼容旧配置：优先 ssh_host，其次 telnet_host / ftp_host，否则本地模式。
-target_protocol: local
+target_protocol: local                   # local|ssh|sftp|telnet|ftp；sftp 复用 ssh_* 认证字段
 
 # SSH 远程模式（无端口时默认 :22）
 ssh_host: ""                              # 例："192.0.2.10:22"（文档保留地址）
@@ -155,7 +193,7 @@ ssh_key_path: ""
 ssh_key_passphrase: ""                     # 加密私钥口令；未加密可留空
 ssh_host_key_policy: accept-new            # strict | accept-new | insecure；正式环境禁止 insecure
 ssh_known_hosts_path: ~/.deepsentry/known_hosts
-ssh_legacy_compat: true                    # 默认兼容老 OpenSSH / 交换机的 ssh-rsa、DH-SHA1、CBC
+ssh_legacy_compat: true                    # 现代优先；兼容旧 SSH2 RSA/DSA、DH-SHA1、AES-192/256-CBC、3DES、MD5 MAC
 ssh_connect_timeout_sec: 25                # 老设备握手慢时可加大
 ssh_device_type: auto                      # auto | linux | huawei | h3c | ruijie | cisco | asa | juniper | fortinet | paloalto | hillstone | sangfor | checkpoint | generic
 ssh_prompt: ""                             # 网络设备交互 CLI prompt；留空自动探测
@@ -280,7 +318,7 @@ ftp_transfer_timeout_sec: 90
 #     required: false
 #     disabled: false
 #
-# HawkEye MCP 1.0.12 深度适配示例（路径换成本机实际位置）：
+# HawkEye 扩展 1.0.7 / MCP Server 1.0.14 深度适配示例（路径换成本机实际位置）：
 #   - name: hawkeye
 #     type: stdio
 #     command: node

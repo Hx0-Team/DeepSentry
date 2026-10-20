@@ -22,6 +22,7 @@ type Tool struct {
 	Description string
 	RiskLevel   string
 	Perspective string // target | controller
+	Feature     string // optional runtime feature gate
 	ArgsHint    string
 	Enabled     bool
 }
@@ -30,12 +31,13 @@ type Tool struct {
 var Registry = buildRegistry()
 
 var registryMu sync.RWMutex
+var registryRevision uint64
 
 func buildRegistry() map[string]*Tool {
 	all := []*Tool{
 		{Name: "task_wait", Category: "自动化任务", Description: "条件等待，不消耗模型轮次；下载验证大小或校验和后继续，可中止", RiskLevel: RiskLow, Perspective: PerspectiveController, ArgsHint: "mode,path,timeout_sec,interval_sec,stable_sec,expected_size,sha256"},
 		{Name: "task_context", Category: "自动化任务", Description: "保存/读取长任务工作记录，随会话 checkpoint 恢复", RiskLevel: RiskLow, Perspective: PerspectiveController, ArgsHint: "action,goal,progress,next_step,waiting_for,side_effects,evidence"},
-		{Name: "computer_use", Category: "桌面操作", Description: "桌面兜底。macOS 优先点元素索引，稀疏界面退回截图像素。", RiskLevel: RiskHigh, Perspective: PerspectiveController, ArgsHint: "action, observation_id, action_id, element_index, x, y, text, key, amount, wait_ms"},
+		{Name: "computer_use", Category: "桌面操作", Description: "桌面兜底。macOS/Windows 可 query 定向查找并优先用元素动作；无元素时使用截图像素。", RiskLevel: RiskHigh, Perspective: PerspectiveController, ArgsHint: "action, observation_id, action_id, element_index, x, y, text, role, match_mode, limit, max_nodes, key, amount, wait_ms"},
 		{Name: "ping", Category: "网络连通", Description: "TCP 探活 (Go 原生，无需 ping 命令)", RiskLevel: RiskLow, Perspective: PerspectiveController, ArgsHint: "host(必填), count(默认4)"},
 		{Name: "traceroute", Category: "网络连通", Description: "路由追踪简化版 (DNS+TCP 探活)", RiskLevel: RiskLow, Perspective: PerspectiveController, ArgsHint: "host(必填)"},
 		{Name: "dns_lookup", Category: "网络连通", Description: "DNS 解析 (Go net.Resolver)", RiskLevel: RiskLow, Perspective: PerspectiveController, ArgsHint: "host(必填), type(A/MX/NS/TXT)"},
@@ -60,17 +62,19 @@ func buildRegistry() map[string]*Tool {
 		{Name: "file_hash", Category: "系统应急", Description: "文件 SHA256 (SFTP/直读，无需 sha256sum)", RiskLevel: RiskLow, Perspective: PerspectiveTarget, ArgsHint: "path(必填)"},
 		{Name: "file_ident", Category: "取证分析", Description: "魔数/文件类型识别 (无需 file 命令)", RiskLevel: RiskLow, Perspective: PerspectiveTarget, ArgsHint: "path(必填)"},
 		{Name: "file_strings", Category: "取证分析", Description: "提取可打印字符串 (无需 strings 命令)", RiskLevel: RiskLow, Perspective: PerspectiveTarget, ArgsHint: "path(必填), min_len(默认4), limit, pattern"},
-		{Name: "document_parse", Category: "文档解析", Description: "原生解析 PDF/Word DOCX/Excel XLSX/XLS/CSV/RTF，提取文本、表格和元信息", RiskLevel: RiskLow, Perspective: PerspectiveTarget, ArgsHint: "path(必填), mode(auto|text|tables|metadata), max_text, max_rows, max_sheets"},
+		{Name: "document_parse", Category: "文档解析", Description: "结构化读取 PDF/Word DOCX/Excel XLSX/XLS/PPTX/CSV/RTF：正文、表格、公式、工作表、幻灯片与备注；offset 分页。图片不等于已做视觉理解", RiskLevel: RiskLow, Perspective: PerspectiveTarget, ArgsHint: "path(必填), mode(auto|text|tables|metadata), max_text, max_rows, max_sheets, offset"},
+		{Name: "document_create", Category: "文档解析", Description: "生成通用商务/安全 DOCX、Excel XLSX（多表/公式）、PPTX（要点/备注）、中文 PDF；只新建控制端文件，不覆盖；自动回读和 SHA256 核验", RiskLevel: RiskMedium, Perspective: PerspectiveController, ArgsHint: "path(必填), format(docx|xlsx|pptx|pdf), spec(必填JSON对象)"},
 		{Name: "chat_send_file", Category: "聊天文件", Description: "把本机文件发到当前聊天（微信/QQ）。仅聊天机器人任务可用；path 用本机绝对路径，例如桌面上的文件", RiskLevel: RiskLow, Perspective: PerspectiveController, ArgsHint: "path(必填), name(可选)"},
 		{Name: "read_gzip", Category: "取证分析", Description: "分析 gzip 压缩或轮转日志，无需 zcat/gunzip", RiskLevel: RiskLow, Perspective: PerspectiveTarget, ArgsHint: "path(必填), lines(默认200), pattern"},
 		{Name: "read_log", Category: "取证分析", Description: "智能读日志 (自动识别 plain/gzip)", RiskLevel: RiskLow, Perspective: PerspectiveTarget, ArgsHint: "path(必填), lines(默认200), pattern"},
 		{Name: "nmap_scan", Category: "端口扫描", Description: "Go TCP 端口扫描 (无需 nmap)", RiskLevel: RiskHigh, Perspective: PerspectiveController, ArgsHint: "host(必填), ports, mode(quick)"},
 		{Name: "cidr_scan", Category: "内网发现", Description: "fscan-like 轻量 TCP 内网发现，限制主机数/并发，不做漏洞探测", RiskLevel: RiskHigh, Perspective: PerspectiveController, ArgsHint: "cidr(必填), ports(可选), timeout, limit(默认256最大1024)"},
 		{Name: "netcat_probe", Category: "协议探测", Description: "TCP 端口探活 (Go net.Dial)", RiskLevel: RiskMedium, Perspective: PerspectiveController, ArgsHint: "host(必填), port(必填)"},
-		{Name: "http_probe", Category: "协议探测", Description: "HTTP 探测 (Go net/http)", RiskLevel: RiskMedium, Perspective: PerspectiveController, ArgsHint: "url(必填), method(HEAD|GET)"},
+		{Name: "http_probe", Category: "协议探测", Description: "HTTP 状态/响应头探测；HEAD 不含正文，GET 含最多8KiB正文预览，可直接核验公开接口", RiskLevel: RiskMedium, Perspective: PerspectiveController, ArgsHint: "url(必填), method(HEAD|GET)"},
 		{Name: "http_fetch", Category: "Web探测", Description: "Go 原生 curl/wget 替代，只支持 GET/HEAD，返回响应头和有限正文", RiskLevel: RiskMedium, Perspective: PerspectiveController, ArgsHint: "url(必填), method(GET|HEAD), max_bytes"},
+		{Name: "web_search", Category: "联网搜索", Feature: FeatureWebSearch, Description: "DeepSeek 官方 Search API：检索实时网页、新闻、公告、版本与漏洞信息，返回标题、URL、摘要和权威评分。仅在需要互联网实时证据时调用；需要正文时再设 need_content=true。", RiskLevel: RiskLow, Perspective: PerspectiveController, ArgsHint: "query(必填), count(1-50), ori_question, need_content, localization"},
 		{Name: "web_snapshot", Category: "Web探测", Description: "网页快照解析：title/meta/forms/scripts/links/headers", RiskLevel: RiskMedium, Perspective: PerspectiveController, ArgsHint: "url(必填), max_bytes"},
-		{Name: "headless_browser", Category: "Web探测", Description: "控制端无头 Chrome/Chromium 渲染解析，失败自动降级静态快照", RiskLevel: RiskMedium, Perspective: PerspectiveController, ArgsHint: "url(必填), mode(snapshot|text|forms|links|screenshot), wait_ms, selector, max_text, screenshot"},
+		{Name: "headless_browser", Category: "Web探测", Description: "需要JavaScript的HTML页面渲染/截图；JSON/API/纯文本用http_fetch GET，避免浏览器启动与超时", RiskLevel: RiskMedium, Perspective: PerspectiveController, ArgsHint: "url(必填), mode(snapshot|text|forms|links|screenshot), wait_ms, selector, max_text, screenshot"},
 		{Name: "browser_browse", Category: "浏览器控制", Description: "启动隔离的可见 Chrome 或无头会话并持续浏览：分页快照、按 @ref 低风险跟进超链接、导航、截图、前进后退；缺少浏览器时返回安装引导", RiskLevel: RiskLow, Perspective: PerspectiveController, ArgsHint: "action(status|list|open|navigate|follow|snapshot|screenshot|back|forward|reload|wait|close), session_id, url, mode(auto|visible|headless), selector, wait_ms, max_text, text_offset, element_offset, element_limit"},
 		{Name: "browser_interact", Category: "浏览器控制", Description: "在受控浏览器会话中点击按钮、输入、选择或按键；普通超链接优先用低风险 browser_browse follow；交互必须使用快照 @ref/CSS selector", RiskLevel: RiskHigh, Perspective: PerspectiveController, ArgsHint: "action(click|type|select|key), session_id, selector, text, value, key, clear, submit, wait_ms, max_text, text_offset, element_offset, element_limit"},
 		{Name: "flow_snapshot", Category: "抓包分析", Description: "连接流快照对比 (/proc，替代 tcpdump)", RiskLevel: RiskLow, Perspective: PerspectiveTarget, ArgsHint: "interval秒(默认2)"},
@@ -103,7 +107,7 @@ func buildRegistry() map[string]*Tool {
 		{Name: "http_proxy", Category: "代理转发", Description: "在本机开启 HTTP 代理 start/list/stop，支持 CONNECT 和普通 HTTP 转发，供用户流量接入；不是控制端出站 -proxy", RiskLevel: RiskHigh, Perspective: PerspectiveController, ArgsHint: "action(start|list|stop), listen_host(默认127.0.0.1), listen_port(默认8080), username, password, allow_lan"},
 		{Name: "inspection_run", Category: "设备巡检", Description: "设备清单供 HawkEye 巡检；一键把当前/指定 Markdown 审计报告编成 Word；也支持固定检查采集。生成 Word 不必手写 JSON", RiskLevel: RiskMedium, Perspective: PerspectiveController, ArgsHint: "action(inventory|collect|report), selector, source(可选 .md/.json；report 省略则用最新会话报告)"},
 		{Name: "schedule_task", Category: "自动化任务", Description: "用 task、interval_sec 或 run_at 创建定时任务，不从正文猜测时间。/schedule 可查看、修改、取消、重置、删除", RiskLevel: RiskMedium, Perspective: PerspectiveController, ArgsHint: "action(plan|add|list|show|edit|cancel|resume|reset|remove|run), task, interval_sec, reply_text, run_at, repeat, id, confirm_create(add必填), allow_batch, confirm_unattended(无人值守Agent必填)"},
-		{Name: "config_manage", Category: "配置管理", Description: "受控维护控制端 config.yaml：查看/读取/校验/备份/修复替换、全局或按名称启停 Skill、维护 skill_sources、mcp_servers、SSH/Telnet/FTP/Fleet 目标；写入前自动备份", RiskLevel: RiskHigh, Perspective: PerspectiveController, ArgsHint: "action(status|get|validate|backup|disable_skills|enable_skills|disable_skill|enable_skill|add_skill_source|add_mcp_server|add_target|enable_fleet|set_ssh|set|replace_yaml), config_path, key, name, source, spec, protocol, host, port, user, password, key_path, tags, content；添加目标推荐分开传 host 和 port；已有单台配置转 Fleet 用 enable_fleet"},
+		{Name: "config_manage", Category: "配置管理", Description: "配置 DeepSentry 自身/你自己的设置：控制端 config.yaml 状态、实际主模型、describe 字段说明、patch 批量局部更新、dry_run 预览；查看/校验/备份/修复替换、全局或按名称启停 Skill、维护 skill_sources、mcp_servers、SSH/Telnet/FTP/Fleet 目标；写入前自动备份", RiskLevel: RiskHigh, Perspective: PerspectiveController, ArgsHint: "action(status|describe|get|patch|probe_ssh|probe_proxy|validate|backup|disable_skills|enable_skills|disable_skill|enable_skill|add_skill_source|add_mcp_server|add_target|enable_fleet|set_ssh|set|replace_yaml), config_path, key, value, changes(JSON对象), model_id(primary或ID), dry_run, name, source, spec, protocol, host, port, user, password, key_path, tags, content；添加目标推荐分开传 host 和 port；已有单台配置转 Fleet 用 enable_fleet"},
 		{Name: "skill_market", Category: "配置管理", Description: "导入本地 .skill，并跨 ClawHub / skills.sh 搜索、审查、安装、更新和可恢复回滚 Agent Skill；全程记录来源锁", RiskLevel: RiskHigh, Perspective: PerspectiveController, ArgsHint: "action(search|inspect|install|import|managed|check_updates|update|pin|unpin|uninstall|rollback|audit), query, market, source, name, version, confirm_install/update/remove/rollback, acknowledge_risk, force, dest"},
 		{Name: "mcp_resource", Category: "配置管理", Description: "列出或读取已连接 MCP Server 暴露的 Resource", RiskLevel: RiskLow, Perspective: PerspectiveController, ArgsHint: "action(list|read), server, uri"},
 		{Name: "mcp_prompt", Category: "配置管理", Description: "列出或获取已连接 MCP Server 暴露的 Prompt 模板", RiskLevel: RiskLow, Perspective: PerspectiveController, ArgsHint: "action(list|get), server, name, 以及模板参数"},
@@ -123,6 +127,7 @@ func buildRegistry() map[string]*Tool {
 func ConfigureEnabled(enabled, disabled []string) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
+	registryRevision++
 
 	if len(enabled) == 0 && len(disabled) == 0 {
 		for _, t := range Registry {
@@ -155,5 +160,12 @@ func SetEnabled(name string, enabled bool) bool {
 		return false
 	}
 	t.Enabled = enabled
+	registryRevision++
 	return true
+}
+
+func Revision() uint64 {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	return registryRevision
 }

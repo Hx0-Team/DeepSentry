@@ -24,7 +24,7 @@ func TestFormatCatalog(t *testing.T) {
 
 func TestRegistryCount(t *testing.T) {
 	ConfigureEnabled(nil, nil)
-	const releaseToolCount = 77
+	const releaseToolCount = 79
 	if got := CountEnabled(); got != releaseToolCount {
 		t.Fatalf("enabled tool count = %d, want release count %d; update the release docs and this gate together", got, releaseToolCount)
 	}

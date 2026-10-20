@@ -95,6 +95,7 @@ var bannerTips = []string{
 	"tool_catalog name=config_manage 可返回动作、必填字段和可复制示例",
 	"内置工具参数会运行时校验，错误会返回合法字段与修正示例",
 	"小模型每轮只看核心与任务相关 schema，其余工具仍可按需发现",
+	"需要最新公告/版本时用 web_search；/search on|off 可开关 DeepSeek 联网搜索",
 	"说“帮我添加 SSH 服务器”，Agent 会用 config_manage 受控写入配置",
 	"config_manage 修改 config.yaml 前会自动创建权限受控备份",
 	"添加 SSH 目标时 host 和 port 可分开传，避免默认连到 22 端口",

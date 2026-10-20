@@ -15,6 +15,15 @@ import (
 	"github.com/spf13/viper"
 )
 
+func TestSingleTargetSFTPWizardAppliesFileModeAndKeyPassphrase(t *testing.T) {
+	viper.Reset()
+	defer viper.Reset()
+	applySingleTargetConfig(config.TargetConfig{Protocol: "sftp", Host: "192.0.2.3:2222", User: "files", KeyPath: "/tmp/lab-id", KeyPassphrase: "fixture-passphrase"})
+	if viper.GetString("target_protocol") != "sftp" || viper.GetString("ssh_host") != "192.0.2.3:2222" || viper.GetString("ssh_key_passphrase") != "fixture-passphrase" {
+		t.Fatal("SFTP wizard changed protocol or lost encrypted-key auth")
+	}
+}
+
 func TestSwitchToLocalModeClearsProtocolAndRemoteFields(t *testing.T) {
 	tmp := t.TempDir()
 	oldWD, err := os.Getwd()
@@ -152,7 +161,7 @@ func TestWizardRecommendedProviderIsFirstAndVisionCapable(t *testing.T) {
 		t.Fatalf("unexpected recommended preset: %#v", preset)
 	}
 	capabilities := (config.Config{Provider: string(preset.ID), ModelName: preset.Model}).EffectiveModelCapabilities()
-	if !capabilities.SupportsVision || capabilities.ContextWindowTokens != 1_000_000 {
+	if !capabilities.SupportsVision || capabilities.ContextWindowTokens != 1_048_576 {
 		t.Fatalf("recommended model capabilities=%#v", capabilities)
 	}
 }

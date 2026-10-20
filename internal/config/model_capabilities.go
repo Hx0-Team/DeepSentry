@@ -89,7 +89,9 @@ func (c Config) EffectiveModelCapabilities() ModelCapabilities {
 		source = "local-runtime"
 	}
 	if window <= 0 {
-		if preset, ok := FindModelPreset(c.Provider, c.ModelName); ok && preset.ContextWindowTokens > 0 {
+		if info, ok := LookupDeepSeekModel(c.Provider, c.ModelName); ok && c.IsDeepSeek() && info.ContextWindowTokens > 0 {
+			window, source = info.ContextWindowTokens, "model-catalog"
+		} else if preset, ok := FindModelPreset(c.Provider, c.ModelName); ok && preset.ContextWindowTokens > 0 {
 			window, source = preset.ContextWindowTokens, "model-catalog"
 		} else if hinted := inferContextWindow(c.ModelName); hinted > 0 {
 			window, source = hinted, "model-name"
@@ -128,6 +130,9 @@ func (c Config) EffectiveModelCapabilities() ModelCapabilities {
 	utilization = math.Max(0.40, math.Min(0.90, utilization))
 
 	reserved := c.ReservedOutputTokens
+	if reserved <= 0 && c.IsDeepSeek() {
+		reserved = c.deepSeekReservedOutputTokens(window)
+	}
 	if reserved <= 0 {
 		switch {
 		case window <= 16_384:
@@ -191,6 +196,11 @@ func (c Config) effectiveVisionCapability() (bool, string) {
 		return false, "config"
 	}
 	model := strings.ToLower(strings.TrimSpace(c.ModelName))
+	if c.IsDeepSeek() {
+		if info, ok := LookupDeepSeekModel(c.Provider, c.ModelName); ok {
+			return info.SupportsVision, "model-catalog"
+		}
+	}
 	if preset, ok := FindModelPreset(c.Provider, c.ModelName); ok {
 		return preset.SupportsVision, "model-catalog"
 	}
@@ -213,6 +223,20 @@ func (m ModelCapabilities) HistoryBudgetTokens(systemPromptTokens int) int {
 	target := int(float64(m.ContextWindowTokens) * m.ContextUtilization)
 	budget := target - m.ReservedOutputTokens - maxInt(0, systemPromptTokens)
 	return maxInt(1_024, budget)
+}
+
+// RequestHistoryBudgetTokens separates affordable working history from the
+// model's maximum capacity. Operators can opt back into capacity-sized history.
+func (c Config) RequestHistoryBudgetTokens(requestOverheadTokens int) int {
+	capacity := c.EffectiveModelCapabilities().HistoryBudgetTokens(requestOverheadTokens)
+	if c.HistoryBudgetTokens < 0 {
+		return capacity
+	}
+	budget := c.HistoryBudgetTokens
+	if budget == 0 {
+		budget = 48_000
+	}
+	return minInt(capacity, maxInt(1_024, budget))
 }
 
 func (m ModelCapabilities) SystemPromptBudgetTokens() int {

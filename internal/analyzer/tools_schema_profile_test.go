@@ -106,7 +106,27 @@ func TestDeferredConfigManageRequiresExplicitProductConfigIntent(t *testing.T) {
 	}
 }
 
-func TestRuntimeV3PinsStructuredToolResultsAndLegacyRemainsFull(t *testing.T) {
+func TestSelfConfigNaturalIntentIsRetrieved(t *testing.T) {
+	for _, query := range []string{"把你自己的历史预算改成 24000", "给你添加一个 MCP", "修改你的模型和接口", "配置你自己，用亮色主题", "调整你自身配置的执行预算"} {
+		if !SelfConfigIntent(query) {
+			t.Fatalf("self intent missed: %s", query)
+		}
+		found := false
+		for _, definition := range AgentToolDefinitionsForContextWithPinned(runtimeV3DeferredToolLimit, query, nil) {
+			found = found || definition.Function.Name == "config_manage"
+		}
+		if !found {
+			t.Fatalf("self tool not retrieved: %s", query)
+		}
+	}
+	for _, query := range []string{"你自己检查服务器的 Redis 日志", "配置目标机 nginx", "看一下服务器模型接口配置"} {
+		if SelfConfigIntent(query) {
+			t.Fatalf("server task confused with self config: %s", query)
+		}
+	}
+}
+
+func TestBothRuntimesBoundToolsAndPinStructuredResults(t *testing.T) {
 	base := config.Config{Provider: "custom", APIProtocol: config.ProtocolOpenAIChat, ApiURL: "https://example.com/v1", ModelName: "large", ContextWindowTokens: 1_048_576}
 	messages := []Message{{Role: "tool", Name: "network_device_diagnose", ToolCallID: "call_1", Content: "ok"}}
 	base.AgentRuntime = "v3"
@@ -120,8 +140,12 @@ func TestRuntimeV3PinsStructuredToolResultsAndLegacyRemainsFull(t *testing.T) {
 	}
 	base.AgentRuntime = "legacy"
 	legacy := nativeToolDefinitionsForRequest(base, messages)
-	if len(legacy) <= len(v3) {
-		t.Fatalf("legacy definitions=%d should remain larger than bounded v3=%d", len(legacy), len(v3))
+	if len(legacy) != len(v3) {
+		t.Fatalf("legacy definitions=%d should share bounded v3=%d", len(legacy), len(v3))
+	}
+	base.NativeToolLimit = 1000
+	if explicit := nativeToolDefinitionsForRequest(base, []Message{{Role: "user", Content: "process_list"}}); len(explicit) == 0 {
+		t.Fatal("explicit tool limit should remain configurable")
 	}
 }
 

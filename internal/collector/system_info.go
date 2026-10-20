@@ -32,6 +32,14 @@ type SystemContext struct {
 // GetSystemContext 采集系统信息 (针对当前 Executor 指向的目标)
 func GetSystemContext() SystemContext {
 	ctx := SystemContext{}
+	if executor.CurrentMode() == "sftp" {
+		ctx.OS = "SFTP 文件服务"
+		ctx.Arch = "unknown"
+		ctx.Hostname = "通过文件服务连接"
+		ctx.DeviceProtocol = "sftp"
+		ctx.Shell = "无远程 Shell"
+		return ctx
+	}
 	if reporter, ok := executor.Current.(executor.NetworkDeviceReporter); ok {
 		info := reporter.NetworkDeviceInfo()
 		if info.Vendor != "" && info.Vendor != "linux" {
@@ -188,6 +196,36 @@ func GetSystemContext() SystemContext {
 }
 
 // GenerateSystemPrompt 生成 Prompt (核心大脑配置)
+// GenerateAgentSystemPrompt contains stable environment facts only. The agent
+// owns its action protocol, so repeating that protocol here wastes context and
+// can contradict native tool calling. Keep the clock out of the cached prefix.
+func (ctx SystemContext) GenerateAgentSystemPrompt() string {
+	mode := "local"
+	if executor.Current != nil && executor.Current.IsRemote() {
+		mode = executor.CurrentMode()
+	}
+	role := "普通用户"
+	if ctx.IsRoot {
+		role = "管理员"
+	}
+	prompt := fmt.Sprintf(`
+【系统架构感知】
+控制端: %s/%s；连接模式: %s。
+目标: %s/%s；主机: %s；用户: %s (%s)；内核: %s；资源: %s。
+execute 默认在目标执行，local_run 前缀在控制端执行；不要混淆两端路径或命令语法。控制端 Windows 用 CMD/PowerShell，macOS/Linux 用对应 Shell。
+已配置远程目标通过 fleet_exec/fleet_file/target_selector 访问，禁止裸 ssh/scp/sftp。传输命令为 upload <本地> <远程> 或 download <远程> <本地>。
+FTP 不支持 Shell，使用 file_download/file_upload/read_file/ls。不得脑补结果；日志时间线以控制端当前时间与明确的时区为基准。
+`, runtime.GOOS, runtime.GOARCH, mode, ctx.OS, ctx.Arch, ctx.Hostname, ctx.Username, role, ctx.KernelVersion, ctx.MemoryStatus)
+	if ctx.DeviceType != "" {
+		prompt += networkDevicePromptGuidance(ctx.DeviceType)
+	}
+	return prompt
+}
+
+func CurrentTimePrompt() string {
+	return "\n【控制端当前时间】" + formatLocalTime() + "\n"
+}
+
 func (ctx SystemContext) GenerateSystemPrompt() string {
 	userRole := "普通用户"
 	if ctx.IsRoot {
@@ -210,6 +248,9 @@ func (ctx SystemContext) GenerateSystemPrompt() string {
 				targetDesc = fmt.Sprintf("你正在通过 %s 操作 %s 网络设备，当前 prompt=%s", protocol, networkDeviceOS(ctx.DeviceType), ctx.DevicePrompt)
 				networkGuidance = networkDevicePromptGuidance(ctx.DeviceType)
 			}
+		case "sftp":
+			connectionType = "SFTP 远程连接（仅文件）"
+			targetDesc = "通过 SSH2 的 SFTP 子系统操作远程文件；仅目录/文件读取、上传、下载，不可执行 Shell 命令。使用文件工具，不要反复尝试 uname/bash。"
 		case "ftp":
 			connectionType = "FTP 远程连接 (FTP Mode)"
 			targetDesc = "你正在通过 FTP 操作远程主机；仅适合目录/文件读取、上传、下载，不支持 shell 命令执行"

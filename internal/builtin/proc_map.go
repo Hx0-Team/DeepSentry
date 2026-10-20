@@ -24,7 +24,7 @@ func ProcSocketMap(rt Runtime, filter string, limit int) (string, error) {
 	if limit > 300 {
 		limit = 300
 	}
-	sockets, err := readAllSockets()
+	sockets, err := rt.readAllSockets()
 	if err != nil {
 		return "", err
 	}
@@ -47,7 +47,7 @@ func ProcSocketMap(rt Runtime, filter string, limit int) (string, error) {
 	}
 	owners := map[string]procOwner{}
 	if filter == "owned" {
-		owners = buildSocketOwners(neededInodes)
+		owners = rt.buildSocketOwners(neededInodes)
 	}
 
 	var b strings.Builder
@@ -84,12 +84,12 @@ func ProcSocketMap(rt Runtime, filter string, limit int) (string, error) {
 	return b.String(), nil
 }
 
-func buildSocketOwners(wanted map[string]struct{}) map[string]procOwner {
+func (rt Runtime) buildSocketOwners(wanted map[string]struct{}) map[string]procOwner {
 	owners := map[string]procOwner{}
 	if len(wanted) == 0 {
 		return owners
 	}
-	pids, err := listTarget("/proc")
+	pids, err := rt.listTarget("/proc")
 	if err != nil {
 		return owners
 	}
@@ -99,13 +99,13 @@ func buildSocketOwners(wanted map[string]struct{}) map[string]procOwner {
 			continue
 		}
 		fdDir := filepath.Join("/proc", pid, "fd")
-		fds, err := listTarget(fdDir)
+		fds, err := rt.listTarget(fdDir)
 		if err != nil {
 			continue
 		}
-		owner := procOwner{PID: pid, Comm: readProcText(filepath.Join("/proc", pid, "comm")), Cmdline: readProcCmdline(pid)}
+		owner := procOwner{PID: pid, Comm: rt.readProcText(filepath.Join("/proc", pid, "comm")), Cmdline: rt.readProcCmdline(pid)}
 		for _, fd := range fds {
-			link, err := readTargetLink(filepath.Join(fdDir, fd))
+			link, err := rt.readTargetLink(filepath.Join(fdDir, fd))
 			if err != nil {
 				continue
 			}
@@ -127,16 +127,16 @@ func buildSocketOwners(wanted map[string]struct{}) map[string]procOwner {
 	return owners
 }
 
-func readProcText(path string) string {
-	data, err := readTarget(path)
+func (rt Runtime) readProcText(path string) string {
+	data, err := rt.readTarget(path)
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
 }
 
-func readProcCmdline(pid string) string {
-	data, err := readTarget(filepath.Join("/proc", pid, "cmdline"))
+func (rt Runtime) readProcCmdline(pid string) string {
+	data, err := rt.readTarget(filepath.Join("/proc", pid, "cmdline"))
 	if err != nil {
 		return ""
 	}

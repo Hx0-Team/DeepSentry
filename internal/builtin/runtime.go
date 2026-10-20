@@ -2,10 +2,10 @@ package builtin
 
 import (
 	"ai-edr/internal/executor"
+	"context"
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"unicode/utf8"
 )
 
@@ -14,6 +14,7 @@ type Runtime struct {
 	IsWindows bool
 	IsRemote  bool
 	Exec      executor.Executor
+	Context   context.Context
 }
 
 // NewRuntime 从系统指纹构造运行时
@@ -32,24 +33,24 @@ func (rt Runtime) tag() string {
 	return "[Go内置·本地]"
 }
 
-func readTarget(path string) ([]byte, error) {
-	ex := currentRuntimeExec()
+func (rt Runtime) readTarget(path string) ([]byte, error) {
+	ex := rt.executor()
 	if ex == nil {
 		return nil, fmt.Errorf("执行器未初始化")
 	}
 	return ex.ReadTargetFile(path)
 }
 
-func listTarget(path string) ([]string, error) {
-	ex := currentRuntimeExec()
+func (rt Runtime) listTarget(path string) ([]string, error) {
+	ex := rt.executor()
 	if ex == nil {
 		return nil, fmt.Errorf("执行器未初始化")
 	}
 	return ex.ListTargetDir(path)
 }
 
-func isTargetDir(path string) bool {
-	ex := currentRuntimeExec()
+func (rt Runtime) isTargetDir(path string) bool {
+	ex := rt.executor()
 	if ex == nil {
 		return false
 	}
@@ -64,8 +65,8 @@ func isTargetDir(path string) bool {
 	return strings.Contains(out, "__DIR__")
 }
 
-func readTargetLink(path string) (string, error) {
-	ex := currentRuntimeExec()
+func (rt Runtime) readTargetLink(path string) (string, error) {
+	ex := rt.executor()
 	if ex == nil {
 		return "", fmt.Errorf("执行器未初始化")
 	}
@@ -79,31 +80,24 @@ func readTargetLink(path string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-var (
-	runtimeExecMu       sync.Mutex
-	runtimeExecOverride executor.Executor
-)
-
-func lockRuntimeExecutor(ex executor.Executor) func() {
-	runtimeExecMu.Lock()
-	runtimeExecOverride = ex
-	return func() {
-		runtimeExecOverride = nil
-		runtimeExecMu.Unlock()
-	}
-}
-
 func WithExecutor(rt Runtime, ex executor.Executor) Runtime {
 	rt.Exec = ex
 	rt.IsRemote = ex != nil && ex.IsRemote()
 	return rt
 }
 
-func currentRuntimeExec() executor.Executor {
-	if runtimeExecOverride != nil {
-		return runtimeExecOverride
+func (rt Runtime) executor() executor.Executor {
+	if rt.Exec != nil {
+		return rt.Exec
 	}
 	return executor.Current
+}
+
+func (rt Runtime) context() context.Context {
+	if rt.Context != nil {
+		return rt.Context
+	}
+	return context.Background()
 }
 
 func shellQuote(s string) string {

@@ -38,3 +38,17 @@ Thumbs.db
 # Go test/build leftovers
 *.test
 *.prof
+
+# Local publication materials and development evidence
+/publication/
+/computer-use-helper
+/Deepsentry2.0.4海报.png
+/wechat-article-publish.skill
+/docs/validation-*/
+/docs/Agent-进阶优化计划.md
+/docs/Agent-进阶优化验收-20261014.md
+/docs/Agent-进阶发布核验-20261014.json
+/docs/Computer-Use-OCU研究与优化-20261014.md
+/docs/Token-优化验收-2.0.6.md
+/docs/自身配置优化验收-20261014.md
+/docs/远程连接与代理兼容验收-20261014.md

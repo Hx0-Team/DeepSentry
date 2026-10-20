@@ -35,16 +35,16 @@ func validateReadPath(path string) error {
 	return nil
 }
 
-func readTargetLimited(path string, max int) ([]byte, error) {
+func (rt Runtime) readTargetLimited(path string, max int) ([]byte, error) {
 	if err := validateReadPath(path); err != nil {
 		return nil, err
 	}
-	if ex := currentRuntimeExec(); ex != nil && !ex.IsRemote() && max > 0 {
+	if ex := rt.executor(); ex != nil && !ex.IsRemote() && max > 0 {
 		if st, err := os.Stat(path); err == nil && !st.IsDir() && st.Size() > int64(max) {
 			return nil, fmt.Errorf("文件过大 (%d 字节，上限 %d)", st.Size(), max)
 		}
 	}
-	data, err := readTarget(path)
+	data, err := rt.readTarget(path)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +56,7 @@ func readTargetLimited(path string, max int) ([]byte, error) {
 
 // FileIdentify 魔数/文件类型识别（Go 原生，无需 file 命令）
 func FileIdentify(rt Runtime, path string) (string, error) {
-	data, err := readTargetLimited(path, 512*1024) // 读前 512KB 足够识别
+	data, err := rt.readTargetLimited(path, 512*1024) // 读前 512KB 足够识别
 	if err != nil {
 		return "", err
 	}
@@ -101,7 +101,7 @@ func FileIdentify(rt Runtime, path string) (string, error) {
 
 // FileStrings 提取可打印字符串（Go 原生，无需 strings 命令）
 func FileStrings(rt Runtime, path string, minLen, limit int, pattern string) (string, error) {
-	data, err := readTargetLimited(path, maxStringsScan)
+	data, err := rt.readTargetLimited(path, maxStringsScan)
 	if err != nil {
 		return "", err
 	}
@@ -223,7 +223,7 @@ func dedupeStrings(in []string) []string {
 
 // ReadGzip 解压读取 gzip 日志（Go 原生，无需 zcat/gunzip）
 func ReadGzip(rt Runtime, path string, lines int, pattern string) (string, error) {
-	raw, err := readTargetLimited(path, maxForensicRead)
+	raw, err := rt.readTargetLimited(path, maxForensicRead)
 	if err != nil {
 		return "", err
 	}
@@ -247,7 +247,7 @@ func ReadGzip(rt Runtime, path string, lines int, pattern string) (string, error
 
 // ReadLog 智能读日志（自动识别 plain/gzip）
 func ReadLog(rt Runtime, path string, lines int, pattern string) (string, error) {
-	raw, err := readTargetLimited(path, maxForensicRead)
+	raw, err := rt.readTargetLimited(path, maxForensicRead)
 	if err != nil {
 		return "", err
 	}

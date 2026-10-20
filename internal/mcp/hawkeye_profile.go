@@ -13,7 +13,7 @@ import (
 )
 
 // HawkEyeToolProfile is DeepSentry's local contract for the public HawkEye
-// MCP 1.0.12 tool surface. Server annotations remain useful evidence, but this
+// extension 1.0.7 / MCP Server 1.0.14 tool surface. Server annotations remain useful evidence, but this
 // allow-list is what permits action-aware routing and approvals; an arbitrary
 // third-party MCP server cannot become trusted merely by setting readOnlyHint.
 type HawkEyeToolProfile struct {
@@ -44,6 +44,7 @@ var hawkEyeToolProfiles = map[string]HawkEyeToolProfile{
 	"browser_file_upload": {"interaction", 560}, "browser_download_file": {"evidence", 570},
 	"browser_drag": {"interaction", 540}, "browser_scroll": {"interaction", 630},
 	"browser_read_text": {"browser", 910},
+	"browser_bookmarks": {"browser", 730},
 
 	"hawkeye_capture_start": {"capture", 970}, "hawkeye_capture_stop": {"capture", 740},
 	"hawkeye_capture_state": {"capture", 980}, "hawkeye_capture_history": {"capture", 960},
@@ -54,6 +55,7 @@ var hawkEyeToolProfiles = map[string]HawkEyeToolProfile{
 	"hawkeye_codec": {"utility", 510}, "hawkeye_script_list": {"script", 470},
 	"hawkeye_script_run": {"script", 450}, "hawkeye_evaluate": {"script", 300},
 	"hawkeye_script_upsert": {"script", 430}, "hawkeye_sensitive_scan": {"audit", 800},
+	"hawkeye_script_manage": {"script", 480},
 	"hawkeye_darklink_scan": {"audit", 790}, "hawkeye_intercept": {"intercept", 920},
 }
 
@@ -65,7 +67,7 @@ func hawkEyeOriginalName(tool *ExternalTool) string {
 }
 
 // HawkEyeKnownToolNames returns a stable copy for contract tests and operator
-// diagnostics. It intentionally lists every public 1.0.12 tool, not just the
+// diagnostics. It intentionally lists every public 1.0.14 tool, not just the
 // small subset most often used in prompts.
 func HawkEyeKnownToolNames() []string {
 	names := make([]string, 0, len(hawkEyeToolProfiles))
@@ -193,21 +195,61 @@ func HawkEyeToolDescriptionOverlay(name string) string {
 	case "browser_tabs":
 		return "DeepSentry: list 不绑定。整次任务最多 new 一次；已打开的页用 select。禁止用 tabs/new 代替 navigate。"
 	case "browser_snapshot":
-		return "DeepSentry: 先 snapshot 再交互。默认视口内 compact 树。只看本轮无障碍树，不要 read_file artifact。下一步用 diff=true。翻页只传 page_token=context.next_page_token，不要带 cursor 或其他参数。"
+		return "DeepSentry: 首次 snapshot，后续优先 find 或 diff=true；boxes 仅需坐标时开。默认视口 compact 树。翻页只传 page_token=context.next_page_token（2分钟有效），不带其他参数；不要 read_file artifact。"
 	case "browser_find":
 		return "DeepSentry: 大页面定位优先 find，不要把 snapshot 落盘后再 grep。翻页同样只传 page_token。"
 	case "browser_search":
-		return "DeepSentry: 具体问题必须带搜索运算符，不要只丢关键词。用 \"精确短语\"、site:、filetype:、intitle:、年份范围 2020..2025、空格加 -排除。中文论坛可加 site:zhihu.com / tieba.baidu.com；CVE/威胁情报加 site:threatbook.cn 或 virustotal.com。首页嘈杂就改写运算符再搜。"
+		return "DeepSentry: 新查询必须 query 或 queries；使用精确短语/site:/filetype:/排除词。maxFetches=0..7，concurrency=auto或1..7，按证据需求选择。证据不足才改写；blockedByChallenge/degraded/stale 不代表核实。翻页只传 page_token。"
 	case "browser_research":
-		return "DeepSentry: 公开网页取证闭环。queries 同样要带搜索运算符。结果不够就换运算符/引擎，不要只翻第一页。"
+		return "DeepSentry: 新调用必需 prompt。queries 用搜索运算符；maxPages=1..15，concurrency=auto或1..7，简单问题少读来源。核验实际正文与缺口，不把 evidenceScore 当真实性。"
 	case "browser_fetch":
 		return "DeepSentry: 隔离临时标签拉取公开页正文。默认会写入 HawkEye 抓包历史；只要正文可设 capture=false。私网地址会被拒绝。"
 	case "browser_security":
 		return "DeepSentry: 读当前页 TLS/证书结构化证据。不要用截图或正文推断证书是否可信。证据缺失时 refresh=true 做一次诊断刷新。"
 	case "browser_captcha_assist":
 		return "DeepSentry: 自有/登录图验证码必须走这个工具。先 action=analyze 看放大裁图，只认大号深色前景字，忽略彩线和浅色底纹。禁止 hawkeye_evaluate 像素、禁止下载 img src、禁止点击图片（会刷新）。再 action=solve authorized=true answer=识别结果。滑块用 suggestedOffsetRatio。reCAPTCHA/hCaptcha/Turnstile 等第三方挑战只报 manual_required，让用户手过。"
+	case "browser_fill_form":
+		return "DeepSentry: 批量填表优先 fill_form，不要用 browser_type 逐项填。submit=false 先填写并核验；submit=true 会提交，涉及生产/不可逆表单时先获得用户明确授权。"
+	case "browser_exam_questions":
+		return "DeepSentry: 先提取题目、选项和 frame-scoped refs，再用 browser_answer_questions 填答案，默认不会提交。cursor 用于分页，不要用 snapshot 硬抠题目。"
+	case "browser_answer_questions":
+		return "DeepSentry: 只填写答案，不提交。按 index/text 匹配题目，填完先核验；需要提交时另用 browser_fill_form submit=true 或明确的点击动作。"
+	case "browser_handle_dialog":
+		return "DeepSentry: 先读取最近 alert/confirm/prompt 证据；accept 可能确认删除、覆盖或提交，涉及副作用先问用户；dismiss 只取消。clear 会清理本地对话框记录。"
+	case "browser_file_upload":
+		return "DeepSentry: 只上传用户明确授权的本地文件；路径由控制端读取并传输，不要把凭据、私钥或未授权文件传给页面。上传后核验 choice/file 状态。"
+	case "browser_download_file":
+		return "DeepSentry: discover 只发现可下载资源；download 会启动浏览器原始下载，需要用户明确要求。成功必须以 nativeDownloadStarted=true 且返回 downloadId 为准，不要只看点击结果。"
+	case "browser_read_text":
+		return "DeepSentry: 长文按返回的 offset/分页继续读取，不要用 snapshot 抓全文或反复滚动。保留来源 URL 和可见文本边界。"
 	case "hawkeye_evaluate":
 		return "DeepSentry: 默认 MAIN 世界，能看见页面变量。B站播放：读 paused/currentTime/playbackRate；倍速设 video.playbackRate；全屏后读 fullscreenElement；黑屏时 canvas.drawImage(video)。全屏手势仍须先 press_key f。验证码、cookie、联网请求不要走 evaluate。"
+	case "browser_bookmarks":
+		return "DeepSentry: list/search/get/backup 为读取，按 offset/limit 分页；修改用精确 id，update/move/remove 带 expectedUrl/expectedTitle 防误改。删除/去重必须用户明确要求，核验回执；无需新建网页。"
+	case "hawkeye_script_manage":
+		return "DeepSentry: get(scriptId) 先读 code/updatedAt；编辑通过 script_upsert(scriptId,code,expectedUpdatedAt)；再 get 验证，明确要求执行才 script_run。enable/disable/global_enable/global_disable/remove 是持久修改。"
+	case "hawkeye_script_upsert":
+		return "DeepSentry: 创建必需 code；更新先 script_manage get，传 scriptId 与 expectedUpdatedAt 防覆盖。省略元数据保留原值。保存不代表执行，执行使用 script_run。"
+	case "hawkeye_codec":
+		return "DeepSentry: 先 catalog(query/category,summary=true)，操作数量动态，不猜字段。run 最多16步；smartdecode 用 maxDepth/maxAttempts/minScore，ai=true 会向配置模型传内容。二维码/条码多结果用 maxResults/region，网页用 page_scan(maxImages,offset)/nextOffset。检查 text/binary truncated；二进制用 workbench save_file 保留原字节，export 只导出UTF-8。翻页只传 page_token。"
+	case "hawkeye_request_replay":
+		return "DeepSentry: 主动请求只允许在 hawkEye scope 明确授权的 host 上执行；优先用 url/query/json 的普通 API 形式，rawRequest/recordId 仅用于精确重放。高风险，执行前确认授权范围。"
+	case "hawkeye_request_mutate":
+		return "DeepSentry: 只生成请求变体，不发送。先 mutate 检查参数，再决定是否用 replay/fuzz；不要把变体预览当成已执行请求。"
+	case "hawkeye_fuzz_run":
+		return "DeepSentry: 仅对 scope 中明确授权且开启 fuzzing 的 host 运行；最多 3 个 §...§ 点和 12 个请求。先 scope 核验，再执行，结束汇总响应差异与证据。"
+	case "hawkeye_scope":
+		return "DeepSentry: get 只读；set/add/remove/clear 会改变主动测试授权边界，必须先获得用户明确授权。不要把普通浏览或 replay 当成自动扩大 scope。"
+	case "hawkeye_findings":
+		return "DeepSentry: list/get 只读；upsert/create/update/remove 会修改本地审计记录，clear 会清空。保留 finding id 和证据来源。"
+	case "hawkeye_intercept":
+		return "DeepSentry: status/queue 只读；enable/disable 是本地拦截状态；release/release_all/drop 会影响真实流量，属于高风险。启用后必须 disable 收尾，避免页面挂起。"
+	case "hawkeye_capture_history":
+		return "DeepSentry: 默认限定 MCP 绑定 tab 和当前 host；跨 tab 查询用 targetHost。继续读取用 page_token/next_page_token，不要重复抓全量历史。"
+	case "hawkeye_sensitive_scan":
+		return "DeepSentry: 只读敏感信息检测；可扫内联 html/text/responseBody、单条 recordId 或 targetHost 历史。结果需脱敏后再写入报告。"
+	case "hawkeye_darklink_scan":
+		return "DeepSentry: 只读暗链/隐藏链接检测；无内容时扫描当前绑定 tab DOM。不要把命中的链接自动打开，先作为证据复核。"
 	default:
 		return ""
 	}
@@ -297,7 +339,7 @@ func hawkEyeSafeEvaluate(code string) bool {
 }
 
 func hawkEyeStructuredSummary(name string, structured any) string {
-	if structured == nil || !hawkEyeDropsStructuredDump(name) {
+	if structured == nil {
 		return ""
 	}
 	raw, err := json.Marshal(structured)
@@ -309,6 +351,9 @@ func hawkEyeStructuredSummary(name string, structured any) string {
 		return ""
 	}
 	context, _ := payload["context"].(map[string]any)
+	if context == nil && !hawkEyeDropsStructuredDump(name) {
+		return ""
+	}
 	complete := true
 	nextPageToken := ""
 	if context != nil {
@@ -424,6 +469,9 @@ func HawkEyeToolRisk(tool *ExternalTool, args map[string]string) (risk, reason s
 	if _, known := HawkEyeToolProfileForName(name); !known {
 		return "", "", false
 	}
+	if hawkEyeContinuationToken(args) != "" {
+		return MCPRiskLow, "HawkEye page_token 仅读取已缓存的不可变结果，不重放原动作", true
+	}
 	readOnly := map[string]bool{
 		"browser_search": true, "browser_fetch": true, "browser_research": true,
 		"browser_snapshot": true, "browser_find": true, "browser_security": true,
@@ -432,7 +480,7 @@ func HawkEyeToolRisk(tool *ExternalTool, args map[string]string) (risk, reason s
 		"hawkeye_capture_state": true, "hawkeye_capture_history": true,
 		"hawkeye_capture_inspect": true, "hawkeye_request_get": true,
 		"hawkeye_request_mutate": true, "hawkeye_response_compare": true,
-		"hawkeye_codec": true, "hawkeye_script_list": true,
+		"hawkeye_script_list":    true,
 		"hawkeye_sensitive_scan": true, "hawkeye_darklink_scan": true,
 	}
 	if readOnly[name] {
@@ -446,6 +494,32 @@ func HawkEyeToolRisk(tool *ExternalTool, args map[string]string) (risk, reason s
 	}
 
 	switch name {
+	case "browser_bookmarks":
+		switch hawkEyeArg(args, "action") {
+		case "list", "search", "get", "backup":
+			return MCPRiskLow, "HawkEye bookmarks 仅读取书签与备份内容", true
+		case "create", "update", "move":
+			return MCPRiskMedium, "HawkEye bookmarks 会修改用户书签", true
+		default:
+			return MCPRiskHigh, "HawkEye bookmarks 删除或未知动作，必须核验明确授权", true
+		}
+	case "hawkeye_script_manage":
+		switch hawkEyeArg(args, "action") {
+		case "list", "get":
+			return MCPRiskLow, "HawkEye script_manage 仅读取脚本元数据/源码", true
+		default:
+			return MCPRiskHigh, "HawkEye script_manage 会改变持久脚本或自动执行开关", true
+		}
+	case "hawkeye_codec":
+		var options map[string]any
+		_ = json.Unmarshal([]byte(hawkEyeRawArg(args, "options")), &options)
+		if options["ai"] == true || hawkEyeTruthy(hawkEyeArg(args, "ai")) {
+			return MCPRiskHigh, "HawkEye Codec AI 解码会向配置的模型发送输入/候选内容", true
+		}
+		if hawkEyeArg(args, "action") == "workbench" && hawkEyeArg(args, "command") != "read" {
+			return MCPRiskMedium, "HawkEye Codec workbench 会修改工作台或导出/保存本地文件", true
+		}
+		return MCPRiskLow, "HawkEye Codec 为本地目录查询/离线计算", true
 	case "hawkeye_scope":
 		switch hawkEyeArg(args, "action") {
 		case "", "get":
@@ -484,11 +558,28 @@ func HawkEyeToolRisk(tool *ExternalTool, args map[string]string) (risk, reason s
 			return MCPRiskLow, "HawkEye captcha analyze 仅分析当前验证码", true
 		}
 		return MCPRiskMedium, "HawkEye captcha solve 会与页面交互/提交", true
+	case "browser_fill_form":
+		if hawkEyeTruthy(hawkEyeArg(args, "submit")) {
+			return MCPRiskMedium, "HawkEye fill_form 会填写并提交表单", true
+		}
+		return MCPRiskLow, "HawkEye fill_form 仅填写表单字段，不提交", true
+	case "browser_handle_dialog":
+		switch hawkEyeArg(args, "action") {
+		case "accept":
+			return MCPRiskMedium, "HawkEye handle_dialog accept 会确认下一个确认/输入对话框", true
+		case "", "dismiss":
+			return MCPRiskLow, "HawkEye handle_dialog 仅读取对话框证据或取消", true
+		default:
+			return MCPRiskHigh, "HawkEye handle_dialog action 未知", true
+		}
 	case "browser_file_upload":
 		return MCPRiskHigh, "HawkEye file_upload 会向目标页面提供本地文件", true
 	case "browser_download_file":
 		if action := hawkEyeArg(args, "action"); action == "" || action == "discover" {
 			return MCPRiskLow, "HawkEye download discover 仅发现页面可下载资源", true
+		}
+		if strings.EqualFold(hawkEyeArg(args, "conflictAction"), "overwrite") {
+			return MCPRiskHigh, "HawkEye download 会覆盖同名本地文件", true
 		}
 		return MCPRiskMedium, "HawkEye download 会启动浏览器本地下载", true
 	case "browser_tabs":
@@ -511,7 +602,7 @@ func HawkEyeToolRisk(tool *ExternalTool, args map[string]string) (risk, reason s
 		return MCPRiskLow, "HawkEye capture 启停是本地取证状态，不单独弹确认", true
 	case "browser_navigate", "browser_go_back", "browser_go_forward", "browser_click", "browser_hover",
 		"browser_type", "browser_select_option", "browser_press_key", "browser_resize",
-		"browser_reload", "browser_fill_form", "browser_answer_questions", "browser_handle_dialog",
+		"browser_reload", "browser_answer_questions",
 		"browser_drag", "browser_scroll":
 		return MCPRiskLow, fmt.Sprintf("HawkEye %s 属于用户已连接浏览器的常规自动化，不单独弹确认", name), true
 	default:
@@ -531,10 +622,14 @@ func HawkEyeToolTimeout(name string, configured time.Duration, explicitlyConfigu
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "browser_research":
 		return 205 * time.Second
-	case "browser_search", "browser_fetch", "browser_captcha_assist", "hawkeye_fuzz_run":
+	case "browser_search", "browser_fetch", "browser_captcha_assist", "hawkeye_fuzz_run",
+		"browser_download_file", "browser_file_upload", "hawkeye_codec":
 		return 130 * time.Second
 	case "browser_snapshot", "browser_navigate", "browser_reload", "browser_read_text", "browser_find",
-		"browser_screenshot", "browser_go_back", "browser_go_forward", "browser_wait_for", "browser_scroll":
+		"browser_screenshot", "browser_go_back", "browser_go_forward", "browser_wait_for", "browser_scroll",
+		"browser_fill_form", "browser_answer_questions", "browser_exam_questions",
+		"hawkeye_capture_history", "hawkeye_request_replay", "hawkeye_response_compare",
+		"hawkeye_script_run", "hawkeye_sensitive_scan", "hawkeye_darklink_scan":
 		return 100 * time.Second
 	default:
 		return configured

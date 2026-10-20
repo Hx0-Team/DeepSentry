@@ -334,8 +334,11 @@ func (m *ToolsMiddleware) mcpRegistry() *mcp.Registry {
 }
 
 func (m *ToolsMiddleware) EnhancePrompt(base string, _ *AgentState) string {
+	if config.GlobalConfig.UseNativeTools && config.GlobalConfig.IsOpenAICompatible() {
+		return base + "\n【工具发现】已提供原生 schema 的工具直接调用；其他内置/MCP 工具通过 tool_catalog(name/query) 按需发现，再通过 agent_action 的 tool 动作调用。不要重复查询已验证用法。\n" + m.mcpRegistry().FormatNativePrompt()
+	}
 	capabilities := config.GlobalConfig.EffectiveModelCapabilities()
-	toolPrompt := tools.FormatCatalogPrompt()
+	toolPrompt := tools.FormatCompactCatalogPrompt()
 	mcpPrompt := m.mcpRegistry().FormatPrompt()
 	if capabilities.PromptProfile == config.ModelProfileCompact {
 		toolPrompt = tools.FormatCompactCatalogPrompt()
@@ -437,7 +440,9 @@ func (m *ToolsMiddleware) HandleAction(ctx *StepContext, action *AgentAction) (*
 	if name == "schedule_task" {
 		stampScheduleChatReply(action, ctx.SessionID)
 	}
-	out, risk, err := tools.RunWithExecutor(name, action.ToolArgs, isWindows, ctx.Executor)
+	toolCtx, cancelTool := contextFromStop(ctx.Stop)
+	defer cancelTool()
+	out, risk, err := tools.RunWithExecutorContext(toolCtx, name, action.ToolArgs, isWindows, ctx.Executor)
 	if err != nil {
 		return &ActionResult{
 			Output:       fmt.Sprintf("工具 [%s] 执行失败: %v\n%s", name, err, out),
@@ -456,7 +461,7 @@ func (m *ToolsMiddleware) HandleAction(ctx *StepContext, action *AgentAction) (*
 			out += "；现在可直接 load_skill，无需重启。"
 		}
 	}
-	if name == "config_manage" && skillConfigMutation(action.ToolArgs["action"]) && m.Catalog != nil {
+	if name == "config_manage" && !config.ConfigPreview(action.ToolArgs) && skillConfigMutation(action.ToolArgs["action"]) && m.Catalog != nil {
 		m.Catalog.Sources = skills.ResolveSources(config.GlobalConfig.SkillSources, config.GlobalConfig.DisabledSkillSources)
 		if err := m.Catalog.ReloadWithDisabled(config.GlobalConfig.EffectiveDisabledSkills()); err != nil {
 			out += fmt.Sprintf("\n⚠️ Skill 配置已写入，但当前会话 Catalog 刷新失败: %v\n可执行 /skill rescan 重试。", err)
@@ -1389,8 +1394,8 @@ func (m *ContextMiddleware) OffloadOutput(state *AgentState, label, output strin
 		return output
 	}
 
-	if state.WorkspaceDir == "" {
-		return output[:m.OutputThreshold] + "\n...(输出过长已截断)..."
+	if state == nil || state.WorkspaceDir == "" {
+		return boundedOutputPreview(output, m.OutputThreshold) + "\n...(输出过长已截断)..."
 	}
 
 	outputDir := sessionOutputDir(state)
@@ -1399,15 +1404,13 @@ func (m *ContextMiddleware) OffloadOutput(state *AgentState, label, output strin
 	fullPath := filepath.Join(outputDir, filename)
 
 	if err := os.WriteFile(fullPath, []byte(output), 0600); err != nil {
-		return output[:m.OutputThreshold] + "\n...(输出过长已截断)..."
+		return boundedOutputPreview(output, m.OutputThreshold) + "\n...(输出过长已截断)..."
 	}
 	digest := sha256.Sum256([]byte(output))
 
-	previewLen := 500
-	if len(output) < previewLen {
-		previewLen = len(output)
-	}
-	preview := output[:previewLen]
+	// Preserve the final error/result as well as the header so the model
+	// need not spend another call just to learn a command's outcome.
+	preview := boundedOutputPreview(output, 1600)
 	absPath, _ := filepath.Abs(fullPath)
 	record := ArtifactRecord{
 		Path: absPath, SHA256: fmt.Sprintf("%x", digest[:]), Source: label,

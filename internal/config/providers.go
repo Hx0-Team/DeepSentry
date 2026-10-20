@@ -184,12 +184,12 @@ var AllProviders = []ProviderPreset{
 // Chinese providers. Historical IDs that are still served remain available so
 // existing configs get correct routing without becoming the new default.
 var AllModelPresets = []ModelPreset{
-	{Provider: ProviderDeepSeek, ID: "deepseek-flash", ContextWindowTokens: 1_000_000, SupportsVision: true},
-	{Provider: ProviderDeepSeek, ID: "deepseek-v4.1-flash", ContextWindowTokens: 1_000_000, SupportsVision: true},
-	{Provider: ProviderDeepSeek, ID: "deepseek-v4.1-flash-expires-on-0910", ContextWindowTokens: 1_000_000, SupportsVision: true},
-	{Provider: ProviderDeepSeek, ID: "deepseek-v4-flash-vision-exp", ContextWindowTokens: 1_000_000, SupportsVision: true},
-	{Provider: ProviderDeepSeek, ID: "deepseek-v4-flash", ContextWindowTokens: 1_000_000, SupportsVision: true},
-	{Provider: ProviderDeepSeek, ID: "deepseek-v4-pro", ContextWindowTokens: 1_000_000},
+	{Provider: ProviderDeepSeek, ID: "deepseek-flash", ContextWindowTokens: 1_048_576, SupportsVision: true},
+	{Provider: ProviderDeepSeek, ID: "deepseek-v4.1-flash", ContextWindowTokens: 1_048_576, SupportsVision: true},
+	{Provider: ProviderDeepSeek, ID: "deepseek-v4.1-flash-expires-on-0910", ContextWindowTokens: 1_048_576, SupportsVision: true},
+	{Provider: ProviderDeepSeek, ID: "deepseek-v4-flash-vision-exp", ContextWindowTokens: 1_048_576, SupportsVision: true},
+	{Provider: ProviderDeepSeek, ID: "deepseek-v4-flash", ContextWindowTokens: 1_048_576, SupportsVision: true},
+	{Provider: ProviderDeepSeek, ID: "deepseek-v4-pro", ContextWindowTokens: 1_048_576},
 	{Provider: ProviderGLM, ID: "glm-5.3-flash", ContextWindowTokens: 1_000_000, SupportsVision: true},
 	{Provider: ProviderGLM, ID: "glm-5.3", ContextWindowTokens: 1_000_000},
 	{Provider: ProviderMiniMax, ID: "MiniMax-M3", ContextWindowTokens: 1_000_000, SupportsVision: true},
@@ -466,6 +466,21 @@ func NormalizeAPIURL(raw, protocol string) string {
 		if strings.HasSuffix(raw, old) {
 			raw = strings.TrimSuffix(raw, old)
 			break
+		}
+	}
+	if strings.EqualFold(protocol, ProtocolAnthropicMessages) {
+		if u, err := url.Parse(raw); err == nil && strings.EqualFold(u.Hostname(), "api.deepseek.com") {
+			path := strings.TrimRight(u.Path, "/")
+			switch {
+			case strings.HasSuffix(path, "/anthropic/v1"):
+				return raw + suffix
+			case strings.HasSuffix(path, "/anthropic"):
+				return raw + "/v1" + suffix
+			case path == "" || path == "/v1":
+				return "https://api.deepseek.com/anthropic/v1" + suffix
+			default:
+				return raw + "/anthropic/v1" + suffix
+			}
 		}
 	}
 	return raw + suffix

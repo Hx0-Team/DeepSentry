@@ -30,6 +30,7 @@ type fakeBackend struct {
 	inputHook    func()
 	grounding    string
 	elements     []Element
+	elementsHook func()
 	liveName     string
 }
 
@@ -57,6 +58,9 @@ func (b *fakeBackend) Capture(ctx context.Context, path string) error {
 	return png.Encode(f, image.NewRGBA(image.Rect(0, 0, 200, 100)))
 }
 func (b *fakeBackend) Elements(context.Context) (string, []Element, error) {
+	if b.elementsHook != nil {
+		b.elementsHook()
+	}
 	if b.grounding == "" && len(b.elements) == 0 {
 		return "vision", nil, nil
 	}

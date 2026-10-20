@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -55,6 +56,9 @@ func Run(cfg SessionConfig) error {
 	}
 
 	m := NewAgentModel(ctrl, title, status, cfg.MaxSteps, cfg.AwaitGoal, !cfg.AwaitGoal && len(*cfg.History) > 0, cfg.Startup)
+	balanceCtx, cancelBalance := context.WithCancel(context.Background())
+	m.balanceCtx = balanceCtx
+	defer cancelBalance()
 	defer m.stopOwnedChat()
 	defer m.cursorAnchor.release()
 	if note := m.startConfiguredChatIfNeeded(); note != "" {

@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"ai-edr/internal/analyzer"
 	"ai-edr/internal/ui"
 	"encoding/json"
 	"fmt"
@@ -32,27 +33,33 @@ const (
 	EventCommandOutput  EventKind = "command_output"
 	// Stream deltas carry only the new bytes in Message. StreamEnd carries the
 	// complete response in Detail, including chunks a UI may have dropped.
-	EventStreamDelta EventKind = "stream_delta"
-	EventStreamEnd   EventKind = "stream_end"
-	EventAwaitUser   EventKind = "await_user"
-	EventTokenUsage  EventKind = "token_usage"
+	EventStreamDelta  EventKind = "stream_delta"
+	EventStreamEnd    EventKind = "stream_end"
+	EventAwaitUser    EventKind = "await_user"
+	EventTokenUsage   EventKind = "token_usage"
+	EventContextUsage EventKind = "context_usage"
 )
 
 // UIEvent 单条 UI 事件
 type UIEvent struct {
-	Kind             EventKind
-	Step             int
-	MaxSteps         int
-	Message          string
-	Detail           string
-	Action           *AgentAction
-	TargetName       string
-	TargetProtocol   string
-	TargetHost       string
-	Status           string
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
+	Kind               EventKind
+	Step               int
+	MaxSteps           int
+	Message            string
+	Detail             string
+	Action             *AgentAction
+	TargetName         string
+	TargetProtocol     string
+	TargetHost         string
+	Status             string
+	PromptTokens       int
+	CompletionTokens   int
+	TotalTokens        int
+	CacheReadTokens    int
+	CacheWriteTokens   int
+	ReasoningTokens    int
+	CacheUsageReported bool
+	ContextUsage       *analyzer.ContextUsage `json:",omitempty"`
 }
 
 // UISink Agent 循环输出接口（stdout / TUI 共用）

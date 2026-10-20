@@ -6,6 +6,27 @@ import (
 	"testing"
 )
 
+func TestDeferredHawkEyeAliasKeepsFullCatalogIdentity(t *testing.T) {
+	const server = "deferred-browser-alias"
+	t.Cleanup(func() { mcp.Global().UnregisterServer(server) })
+	for _, name := range []string{"browser_press_key", "hawkeye_capture_state", "hawkeye_capture_history", "hawkeye_request_get"} {
+		fullName := server + "__" + name
+		mcp.Global().RegisterHandler(fullName, mcp.ExternalTool{Name: fullName, OriginalName: name, Server: server, InputSchema: map[string]any{"type": "object"}}, nil)
+	}
+	// With only one MCP schema visible, generic browser_press_key cannot
+	// establish identity alone; the omitted signatures must still count.
+	definitions := AgentToolDefinitionsForContextWithPinned(3, "browser_press_key", []string{server + "__browser_press_key"})
+	for _, d := range definitions {
+		if d.Function.Name == server+"__browser_press_key" {
+			if !strings.Contains(d.Function.Description, "inputMode=trusted") {
+				t.Fatal("deferred alias lost HawkEye-specific gesture contract")
+			}
+			return
+		}
+	}
+	t.Fatal("pinned HawkEye function missing")
+}
+
 func TestLimitedNativeProfileSelectsTypedHawkEyeToolsByWorkflowIntent(t *testing.T) {
 	tools := []mcp.ExternalTool{
 		{Name: "hawkeye__browser_tabs", OriginalName: "browser_tabs", Server: "hawkeye"},

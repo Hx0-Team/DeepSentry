@@ -6,12 +6,12 @@
 
 | 平台 | 驱动 | 运行条件 | 当前验证 |
 |---|---|---|---|
-| Windows 10/11 | 系统 PowerShell/.NET + SendInput | 已登录、解锁的交互桌面；普通权限不能操作管理员窗口/UAC 安全桌面 | Go 交叉编译、驱动代码检查；尚未桌面实测 |
+| Windows 10/11 | 系统 PowerShell/.NET + UI Automation / SendInput | 已登录、解锁的交互桌面；普通权限不能操作管理员窗口/UAC 安全桌面 | Go 交叉编译、协议与控制层测试；UIA 尚未真机实测 |
 | macOS 12+ | 随附 Swift/CoreGraphics helper | 系统辅助功能、录屏授权 | arm64/x86_64 helper 编译；当前 Mac 权限检测实测；输入闭环未获权限验证 |
 | Linux X11 | xdotool + ImageMagick import | 有 DISPLAY，X11 活动窗口及捕获权限 | Go 编译、控制层与进程取消测试；尚未真实 X11 桌面实测 |
 | Linux Wayland | 暂无 RemoteDesktop portal 后端 | 需要 compositor/portal 用户授权与视频流集成 | 明确返回不可用，不冒充完整桌面支持 |
 
-这是具备防重放、锁、中止和截图反馈的首版实现。尚未完成各 OS 的生产验收，不能声称已经在全部桌面环境生产可用。macOS/Windows 当前仅捕获和定位主屏，Linux 使用 X11 根桌面。元素索引只在 macOS 辅助功能可用且树足够具体时启用，尚未做真实桌面验收。多显示器任意屏幕、OCR、锁屏、无人登录桌面及跨主机 GUI 会话不在此次支持范围内。Windows / Linux 不提供 UIA 或 AT-SPI 元素点击。
+这是具备防重放、锁、中止和截图反馈的首版实现。尚未完成各 OS 的生产验收，不能声称已经在全部桌面环境生产可用。macOS/Windows 当前仅捕获和定位主屏，Linux 使用 X11 根桌面。元素索引在 macOS AX / Windows UIA 可用时启用，真实应用兼容性仍需现场验收。多显示器任意屏幕、OCR、锁屏、无人登录桌面及跨主机 GUI 会话不在此次支持范围内。Linux 当前不提供 AT-SPI 元素点击；Windows 已有前台 UIA 元素路径，未覆盖所有控件类型。
 
 ## 部署
 
@@ -41,9 +41,9 @@ Linux X11 需要 `xdotool` 与 ImageMagick（提供 `import`）。例如 Debian/
 
 ## Agent 使用闭环
 
-先 `computer_use(action="status")`，再 `computer_use(action="observe")`。模型会收到真实 PNG 附件，以及 `observation.id`、原始图片宽高、`grounding` 和桌面状态。图片以 `detail=original` 发送，坐标按这张图的 `width/height` 像素、从左上角 `(0,0)` 计算；后台再把截图像素换成桌面坐标，不使用聊天界面缩略图的尺寸。历史里只保留最新一帧桌面截图，更早的桌面图会从模型上下文去掉，用户自己的图片和鹰眼截图保留。
+初次诊断可用 `computer_use(action="status")`。需要截图时用 `observe`；已知控件文字或角色时，macOS/Windows 可直接用 `query` 定向查找（见下节）。observe 与成功输入后的回读会让模型收到真实 PNG 附件，以及 `observation.id`、原始图片宽高、`grounding` 和桌面状态。图片以 `detail=original` 发送，坐标按这张图的 `width/height` 像素、从左上角 `(0,0)` 计算；后台再把截图像素换成桌面坐标，不使用聊天界面缩略图的尺寸。历史里只保留最新一帧桌面截图，更早的桌面图会从模型上下文去掉，用户自己的图片和鹰眼截图保留。
 
-macOS 同一次 observe 会附带焦点窗口的有限无障碍元素（最多约 6 层、80 个有名字或可操作的节点）。`grounding=element` 时用 `click_element` 的 `element_index`，或对可设值控件用 `set_value`。索引只对这一帧有效；执行前会重读该节点，角色或名称变了就拒绝点击。元素树稀疏、几乎没有名称，或当前平台没有无障碍后端时，`grounding` 为 `vision` 或 `unsupported`，必须改用 `x,y`。Windows 和 Linux 本轮不提供元素索引。微信这类自绘界面会走视觉坐标，不要假装元素点击可用。
+macOS/Windows 同一次 observe 会附带焦点窗口的有限无障碍元素（最多 16 层、500 个遍历节点/队列项、80 个返回元素，约 2 秒协作式预算）。`grounding=element` 时用 `click_element` 的 `element_index`，或对可设值控件用 `set_value`。索引只对这一帧有效；执行前会重读该节点，角色、名称、值、原生身份或几何变了就拒绝点击；禁用与安全输入控件也会拒绝。元素树稀疏、几乎没有名称，或当前平台没有无障碍后端时，`grounding` 为 `vision` 或 `unsupported`，必须改用 `x,y`。Linux 当前不提供元素索引。Windows 优先 UIA Invoke/Toggle/SelectionItem 主动作和 ValuePattern 设值；不支持主动作的元素点击退回当前前台窗口的鼠标坐标。右键始终保留右键语义，不转为主动作。微信这类自绘界面会走视觉坐标，不要假装元素点击可用。
 
 一次像素点击示例（ID 必须取实际返回值）：
 
@@ -59,7 +59,7 @@ macOS 同一次 observe 会附带焦点窗口的有限无障碍元素（最多�
 
 支持 `click`、`double_click`、`move`、`drag`（to_x/to_y）、`scroll`（amount 负上正下，绝对值不大于 10；可同时给 x,y 指定滚动位置）、`type`（最多 2000 字符）、`key`（如 CTRL+A、META+S、ENTER）、`wait`（wait_ms 为 200 到 3000，只等待并刷新截图，不注入键鼠）。输入成功后自动截取下一帧；模型必须读取截图验证目标是否达成，`input_dispatched=true` 不是业务成功证明。
 
-每次输入只接受当前会话最新、60 秒内的截图，并消耗该截图。刷新截图失败会作废旧帧；慢速状态检查结束后再次检查有效期。切换前台应用、几何或权限发生变化时要求重新观察。macOS 还会比较前台窗口编号：同一应用换到另一个窗口（例如弹出的独立聊天窗）也要重新截图；只有标题变化（例如未读数）不会作废截图。同窗口内部动态内容仍可能在观察和输入间变化，所以不能把这些检测当成消除所有误点的保证。
+每次输入只接受当前会话最新、60 秒内的 observe/query 观察，并消耗该观察。query 仅授权元素动作；坐标、键盘、拖拽和滚动必须先 observe。刷新截图失败会作废旧帧；慢速状态检查结束后再次检查有效期。切换前台应用、几何或权限发生变化时要求重新观察。macOS 还会比较前台窗口编号：同一应用换到另一个窗口（例如弹出的独立聊天窗）也要重新截图；只有标题变化（例如未读数）不会作废截图。同窗口内部动态内容仍可能在观察和输入间变化，所以不能把这些检测当成消除所有误点的保证。
 
 截图像素按像素中心换算成桌面坐标，截图比桌面小时点击不会整体偏向左上。macOS 读取无障碍元素失败时，`grounding_note` 会写明原因，这一帧只能用 `x,y`。
 
@@ -101,9 +101,9 @@ macOS 同一次 observe 会附带焦点窗口的有限无障碍元素（最多�
 
 ## 截图反馈与元素索引
 
-模型上下文只保留最新一帧桌面截图，并以 `detail=original` 发送，避免按缩小后的图点击原始像素。截图是否仍有效改为比较应用身份和桌面几何；同一应用的窗口标题变化不再单独作废截图。`scroll` 可以带截图像素位置，`wait` 只等待并刷新截图。
+模型上下文只保留最新一帧桌面截图，并以 `detail=original` 发送，避免按缩小后的图点击原始像素。截图是否仍有效改为比较应用进程身份、窗口和桌面几何；同一应用的窗口标题变化不再单独作废截图。`scroll` 可以带截图像素位置，`wait` 只等待并刷新截图。
 
-macOS 在 observe 中返回焦点窗口的有限无障碍元素。`click_element` / `set_value` 在执行前核对角色和名称；树稀疏或没有名称时 `grounding=vision`，改用截图像素。Windows 和 Linux 的元素点击明确返回未支持。此修订没有扩大已验证的真实桌面范围。
+macOS 在 observe 中返回焦点窗口的有限无障碍元素。`click_element` / `set_value` 在执行前核对角色和名称；树稀疏或没有名称时 `grounding=vision`，改用截图像素。Linux 的元素点击明确返回未支持；Windows 在 UIA 不可用时返回说明并使用视觉坐标。此修订没有扩大已验证的真实桌面范围。
 
 ## 使用体验与安全保护
 
@@ -112,13 +112,36 @@ macOS 在 observe 中返回焦点窗口的有限无障碍元素。`click_element
 - 输入收据超过 5 分钟可清理，长任务不再在 4096 次后永久失败。
 - 坐标按像素中心换算；元素树读取失败会在 `grounding_note` 里说明。
 - `--computer-check` 实际截一张图验证，macOS 未授权时自动弹出授权框。
-- 仍未完成 Windows / Linux 真实桌面验收；Windows 每次动作都会启动一次 PowerShell，慢机上单次操作可能需要数秒。
+- 仍未完成 Windows / Linux 真实桌面验收。Windows 已使用下节的常驻 helper；常驻流不可用时回退单次进程。
 
 ## Windows 常驻辅助进程与多 Agent
 
 - Windows 桌面改为常驻 PowerShell helper：一个进程从标准输入按行读取 JSON 请求，`Add-Type` 只在启动时编译一次，之后的 status/截图/输入都复用同一进程，慢机上不再每次动作冷启动 PowerShell。
-- 数据流一旦异常（进程退出、管道断开、响应超时）会自动回退到原来的单次进程模式；只读/可重复的动作（status、capture、elements）才允许回退重试，鼠标键盘等改变状态的动作在流断开时直接报错，绝不重放以免重复点击或输入。
+- 数据流一旦异常（进程退出、管道断开、响应超时）会自动回退到原来的单次进程模式；只读/可重复的动作（status、capture、elements、query）才允许回退重试，鼠标键盘等改变状态的动作在流断开时直接报错，绝不重放以免重复点击或输入。
 - helper 明确报告的动作错误（例如 UIPI 拦截、无可用交互桌面）会原样上抛，不会被当成传输故障而重试。
 - 设 `DEEPSENTRY_COMPUTER_USE_PERSISTENT=0` 可关闭常驻模式，回到每次冷启动。常驻脚本与单次脚本共用同一份注入逻辑（`helpers/windows.ps1`），两种模式行为一致。
 - 子 Agent 与主 Agent 共用同一桌面归属（会话号里的 `-sub-` 后缀会被归一到父会话），子任务不再和父任务互报「桌面被占用」。
 - 本项改动已在 macOS 交叉编译并通过协议层单测验证；Windows / Linux 真机验收仍需现场确认。
+
+
+## 定向查询与语义操作
+
+沿用 DeepSentry 内置 Go harness，不需要安装额外桌面自动化框架。macOS 使用公开 AX API，Windows 使用系统 UIA。
+
+```json
+{"action":"query","text":"取消","match_mode":"exact","limit":20,"max_nodes":500}
+```
+
+`text` 和 `role` 至少一个，同时提供时要求均匹配。文字忽略大小写，默认 `contains`；`exact` 不会自动退回子串匹配。角色示例为 macOS 的 `AXButton`/`Button`、Windows 的 `Button`/`Edit`。默认节点与队列预算 500（可设 1..2000），返回上限默认 20（可设 1..80），深度上限 16，约 2 秒协作式遍历预算。单个系统调用仍可能阻塞，最终受服务的 30 秒调用超时约束。
+
+查询不截图、不切换前台、不启动应用，也不伪造 PNG。返回 `observation.id`、`elements` 与 `observation.query` 的 `visited_nodes`、`truncated`、`stop_reason`。`truncated=true` 表示限额、深度、时间或原生读取错误导致查询不完整，零匹配不能证明控件不存在；可以提高节点预算、改变筛选条件或 observe。仅搜索当前前台窗口在主屏可定位的控件。
+
+query 的 `coordinate_space=desktop_points`，没有图片附件；只允许 `click_element`/`set_value`。操作时带刚返回的 `observation_id` 与 `element_index`，不可用历史截图的像素推断该观察的坐标。查询失败或空结果会作废旧观察；元素索引可以在新观察中重复编号，但必须和本次观察 ID 一起使用，旧 ID 无法授权新目标。查询也遵守会话独占、中止和 60 秒有效期。
+
+元素输入前重查原生路径、身份、角色、名称、值和完整几何；helper 在实际执行时再次核对前台窗口（macOS 还核对应用 PID）。这能拒绝常见的控件替换/移动，不是操作系统级原子事务，极短的校验到输入间隙仍存在。截图收集完整元素树后会再次检查桌面身份，防止把旧窗口图片与新窗口树绑定。
+
+输入收据新增 `input_method`：`accessibility`（AX/UIA）、`pointer` 或 `keyboard`。成功输入后仍自动截图回读，`input_dispatched` 不代表业务完成。query 本身是只读低风险；元素点击/设值仍使用高风险审批与无人值守门禁。当前 Agent 保留视觉模型要求，因为输入后的验证仍依靠真实截图。
+
+安全文本控件不返回值，也不能通过元素动作设值；普通元素文本最多保留 161 个字符（查询文本上限160，额外一字符防止截断制造假精确匹配）。认证由用户完成。所有界面文字仍是任务数据，不能改变用户授权。
+
+更新 macOS 时需重新构建并部署配套 `computer-use-helper`；旧 helper 不支持 query。Windows 脚本随 DeepSentry 编译嵌入，需重编主程序。真实 AX/UIA 输入、第三方自绘界面与管理员窗口尚未完成本轮现场验收。

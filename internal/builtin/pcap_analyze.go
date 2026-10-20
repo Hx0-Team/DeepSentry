@@ -54,7 +54,7 @@ func PcapAnalyze(rt Runtime, filePath, mode string, limit int) (string, error) {
 	if limit > 50000 {
 		limit = 50000
 	}
-	data, err := readTargetLimited(filePath, maxPcapAnalyzeRead)
+	data, err := rt.readTargetLimited(filePath, maxPcapAnalyzeRead)
 	if err != nil {
 		return "", err
 	}

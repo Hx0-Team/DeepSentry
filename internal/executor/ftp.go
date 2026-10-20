@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ai-edr/internal/config"
@@ -23,6 +24,10 @@ import (
 )
 
 type FTPExecutor struct {
+	controllerProxy string
+	controlRaw      net.Conn
+	closed          atomic.Bool
+	resources       sync.Map
 	conn            net.Conn
 	reader          *bufio.Reader
 	host            string
@@ -67,12 +72,16 @@ func newFTPExecutor(cfg config.Config) (*FTPExecutor, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn, err := config.ControllerDialTimeout("tcp", host, connectTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancel()
+	conn, err := config.ControllerDialContextForProxy(ctx, "tcp", host, cfg.ControllerProxy)
 	if err != nil {
 		return nil, fmt.Errorf("FTP 连接失败: %v", err)
 	}
 	f := &FTPExecutor{
-		conn: conn, reader: bufio.NewReader(conn), host: host,
+		controllerProxy: cfg.ControllerProxy,
+		controlRaw:      conn,
+		conn:            conn, reader: bufio.NewReader(conn), host: host,
 		connectTimeout: connectTimeout, commandTimeout: commandTimeout, transferTimeout: transferTimeout,
 		tlsMode: tlsMode, tlsConfig: tlsConfig, dataMode: dataMode,
 		activeAddress: strings.TrimSpace(cfg.FTPActiveAddress),
@@ -344,19 +353,16 @@ func (f *FTPExecutor) ListTargetDir(path string) ([]string, error) {
 func (f *FTPExecutor) IsRemote() bool { return true }
 func (f *FTPExecutor) Mode() string   { return "ftp" }
 func (f *FTPExecutor) Close() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.conn == nil {
+	if f.closed.Swap(true) {
 		return
 	}
-	previousTimeout := f.commandTimeout
-	if previousTimeout <= 0 || previousTimeout > 2*time.Second {
-		f.commandTimeout = 2 * time.Second
+	if f.controlRaw != nil {
+		_ = f.controlRaw.Close()
 	}
-	_, _ = f.cmd("QUIT")
-	f.commandTimeout = previousTimeout
-	_ = f.conn.Close()
-	f.conn = nil
+	if f.conn != nil {
+		_ = f.conn.Close()
+	}
+	f.resources.Range(func(key, value any) bool { _ = key.(io.Closer).Close(); return true })
 }
 
 func (f *FTPExecutor) uploadFile(localPath, remotePath string) (string, error) {
@@ -445,6 +451,9 @@ func replaceDownloadedFile(src, dst string) error {
 }
 
 func (f *FTPExecutor) cmd(command string) (string, error) {
+	if f.closed.Load() {
+		return "", net.ErrClosed
+	}
 	if _, err := f.cmdNoRead(command); err != nil {
 		return "", err
 	}
@@ -587,6 +596,7 @@ func readFTPDataLimited(conn net.Conn, limit int64) ([]byte, error) {
 }
 
 type ftpPreparedData struct {
+	owner        *FTPExecutor
 	conn         net.Conn
 	listener     *net.TCPListener
 	expectedPeer net.IP
@@ -602,6 +612,9 @@ func (d *ftpPreparedData) close() {
 	}
 	if d.listener != nil {
 		_ = d.listener.Close()
+		if d.owner != nil {
+			d.owner.resources.Delete(d.listener)
+		}
 		d.listener = nil
 	}
 }
@@ -651,11 +664,17 @@ func (d *ftpPreparedData) open(f *FTPExecutor) (net.Conn, error) {
 		_ = d.listener.SetDeadline(time.Now().Add(f.transferTimeout))
 		accepted, err := d.listener.AcceptTCP()
 		_ = d.listener.Close()
+		if d.owner != nil {
+			d.owner.resources.Delete(d.listener)
+		}
 		d.listener = nil
 		if err != nil {
 			return nil, fmt.Errorf("等待 FTP 服务端主动回连失败: %w", err)
 		}
 		conn = accepted
+		if !f.trackFTPResource(conn) {
+			return nil, net.ErrClosed
+		}
 		if d.expectedPeer != nil {
 			peer, _ := accepted.RemoteAddr().(*net.TCPAddr)
 			if peer == nil || !peer.IP.Equal(d.expectedPeer) {
@@ -676,7 +695,7 @@ func (d *ftpPreparedData) open(f *FTPExecutor) (net.Conn, error) {
 		}
 		conn = tlsConn
 	}
-	return conn, nil
+	return &ftpDataConn{Conn: conn, owner: f}, nil
 }
 
 func (f *FTPExecutor) prepareData() (*ftpPreparedData, error) {
@@ -786,7 +805,10 @@ func (f *FTPExecutor) activeData() (*ftpPreparedData, error) {
 	if remote, ok := f.conn.RemoteAddr().(*net.TCPAddr); ok {
 		expectedPeer = append(net.IP(nil), remote.IP...)
 	}
-	return &ftpPreparedData{listener: listener, expectedPeer: expectedPeer}, nil
+	if !f.trackFTPResource(listener) {
+		return nil, net.ErrClosed
+	}
+	return &ftpPreparedData{listener: listener, expectedPeer: expectedPeer, owner: f}, nil
 }
 
 func (f *FTPExecutor) controlPeerHost() (string, error) {
@@ -812,12 +834,38 @@ func (f *FTPExecutor) dialData(host string, port int) (net.Conn, error) {
 	if port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("FTP 被动端口非法: %d", port)
 	}
-	conn, err := config.ControllerDialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), f.connectTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), f.connectTimeout)
+	defer cancel()
+	conn, err := config.ControllerDialContextForProxy(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)), f.controllerProxy)
 	if err != nil {
 		return nil, fmt.Errorf("FTP 数据连接失败 %s:%d: %w", host, port, err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(f.transferTimeout))
-	return conn, nil
+	if !f.trackFTPResource(conn) {
+		return nil, net.ErrClosed
+	}
+	return &ftpDataConn{Conn: conn, owner: f}, nil
+}
+
+func (f *FTPExecutor) trackFTPResource(c io.Closer) bool {
+	f.resources.Store(c, true)
+	if f.closed.Load() {
+		_ = c.Close()
+		f.resources.Delete(c)
+		return false
+	}
+	return true
+}
+
+type ftpDataConn struct {
+	net.Conn
+	owner *FTPExecutor
+}
+
+func (c *ftpDataConn) Close() error {
+	err := c.Conn.Close()
+	c.owner.resources.Delete(c.Conn)
+	return err
 }
 
 func parseEPSVPort(resp string) (int, error) {

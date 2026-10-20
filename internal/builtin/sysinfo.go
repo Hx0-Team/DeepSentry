@@ -13,7 +13,7 @@ func NetConnections(rt Runtime, filter string) (string, error) {
 		return netConnectionsWindows(rt, filter)
 	}
 
-	entries, err := readAllSockets()
+	entries, err := rt.readAllSockets()
 	if err != nil {
 		return "", err
 	}
@@ -56,7 +56,7 @@ func RouteTable(rt Runtime) (string, error) {
 	if rt.IsWindows {
 		return windowsSystemCommand(rt, "route print", "Windows 路由表", 12000)
 	}
-	data, err := readTarget("/proc/net/route")
+	data, err := rt.readTarget("/proc/net/route")
 	if err != nil {
 		return "", err
 	}
@@ -79,7 +79,7 @@ func ARPTable(rt Runtime) (string, error) {
 	if rt.IsWindows {
 		return windowsSystemCommand(rt, "arp -a", "Windows ARP 表", 12000)
 	}
-	data, err := readTarget("/proc/net/arp")
+	data, err := rt.readTarget("/proc/net/arp")
 	if err != nil {
 		return "", err
 	}
@@ -101,7 +101,7 @@ func MemInfo(rt Runtime) (string, error) {
 	if rt.IsWindows {
 		return windowsSystemCommand(rt, windowsPowerShellCommand(`Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory`), "Windows 内存信息", 4000)
 	}
-	data, err := readTarget("/proc/meminfo")
+	data, err := rt.readTarget("/proc/meminfo")
 	if err != nil {
 		return "", err
 	}
@@ -124,7 +124,7 @@ func ProcessList(rt Runtime, limit int) (string, error) {
 		limit = 200
 	}
 
-	pids, err := listTarget("/proc")
+	pids, err := rt.listTarget("/proc")
 	if err != nil {
 		return "", err
 	}
@@ -149,7 +149,7 @@ func ProcessList(rt Runtime, limit int) (string, error) {
 		if len(procs) >= limit {
 			break
 		}
-		comm, err := readTarget(fmt.Sprintf("/proc/%d/comm", pid))
+		comm, err := rt.readTarget(fmt.Sprintf("/proc/%d/comm", pid))
 		if err != nil {
 			continue
 		}
@@ -171,7 +171,7 @@ func ProcessList(rt Runtime, limit int) (string, error) {
 
 // FileHash 文件 SHA256（通过 ReadTargetFile，无需 sha256sum 命令）
 func FileHash(rt Runtime, path string) (string, error) {
-	data, err := readTargetLimited(path, 10<<20)
+	data, err := rt.readTargetLimited(path, 10<<20)
 	if err != nil {
 		return "", err
 	}

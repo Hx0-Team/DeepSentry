@@ -206,12 +206,26 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 			lease.stalled++
 		}
 		llmCtx, cancelLLM := contextFromStop(r.Stop)
+		historyBudget := spec.HistoryBudgetTokens
+		if historyBudget == 0 {
+			historyBudget = config.GlobalConfig.SubAgentHistoryBudgetTokens
+		}
+		if historyBudget == 0 {
+			historyBudget = 16_000
+		}
 		resp, err := stepFn(analyzer.StepOptions{
-			Context:        llmCtx,
-			SysCtx:         sysCtx,
-			History:        &subHistory,
-			ExtraPrompt:    extraPrompt,
-			UseNativeTools: r.UseNative,
+			Context:             llmCtx,
+			SysCtx:              sysCtx,
+			History:             &subHistory,
+			ExtraPrompt:         extraPrompt,
+			UseNativeTools:      r.UseNative,
+			HistoryBudgetTokens: historyBudget,
+			OnUsage: func(usage analyzer.TokenUsage) {
+				if r.UI != nil {
+					r.UI.Emit(UIEvent{Kind: EventTokenUsage, PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens, TotalTokens: usage.TotalTokens,
+						CacheReadTokens: usage.CacheReadTokens, CacheWriteTokens: usage.CacheWriteTokens, ReasoningTokens: usage.ReasoningTokens, CacheUsageReported: usage.CacheUsageReported})
+				}
+			},
 		})
 		cancelLLM()
 		if shouldStop(r.Stop) {

@@ -15,7 +15,7 @@ func number(_ name: String) -> Int { (r[name] as? NSNumber)?.intValue ?? 0 }
 func frontApp() -> NSRunningApplication? { NSWorkspace.shared.frontmostApplication }
 func appID() -> String {
     guard let app = frontApp() else { return "" }
-    if let id = app.bundleIdentifier, !id.isEmpty { return id }
+    if let id = app.bundleIdentifier, !id.isEmpty { return "\(id):pid:\(app.processIdentifier)" }
     return "pid:\(app.processIdentifier)"
 }
 func foreground() -> String {
@@ -49,13 +49,12 @@ func copyAttribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
 func axString(_ element: AXUIElement, _ name: CFString) -> String {
     copyAttribute(element, name) as? String ?? ""
 }
-func axChildren(_ element: AXUIElement) -> [AXUIElement] {
-    copyAttribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] ?? []
-}
 func clipName(_ raw: String) -> String {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    if trimmed.count <= 80 { return trimmed }
-    return String(trimmed.prefix(80))
+    // Keep one boundary character beyond the query limit so clipping cannot
+    // turn a prefix into a false exact match.
+    if trimmed.unicodeScalars.count <= 161 { return trimmed }
+    return String(trimmed.unicodeScalars.prefix(161))
 }
 func elementName(_ element: AXUIElement) -> String {
     for attr in [kAXTitleAttribute as CFString, kAXDescriptionAttribute as CFString] {
@@ -70,6 +69,7 @@ func axPressable(_ element: AXUIElement) -> Bool {
     return ((names as? [String]) ?? []).contains(kAXPressAction as String)
 }
 func axSettable(_ element: AXUIElement) -> Bool {
+    if axString(element, kAXSubroleAttribute as CFString) == "AXSecureTextField" { return false }
     var settable = DarwinBoolean(false)
     return AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success && settable.boolValue
 }
@@ -90,37 +90,82 @@ func focusedWindow() -> AXUIElement? {
     guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &window) == .success, let window else { return nil }
     return (window as! AXUIElement)
 }
-func collectElements(from window: AXUIElement) -> [[String: Any]] {
+func collectElements(from window: AXUIElement, query: Bool) -> [String: Any] {
     var out: [[String: Any]] = []
-    func walk(_ element: AXUIElement, _ path: String, _ depth: Int) {
-        if out.count >= 80 || depth > 6 { return }
-        for (i, child) in axChildren(element).enumerated() {
-            if out.count >= 80 { return }
-            let childPath = path.isEmpty ? "\(i)" : "\(path)/\(i)"
-            let role = axString(child, kAXRoleAttribute as CFString)
-            let name = elementName(child)
-            let press = axPressable(child)
-            let settable = axSettable(child)
-            if let frame = axFrame(child), frame.width > 0, frame.height > 0, !name.isEmpty || press || settable {
-                out.append([
-                    "index": out.count, "role": role, "name": name, "press": press, "settable": settable,
-                    "x": Int(frame.minX), "y": Int(frame.minY), "w": Int(frame.width), "h": Int(frame.height), "path": childPath,
-                ])
-            }
-            if depth < 6 { walk(child, childPath, depth + 1) }
+    let maxNodes = query ? min(2000, max(1, number("max_nodes"))) : 500
+    let limit = query ? min(80, max(1, number("limit"))) : 80
+    let deadline = ProcessInfo.processInfo.systemUptime + 2
+    var queue: [(AXUIElement, String, Int)] = [(window, "", 0)]
+    var seen: Set<AXUIElement> = [window]
+    var head = 0, visited = 0
+    var stop = ""
+    let text = (r["text"] as? String ?? "").lowercased()
+    func normalizedRole(_ value: String) -> String {
+        let lower = value.lowercased()
+        return lower.hasPrefix("ax") ? String(lower.dropFirst(2)) : lower
+    }
+    let wantedRole = normalizedRole(r["role"] as? String ?? "")
+    while head < queue.count {
+        if ProcessInfo.processInfo.systemUptime >= deadline { stop = "timeout"; break }
+        if visited >= maxNodes { stop = "max_nodes"; break }
+        let (node, path, depth) = queue[head]; head += 1; visited += 1
+        AXUIElementSetMessagingTimeout(node, 0.2)
+        let role = axString(node, kAXRoleAttribute as CFString)
+        let secure = axString(node, kAXSubroleAttribute as CFString) == "AXSecureTextField"
+        let name = elementName(node)
+        let value = secure ? "" : clipName(axString(node, kAXValueAttribute as CFString))
+        let press = axPressable(node), settable = !secure && axSettable(node)
+        let enabled = (copyAttribute(node, kAXEnabledAttribute as CFString) as? Bool) ?? true
+        let fields = [name, value, clipName(axString(node, kAXDescriptionAttribute as CFString))]
+        let matchesText = text.isEmpty || fields.contains {
+            (r["match_mode"] as? String) == "exact" ? $0.lowercased() == text : $0.lowercased().contains(text)
+        }
+        let matches = !query || (matchesText && (wantedRole.isEmpty || normalizedRole(role) == wantedRole))
+        if ProcessInfo.processInfo.systemUptime >= deadline { stop = "timeout"; break }
+        if !path.isEmpty, matches, let frame = axFrame(node), frame.width > 0, frame.height > 0,
+           frame.intersects(bounds), !name.isEmpty || !value.isEmpty || press || settable {
+            out.append([
+                "index": out.count, "role": role, "name": name, "value": value,
+                "description": fields[2],
+                "identity": axString(node, kAXIdentifierAttribute as CFString),
+                "enabled": enabled, "focused": (copyAttribute(node, kAXFocusedAttribute as CFString) as? Bool) ?? false,
+                "secure": secure, "press": press, "settable": settable,
+                "x": Int(frame.minX), "y": Int(frame.minY), "w": Int(frame.width), "h": Int(frame.height), "path": path,
+            ])
+            if out.count >= limit { stop = "limit"; break }
+        }
+        // Page children rather than reading an arbitrarily large AX array.
+        var count: CFIndex = 0
+        let childStatus = AXUIElementGetAttributeValueCount(node, kAXChildrenAttribute as CFString, &count)
+        if childStatus != .success {
+            if childStatus != .attributeUnsupported && stop.isEmpty { stop = "ax_error" }
+            continue
+        }
+        if depth >= 16 { if count > 0 && stop.isEmpty { stop = "max_depth" }; continue }
+        let capacity = max(0, maxNodes - seen.count)
+        let pageSize = min(count, capacity)
+        if count > pageSize && stop.isEmpty { stop = "max_nodes" }
+        guard pageSize > 0 else { continue }
+        var page: CFArray?
+        if AXUIElementCopyAttributeValues(node, kAXChildrenAttribute as CFString, 0, pageSize, &page) != .success {
+            if stop.isEmpty { stop = "ax_error" }; continue
+        }
+        for (i, child) in ((page as? [AXUIElement]) ?? []).enumerated() where seen.insert(child).inserted {
+            queue.append((child, path.isEmpty ? "\(i)" : "\(path)/\(i)", depth + 1))
         }
     }
-    walk(window, "", 1)
-    return out
+    return ["elements": out, "visited_nodes": visited, "truncated": !stop.isEmpty, "stop_reason": stop]
 }
 func elementAt(_ path: String) -> AXUIElement? {
     guard let window = focusedWindow(), !path.isEmpty else { return nil }
     var current = window
     for part in path.split(separator: "/") {
         guard let index = Int(part) else { return nil }
-        let kids = axChildren(current)
-        if index < 0 || index >= kids.count { return nil }
-        current = kids[index]
+        if index < 0 || index >= 2000 { return nil }
+        var page: CFArray?
+        guard AXUIElementCopyAttributeValues(current, kAXChildrenAttribute as CFString, index, 1, &page) == .success,
+              let child = (page as? [AXUIElement])?.first else { return nil }
+        current = child
     }
     return current
 }
@@ -130,6 +175,22 @@ func verify(_ element: AXUIElement) {
     if role != (r["expect_role"] as? String ?? "") || name != (r["expect_name"] as? String ?? "") {
         fail("element changed; observe again")
     }
+    if axString(element, kAXIdentifierAttribute as CFString) != (r["expect_identity"] as? String ?? "") {
+        fail("element identity changed; observe/query again")
+    }
+    if (copyAttribute(element, kAXEnabledAttribute as CFString) as? Bool) == false { fail("element disabled") }
+    if axString(element, kAXSubroleAttribute as CFString) == "AXSecureTextField" { fail("authentication control requires user") }
+    if clipName(axString(element, kAXValueAttribute as CFString)) != (r["expect_value"] as? String ?? "") { fail("element value changed; observe/query again") }
+    if clipName(axString(element, kAXDescriptionAttribute as CFString)) != (r["expect_description"] as? String ?? "") { fail("element description changed; observe/query again") }
+    guard let frame = axFrame(element), let expected = r["expect_frame"] as? [Int], expected.count == 4,
+          [Int(frame.minX), Int(frame.minY), Int(frame.width), Int(frame.height)] == expected else {
+        fail("element geometry changed; observe/query again")
+    }
+    verifyDesktop()
+}
+func verifyDesktop() {
+    if let expected = r["expect_app_id"] as? String, !expected.isEmpty, appID() != expected { fail("foreground app changed; observe/query again") }
+    if let expected = r["expect_window_id"] as? String, !expected.isEmpty, windowID() != expected { fail("foreground window changed; observe/query again") }
 }
 if action == "request_permissions" {
     let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -152,12 +213,17 @@ if action == "capture" {
     task.arguments = ["-x", "-D", "1", "-t", "png", path]
     try task.run(); task.waitUntilExit(); if task.terminationStatus != 0 { fail("screencapture failed") }; exit(0)
 }
-if action == "elements" {
+if action == "elements" || action == "query" {
     guard trusted else { fail("Accessibility permission missing") }
-    let elements = focusedWindow().map(collectElements) ?? []
-    FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject:["elements": elements])); exit(0)
+    verifyDesktop()
+    guard let window = focusedWindow() else { fail("focused accessibility window unavailable") }
+    AXUIElementSetMessagingTimeout(window, 0.2)
+    let payload = collectElements(from: window, query: action == "query")
+    verifyDesktop()
+    FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject:payload)); exit(0)
 }
 guard trusted else { fail("Accessibility permission missing") }
+if action != "release" { verifyDesktop() }
 func mouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton, _ count: Int64 = 1) {
     guard let e = CGEvent(mouseEventSource:nil, mouseType:type, mouseCursorPosition:point, mouseButton:button) else { fail("Cannot allocate mouse event") }
     e.setIntegerValueField(.mouseEventClickState, value:count); e.post(tap:.cghidEventTap)

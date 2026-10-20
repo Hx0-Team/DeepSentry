@@ -1,0 +1,12 @@
+{
+  "upstream": "golang.org/x/crypto",
+  "version": "v0.57.0",
+  "license": "BSD-3-Clause (LICENSE preserved)",
+  "patch_scope": "legacy-only AES192-CBC/AES256-CBC and HMAC-MD5/HMAC-MD5-96; modern defaults and host-key verification unchanged; 1024-bit group minimum only for explicitly selected SHA1 GEX",
+  "upstream_file_sha256": {
+    "ssh/common.go": "2d000b9acbcfc8a56367ab2b24aef0d8e69c206cc64e9629485416942899faf0",
+    "ssh/cipher.go": "dcb41888bb63e09f5f2e8d8166b12d43e76cf4f70484b89cf0f9e67d6d3d63dd",
+    "ssh/mac.go": "0894452248f590b8b26b97fa38b86116f9ef86305b4404096e4103e40537161c",
+    "ssh/kex.go": "0aed5134fc6e67e02fd40eca62a70547dee4d9317dffb3eff0e35052b5c39661"
+  }
+}

@@ -76,6 +76,7 @@ func runRuntimeProbe(ctx context.Context, cfgPath, mode string, repetitions, max
 		}
 	}
 	tools.ConfigureEnabled(config.GlobalConfig.EnabledTools, config.GlobalConfig.DisabledTools)
+	tools.SetWebSearchEnabled(config.GlobalConfig.Search.EffectiveEnabled(config.GlobalConfig))
 	if repetitions <= 0 {
 		repetitions = 3
 	}

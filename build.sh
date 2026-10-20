@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DeepSentry v2.0.5 一键交叉编译
+# DeepSentry 一键交叉编译（版本取自 VERSION）
 
 set -euo pipefail
 
@@ -15,6 +15,17 @@ LDFLAGS="-s -w -X 'ai-edr/internal/ui.Version=${APP_VERSION}' -X 'ai-edr/interna
 STAGING="$(mktemp -d "${TMPDIR:-/tmp}/deepsentry-build.XXXXXX")"
 trap 'rm -rf "$STAGING"' EXIT
 mkdir -p "$STAGING/bin" "$OUTPUT_DIR/bin"
+
+# Replace an executable by directory-entry swap. macOS can cache a security
+# decision against an inode; overwriting an ad-hoc signed binary in place may
+# leave the old path SIGKILLed even when its bytes are identical.
+replace_file() {
+  local src="$1" dst="$2"
+  local tmp="${dst}.tmp.$$"
+  cp "$src" "$tmp"
+  chmod 0755 "$tmp"
+  mv -f "$tmp" "$dst"
+}
 
 build_main() {
   local goos=$1 goarch=$2
@@ -80,9 +91,9 @@ find "$OUTPUT_DIR/bin" -maxdepth 1 -type f \( -name 'deepsentry' -o -name 'deeps
 cp "$STAGING"/deepsentry-* "$OUTPUT_DIR/"
 cp "$STAGING"/bin/* "$OUTPUT_DIR/bin/"
 if [[ -f "$STAGING/computer-use-helper" ]]; then
-  cp "$STAGING/computer-use-helper" "$OUTPUT_DIR/computer-use-helper"
-  cp "$STAGING/computer-use-helper" "$OUTPUT_DIR/bin/computer-use-helper"
-  cp "$STAGING/computer-use-helper" "$ROOT/computer-use-helper"
+  replace_file "$STAGING/computer-use-helper" "$OUTPUT_DIR/computer-use-helper"
+  replace_file "$STAGING/computer-use-helper" "$OUTPUT_DIR/bin/computer-use-helper"
+  replace_file "$STAGING/computer-use-helper" "$ROOT/computer-use-helper"
 fi
 
 HOST_BINARY="$STAGING/${APP_NAME}-${HOST_OS}-${HOST_ARCH}"
@@ -93,9 +104,9 @@ if [[ "$HOST_OS" == "windows" ]]; then
   HOST_ALIAS="${HOST_ALIAS}.exe"
   ROOT_ALIAS="${ROOT_ALIAS}.exe"
 fi
-cp "$HOST_BINARY" "$HOST_ALIAS"
-cp "$HOST_BINARY" "$OUTPUT_DIR/$(basename "$HOST_ALIAS")"
-cp "$HOST_BINARY" "$ROOT_ALIAS"
+replace_file "$HOST_BINARY" "$HOST_ALIAS"
+replace_file "$HOST_BINARY" "$OUTPUT_DIR/$(basename "$HOST_ALIAS")"
+replace_file "$HOST_BINARY" "$ROOT_ALIAS"
 
 # Fail the build if any default entry point was left on an older binary.
 cmp "$HOST_BINARY" "$HOST_ALIAS"
@@ -127,9 +138,24 @@ cp README.md "$OUTPUT_DIR/README.md"
 cp CHANGELOG.md "$OUTPUT_DIR/CHANGELOG.md"
 cp docs/Computer-Use.md "$OUTPUT_DIR/Computer-Use.md"
 cp config.example.yaml "$OUTPUT_DIR/config.example.yaml"
+cp hawkeye-mcp-server.mjs "$OUTPUT_DIR/hawkeye-mcp-server.mjs"
+mkdir -p "$OUTPUT_DIR/docs"
+# Public guides are explicit: local research notes and evidence are never copied.
+for guide in "Computer-Use.md" "操作手册.md" "HawkEye-MCP-深度适配.md" "FofaMap-MCP-适配.md" "聊天机器人接入.md" "终端接入与每日巡检.md" "DeepSeek-适配.md" "DeepSeek-Search.md" "文档能力-2.0.6.md" "Remote-Connections.md" "Verification-2.0.6.md"; do
+  cp "docs/$guide" "$OUTPUT_DIR/docs/$guide"
+  release_artifacts+=("docs/$guide")
+done
+# Binary distributions retain the pinned crypto dependency's BSD notice.
+mkdir -p "$OUTPUT_DIR/docs/ssh-crypto"
+for notice in LICENSE DEEPSENTRY.md DEEPSENTRY-PATCH.json; do
+  cp "third_party/xcrypto/$notice" "$OUTPUT_DIR/docs/ssh-crypto/$notice"
+  release_artifacts+=("docs/ssh-crypto/$notice")
+done
 mkdir -p "$OUTPUT_DIR/assets"
-cp assets/DeepSentry-v2.0.5-poster.png "$OUTPUT_DIR/assets/DeepSentry-v2.0.5-poster.png"
-release_artifacts+=("README.md" "CHANGELOG.md" "Computer-Use.md" "config.example.yaml" "assets/DeepSentry-v2.0.5-poster.png")
+cp assets/DeepSentry-v2.0.6-poster.png "$OUTPUT_DIR/assets/DeepSentry-v2.0.6-poster.png"
+cp LICENSE "$OUTPUT_DIR/LICENSE"
+cp SECURITY.md "$OUTPUT_DIR/SECURITY.md"
+release_artifacts+=("README.md" "CHANGELOG.md" "LICENSE" "SECURITY.md" "Computer-Use.md" "config.example.yaml" "hawkeye-mcp-server.mjs" "assets/DeepSentry-v2.0.6-poster.png")
 # Bundled playbooks must travel with standalone binaries. Keep them in a
 # build-owned directory so project/user Skill roots are never overwritten.
 bundled_dir="$OUTPUT_DIR/bundled-skills"
@@ -153,11 +179,9 @@ done < <(find "$bundled_dir" -type f -print0 | sort -z)
 # Include deployment requirements and matching hashes in the archive itself.
 cp docs/Computer-Use.md "$OUTPUT_DIR/Computer-Use.md"
 release_zip="$OUTPUT_DIR/${APP_NAME}-v${APP_VERSION}-all-platforms.zip"
-rm -f "$release_zip"
-(
-  cd "$OUTPUT_DIR"
-  zip -q "$(basename "$release_zip")" "${release_artifacts[@]}" SHA256SUMS
-)
+# The macOS system zip omits UTF-8 filename flags. Use the Go standard library
+# so Chinese guides keep their names in Windows/Python and other extractors.
+go run ./cmd/releasepack --root "$OUTPUT_DIR" --out "$(basename "$release_zip")"
 
 echo "------------------------------------------"
 echo "✅ 编译完成"

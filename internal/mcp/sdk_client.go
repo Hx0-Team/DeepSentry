@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -503,7 +504,7 @@ func (conn *sdkConnection) callTool(name string, schema map[string]interface{}, 
 	toolTimeoutExplicit := conn.toolTimeoutExplicit
 	conn.mu.RUnlock()
 	if hawkEye {
-		args = applyHawkEyeCallDefaults(name, args)
+		args = applyHawkEyeCallDefaultsForSchema(name, schema, args)
 	}
 	if fofaMap {
 		args = applyFofaMapCallDefaults(name, args)
@@ -561,7 +562,7 @@ func (conn *sdkConnection) callTool(name string, schema map[string]interface{}, 
 		return "MCP 工具返回可修正错误:\n" + out, nil
 	}
 	conn.recordHawkEyeState(name, args)
-	return compactHawkEyeMCPOutput(name, out), nil
+	return out, nil
 }
 
 func minMCPDuration(left, right time.Duration) time.Duration {
@@ -578,7 +579,8 @@ func applyHawkEyeCallDefaults(name string, args map[string]string) map[string]st
 	}
 	copyArgs := make(map[string]string, len(args)+4)
 	for key, value := range args {
-		if strings.EqualFold(strings.ReplaceAll(strings.TrimSpace(key), "_", ""), "cursor") && strings.TrimSpace(value) != "" && strings.TrimSpace(value) != "0" {
+		if strings.EqualFold(strings.ReplaceAll(strings.TrimSpace(key), "_", ""), "cursor") &&
+			strings.TrimSpace(value) != "" && strings.TrimSpace(value) != "0" {
 			continue
 		}
 		copyArgs[key] = value
@@ -586,10 +588,10 @@ func applyHawkEyeCallDefaults(name string, args map[string]string) map[string]st
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "browser_snapshot":
 		if strings.TrimSpace(copyArgs["context_budget_chars"]) == "" {
-			copyArgs["context_budget_chars"] = "30000"
+			copyArgs["context_budget_chars"] = "12000"
 		}
 		if strings.TrimSpace(copyArgs["max_elements"]) == "" {
-			copyArgs["max_elements"] = "160"
+			copyArgs["max_elements"] = "100"
 		}
 		if strings.TrimSpace(copyArgs["compact"]) == "" {
 			copyArgs["compact"] = "true"
@@ -597,13 +599,36 @@ func applyHawkEyeCallDefaults(name string, args map[string]string) map[string]st
 		if strings.TrimSpace(copyArgs["viewport_only"]) == "" {
 			copyArgs["viewport_only"] = "true"
 		}
-	case "browser_search", "browser_fetch", "browser_read_text", "browser_find":
+	case "browser_search", "browser_fetch", "browser_read_text", "browser_exam_questions":
 		if strings.TrimSpace(copyArgs["context_budget_chars"]) == "" {
-			copyArgs["context_budget_chars"] = "30000"
+			copyArgs["context_budget_chars"] = "12000"
 		}
 	case "browser_research":
 		if strings.TrimSpace(copyArgs["context_budget_chars"]) == "" {
-			copyArgs["context_budget_chars"] = "50000"
+			copyArgs["context_budget_chars"] = "16000"
+		}
+	case "browser_find":
+		if strings.TrimSpace(copyArgs["limit"]) == "" {
+			copyArgs["limit"] = "12"
+		}
+	case "browser_bookmarks":
+		if hawkEyeArg(copyArgs, "action") == "list" || hawkEyeArg(copyArgs, "action") == "search" {
+			if strings.TrimSpace(copyArgs["limit"]) == "" {
+				copyArgs["limit"] = "50"
+			}
+		}
+	case "hawkeye_evaluate":
+		if strings.TrimSpace(copyArgs["maxLength"]) == "" {
+			copyArgs["maxLength"] = "4000"
+		}
+	case "hawkeye_codec":
+		if hawkEyeArg(copyArgs, "action") == "catalog" {
+			if strings.TrimSpace(copyArgs["summary"]) == "" {
+				copyArgs["summary"] = "true"
+			}
+			if strings.TrimSpace(copyArgs["includeMeta"]) == "" {
+				copyArgs["includeMeta"] = "false"
+			}
 		}
 	case "browser_press_key":
 		if strings.TrimSpace(copyArgs["inputMode"]) == "" && strings.EqualFold(strings.TrimSpace(copyArgs["key"]), "f") {
@@ -620,6 +645,29 @@ func applyHawkEyeCallDefaults(name string, args map[string]string) map[string]st
 		}
 	}
 	return copyArgs
+}
+
+// Only inject defaults actually advertised by this server version/profile.
+// In particular browser_find never accepts context_budget_chars. Explicit
+// caller fields are kept, so real mistakes still receive validation errors.
+func applyHawkEyeCallDefaultsForSchema(name string, schema map[string]interface{}, args map[string]string) map[string]string {
+	defaults := applyHawkEyeCallDefaults(name, args)
+	if hawkEyeContinuationToken(args) != "" {
+		return defaults
+	}
+	properties, ok := schema["properties"].(map[string]interface{})
+	if !ok {
+		return defaults
+	}
+	for key := range defaults {
+		if _, explicit := args[key]; explicit {
+			continue
+		}
+		if _, supported := properties[key]; !supported {
+			delete(defaults, key)
+		}
+	}
+	return defaults
 }
 
 func hawkEyeStaleNavigateError(name, output string) bool {
@@ -660,7 +708,19 @@ func compactHawkEyeMCPOutput(name, output string) string {
 
 func formatHawkEyeMCPContent(name string, contents []sdkmcp.Content, structured any, args map[string]string) string {
 	dumpStructured := structured
-	if hawkEyeDropsStructuredDump(name) {
+	hasText, textDuplicatesStructured := false, false
+	structuredJSON, _ := json.Marshal(structured)
+	for _, content := range contents {
+		if item, ok := content.(*sdkmcp.TextContent); ok && strings.TrimSpace(item.Text) != "" {
+			hasText = true
+			var decoded any
+			if json.Unmarshal([]byte(item.Text), &decoded) == nil {
+				encoded, _ := json.Marshal(decoded)
+				textDuplicatesStructured = textDuplicatesStructured || bytes.Equal(encoded, structuredJSON)
+			}
+		}
+	}
+	if hasText && (hawkEyeDropsStructuredDump(name) || textDuplicatesStructured) {
 		dumpStructured = nil
 	}
 	out := formatMCPContent(contents, dumpStructured)
@@ -673,7 +733,28 @@ func formatHawkEyeMCPContent(name string, contents []sdkmcp.Content, structured 
 	if hint := hawkEyeInteractionHint(name); hint != "" {
 		out += "\n" + hint
 	}
+	// The server paginates immutable text before returning it. Cutting that
+	// page again loses its middle forever: next_page_token starts AFTER the
+	// complete server page. Honor the caller's bounded page budget intact.
+	if hawkEyeHasPagedContext(structured) {
+		return out
+	}
 	return compactHawkEyeMCPOutput(name, out)
+}
+
+func hawkEyeHasPagedContext(structured any) bool {
+	raw, err := json.Marshal(structured)
+	if err != nil {
+		return false
+	}
+	var payload struct {
+		Context map[string]any `json:"context"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		return false
+	}
+	_, budget := payload.Context["budget_chars"]
+	return budget || payload.Context["immutable"] == true
 }
 
 func (conn *sdkConnection) recordHawkEyeState(name string, args map[string]string) {

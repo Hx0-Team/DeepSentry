@@ -37,13 +37,19 @@ type documentParseResult struct {
 // DocumentParse extracts text, tables, and metadata from common flow/layout
 // documents without depending on target-side office/pdf commands.
 func DocumentParse(rt Runtime, filePath, mode string, maxText, maxRows, maxSheets int) (string, error) {
+	return DocumentParseWindow(rt, filePath, mode, maxText, maxRows, maxSheets, 0)
+}
+
+// offset is a Unicode-character offset in the formatted extraction, not a byte
+// offset in an Office ZIP/PDF. Repeated windows never read the binary as text.
+func DocumentParseWindow(rt Runtime, filePath, mode string, maxText, maxRows, maxSheets, offset int) (string, error) {
 	filePath = strings.TrimSpace(filePath)
 	if filePath == "" {
 		return "", fmt.Errorf("path 不能为空")
 	}
 	mode = normalizeDocumentMode(mode)
 	if maxText <= 0 {
-		maxText = 30000
+		maxText = 12000
 	}
 	if maxText > 100000 {
 		maxText = 100000
@@ -61,15 +67,27 @@ func DocumentParse(rt Runtime, filePath, mode string, maxText, maxRows, maxSheet
 		maxSheets = 50
 	}
 
-	data, err := readTargetLimited(filePath, maxDocumentParseRead)
+	data, err := rt.readDocumentTargetLimited(filePath)
 	if err != nil {
 		return "", err
 	}
-	result, err := parseDocumentBytes(filePath, data, maxText, maxRows, maxSheets)
+	if offset < 0 || offset > 1_000_000 {
+		return "", fmt.Errorf("offset 必须为 0..1000000")
+	}
+	result, err := parseDocumentBytes(filePath, data, 1_000_000, maxRows, maxSheets)
 	if err != nil {
 		return "", err
 	}
-	return formatDocumentParseOutput(rt, filePath, len(data), mode, maxText, result), nil
+	full := []rune(formatDocumentParseOutput(rt, filePath, len(data), mode, 1_000_000, result))
+	if offset > len(full) {
+		return "", fmt.Errorf("offset 超出提取结果长度 %d", len(full))
+	}
+	end := min(len(full), offset+maxText)
+	next := "complete=true"
+	if end < len(full) {
+		next = fmt.Sprintf("complete=false next_offset=%d；继续 document_parse，保持 path/mode/max_rows/max_sheets 不变并传 offset=%d", end, end)
+	}
+	return string(full[offset:end]) + fmt.Sprintf("\n[Document window: offset=%d total_chars=%d %s]\n", offset, len(full), next), nil
 }
 
 func normalizeDocumentMode(mode string) string {
@@ -91,9 +109,14 @@ func parseDocumentBytes(filePath string, data []byte, maxText, maxRows, maxSheet
 	ext := strings.ToLower(filepath.Ext(filePath))
 	switch ext {
 	case ".pdf":
+		if !bytes.HasPrefix(data, []byte("%PDF-")) {
+			return documentParseResult{}, fmt.Errorf("文件不是有效PDF；不能把改扩展名的文本当作PDF")
+		}
 		return parsePDFDocument(data, maxText), nil
 	case ".docx":
 		return parseDOCXDocument(data, maxText)
+	case ".pptx":
+		return parsePPTXDocument(data, maxText)
 	case ".xlsx", ".xlsm":
 		return parseXLSXDocument(data, maxRows, maxSheets, maxText)
 	case ".csv":
@@ -102,7 +125,7 @@ func parseDocumentBytes(filePath string, data []byte, maxText, maxRows, maxSheet
 		return parseDelimitedDocument(data, '\t', maxRows, maxText, "TSV table"), nil
 	case ".rtf":
 		return parseRTFDocument(data, maxText), nil
-	case ".doc", ".xls":
+	case ".doc", ".xls", ".ppt":
 		return parseLegacyOfficeDocument(data, ext, maxText), nil
 	}
 
@@ -116,6 +139,8 @@ func parseDocumentBytes(filePath string, data []byte, maxText, maxRows, maxSheet
 				return parseDOCXDocument(data, maxText)
 			case "xlsx":
 				return parseXLSXDocument(data, maxRows, maxSheets, maxText)
+			case "pptx":
+				return parsePPTXDocument(data, maxText)
 			}
 		}
 	}
@@ -227,11 +252,18 @@ func parseDOCXDocument(data []byte, maxText int) (documentParseResult, error) {
 	}
 
 	meta = append(meta, fmt.Sprintf("paragraphs=%d", paragraphs), fmt.Sprintf("tables=%d", tables))
+	var structuredTables []string
+	if f := files["word/document.xml"]; f != nil {
+		if raw, err := readZipEntryLimited(f, maxOOXMLEntryRead); err == nil {
+			structuredTables = extractOfficeTables(raw)
+		}
+	}
 	return documentParseResult{
 		Format: "Word DOCX",
 		Parser: "OOXML ZIP/XML",
 		Meta:   meta,
 		Text:   truncateDocumentText(strings.Join(textParts, "\n\n"), maxText),
+		Tables: structuredTables,
 	}, nil
 }
 
@@ -375,10 +407,20 @@ func parsePDFDocument(data []byte, maxText int) documentParseResult {
 		}
 	}
 	text, streams, warnings := extractPDFText(data, maxText)
+	parser := "native PDF text streams"
+	if external, err := popplerPDFText(data); err == nil && strings.TrimSpace(external) != "" {
+		text = pdfLayoutWithPages(external)
+		parser = "Poppler layout text (字体映射/中文/页分隔)"
+		warnings = nil
+	}
+	if strings.TrimSpace(text) == "" {
+		warnings = append(warnings, "未提取到可读正文，可能是扫描/图片PDF；需要OCR或视觉模型，不能声称已读懂图片")
+	}
+	warnings = append(warnings, "仅提取文字/布局，未做OCR或视觉理解；图片与图表可能有遗漏")
 	meta = append(meta, fmt.Sprintf("streams_scanned=%d", streams))
 	return documentParseResult{
 		Format:   "PDF document",
-		Parser:   "native PDF text streams",
+		Parser:   parser,
 		Meta:     meta,
 		Text:     truncateDocumentText(text, maxText),
 		Warnings: warnings,
@@ -443,6 +485,8 @@ func detectOOXMLKind(data []byte) (string, bool) {
 			return "docx", true
 		case "xl/workbook.xml":
 			return "xlsx", true
+		case "ppt/presentation.xml":
+			return "pptx", true
 		}
 	}
 	return "", false
@@ -778,7 +822,7 @@ func parseWorksheetPreview(data []byte, shared []string, maxRows int) (string, i
 				cells = append(cells, "...")
 				break
 			}
-			cells = append(cells, fmt.Sprintf("%s=%s", colName(c), truncateOneLine(rows[r][c], 160)))
+			cells = append(cells, fmt.Sprintf("%s=%s", colName(c), strings.ReplaceAll(rows[r][c], "\n", " ")))
 		}
 		b.WriteString(fmt.Sprintf("    Row %d: %s\n", r, strings.Join(cells, " | ")))
 		shown++
@@ -851,6 +895,7 @@ func extractPDFInfoString(data []byte, key string) string {
 }
 
 func extractPDFText(data []byte, maxText int) (string, int, []string) {
+	unicodeHex := bytes.Contains(data, []byte("/UniGB-UCS2-H"))
 	var chunks []string
 	warnings := []string{}
 	streams := 0
@@ -888,7 +933,7 @@ func extractPDFText(data []byte, maxText int) (string, int, []string) {
 				_ = z.Close()
 			}
 		}
-		if t := parsePDFContentText(decoded); t != "" {
+		if t := parsePDFContentText(decoded, unicodeHex); t != "" {
 			chunks = append(chunks, t)
 		}
 		streams++
@@ -898,14 +943,14 @@ func extractPDFText(data []byte, maxText int) (string, int, []string) {
 		off = end + len("endstream")
 	}
 	if len(chunks) == 0 {
-		if t := parsePDFContentText(data[:min(len(data), 512*1024)]); t != "" {
+		if t := parsePDFContentText(data[:min(len(data), 512*1024)], unicodeHex); t != "" {
 			chunks = append(chunks, t)
 		}
 	}
 	return cleanDocumentText(strings.Join(chunks, "\n")), streams, dedupeStrings(warnings)
 }
 
-func parsePDFContentText(data []byte) string {
+func parsePDFContentText(data []byte, unicodeHex ...bool) string {
 	if !bytes.Contains(data, []byte("Tj")) && !bytes.Contains(data, []byte("TJ")) &&
 		!bytes.Contains(data, []byte("'")) && !bytes.Contains(data, []byte("\"")) {
 		return ""
@@ -925,7 +970,7 @@ func parsePDFContentText(data []byte) string {
 			if i+1 < len(data) && data[i+1] == '<' {
 				continue
 			}
-			s, next := readPDFHexString(data, i)
+			s, next := readPDFHexString(data, i, unicodeHex...)
 			if next > i {
 				if decoded := strings.TrimSpace(s); decoded != "" {
 					out = append(out, decoded)
@@ -992,7 +1037,7 @@ func readPDFLiteralString(data []byte, start int) (string, int) {
 	return "", start
 }
 
-func readPDFHexString(data []byte, start int) (string, int) {
+func readPDFHexString(data []byte, start int, forceUnicode ...bool) (string, int) {
 	end := bytes.IndexByte(data[start+1:], '>')
 	if end < 0 {
 		return "", start
@@ -1013,6 +1058,9 @@ func readPDFHexString(data []byte, start int) (string, int) {
 			return "", start + 1 + end + 1
 		}
 		buf[i] = byte(v)
+	}
+	if len(forceUnicode) > 0 && forceUnicode[0] && !bytes.HasPrefix(buf, []byte{0xfe, 0xff}) {
+		buf = append([]byte{0xfe, 0xff}, buf...)
 	}
 	return decodePDFBytes(buf), start + 1 + end + 1
 }

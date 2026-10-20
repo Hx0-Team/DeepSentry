@@ -18,9 +18,9 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-func TestHawkEyeV1012ProfileCoversAuthoritativeServerContract(t *testing.T) {
-	if got := len(HawkEyeKnownToolNames()); got != 51 {
-		t.Fatalf("HawkEye 1.0.12 profile tool count=%d, want 51", got)
+func TestHawkEyeV1014ProfileCoversAuthoritativeServerContract(t *testing.T) {
+	if got := len(HawkEyeKnownToolNames()); got != 53 {
+		t.Fatalf("HawkEye extension 1.0.7 / server 1.0.14 tool count=%d, want 53", got)
 	}
 	sourcePath := ""
 	for _, candidate := range []string{
@@ -40,8 +40,8 @@ func TestHawkEyeV1012ProfileCoversAuthoritativeServerContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(raw)
-	if !strings.Contains(source, "const SERVER_VERSION = '1.0.12'") {
-		t.Fatalf("expected HawkEye 1.0.12 server, got %s", sourcePath)
+	if !strings.Contains(source, "const SERVER_VERSION = '1.0.14'") {
+		t.Fatalf("expected HawkEye server 1.0.14 for extension 1.0.7, got %s", sourcePath)
 	}
 	start := strings.Index(source, "const TOOLS = [")
 	if start < 0 {
@@ -68,6 +68,7 @@ func TestHawkEyeV1012ProfileCoversAuthoritativeServerContract(t *testing.T) {
 		"context_budget_chars", "page_token", "next_page_token", "viewport_only",
 		"stableId", "exact", "authorized", "release_all", "fuzzingEnabled",
 		"hawkeye_capture_inspect", "hawkeye_request_mutate", "hawkeye_script_upsert",
+		"browser_bookmarks", "hawkeye_script_manage", "expectedUpdatedAt", "concurrency", "includeMeta", "save_file", "page_scan",
 	} {
 		if !strings.Contains(source, fragment) {
 			t.Fatalf("authoritative HawkEye 1.0.12 contract lost critical field/tool %q", fragment)
@@ -106,6 +107,14 @@ func TestHawkEyeRiskIsActionAware(t *testing.T) {
 		{"hawkeye_intercept", map[string]string{"action": "release"}, MCPRiskHigh},
 		{"browser_tabs", map[string]string{"action": "new"}, MCPRiskLow},
 		{"browser_tabs", map[string]string{"action": "close"}, MCPRiskMedium},
+		{"browser_fill_form", map[string]string{"fields": "[]"}, MCPRiskLow},
+		{"browser_fill_form", map[string]string{"fields": "[]", "submit": "true"}, MCPRiskMedium},
+		{"browser_handle_dialog", map[string]string{"action": "accept"}, MCPRiskMedium},
+		{"browser_handle_dialog", map[string]string{"action": "dismiss"}, MCPRiskLow},
+		{"browser_answer_questions", map[string]string{"answers": "[]"}, MCPRiskLow},
+		{"browser_download_file", map[string]string{"action": "download"}, MCPRiskMedium},
+		{"browser_download_file", map[string]string{"action": "download", "conflictAction": "overwrite"}, MCPRiskHigh},
+		{"browser_file_upload", map[string]string{"path": "/tmp/a"}, MCPRiskHigh},
 		{"hawkeye_capture_start", nil, MCPRiskLow},
 		{"hawkeye_scope", map[string]string{"action": "get"}, MCPRiskLow},
 		{"hawkeye_scope", map[string]string{"action": "set"}, MCPRiskHigh},
@@ -130,15 +139,74 @@ func TestHawkEyeTimeoutsRespectLongOperationsAndExplicitOverride(t *testing.T) {
 	if got := HawkEyeToolTimeout("browser_fetch", 60*time.Second, false); got != 130*time.Second {
 		t.Fatalf("fetch timeout=%s", got)
 	}
+	for _, name := range []string{"browser_download_file", "browser_file_upload", "hawkeye_codec"} {
+		if got := HawkEyeToolTimeout(name, 60*time.Second, false); got != 130*time.Second {
+			t.Fatalf("%s timeout=%s", name, got)
+		}
+	}
+	for _, name := range []string{"browser_fill_form", "browser_answer_questions", "hawkeye_request_replay"} {
+		if got := HawkEyeToolTimeout(name, 60*time.Second, false); got != 100*time.Second {
+			t.Fatalf("%s timeout=%s", name, got)
+		}
+	}
 	if got := HawkEyeToolTimeout("browser_research", 30*time.Second, true); got != 30*time.Second {
 		t.Fatalf("explicit timeout was ignored: %s", got)
 	}
 }
 
+func TestBundledHawkEyeServerKeepsDeepSentryLifecyclePatch(t *testing.T) {
+	path := filepath.Clean(filepath.Join("..", "..", "hawkeye-mcp-server.mjs"))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(raw)
+	for _, marker := range []string{
+		"const SERVER_VERSION = '1.0.14'",
+		"DEEPSENTRY_MCP_PARENT_PID",
+		"ownedByDeepSentry",
+		"stdio input ended; owned MCP server exiting with DeepSentry",
+	} {
+		if !strings.Contains(source, marker) {
+			t.Fatalf("bundled HawkEye server lost DeepSentry lifecycle marker %q", marker)
+		}
+	}
+}
+
+func TestHawkEyeUpstreamToolContractMatchesBundled(t *testing.T) {
+	upstream := strings.TrimSpace(os.Getenv("HAWKEYE_UPSTREAM_SERVER"))
+	if upstream == "" {
+		t.Skip("set HAWKEYE_UPSTREAM_SERVER=/path/to/hawkeye-mcp-server.mjs to compare the upstream TOOLS contract")
+	}
+	want := hawkEyeTOOLSBlock(t, filepath.Join("..", "..", "hawkeye-mcp-server.mjs"))
+	got := hawkEyeTOOLSBlock(t, upstream)
+	if got != want {
+		t.Fatal("upstream HawkEye TOOLS contract differs from the bundled DeepSentry server; review schema/tool changes before syncing")
+	}
+}
+
+func hawkEyeTOOLSBlock(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(raw)
+	start := strings.Index(source, "const TOOLS = [")
+	if start < 0 {
+		t.Fatalf("%s: const TOOLS not found", path)
+	}
+	end := strings.Index(source[start:], "\n];")
+	if end < 0 {
+		t.Fatalf("%s: const TOOLS end not found", path)
+	}
+	return source[start : start+end+3]
+}
+
 func TestHawkEyeCallDefaultsAreBoundedAndExplicitValuesWin(t *testing.T) {
 	input := map[string]string{"compact": "false", "context_budget_chars": "120000"}
 	got := applyHawkEyeCallDefaults("browser_snapshot", input)
-	if got["compact"] != "false" || got["context_budget_chars"] != "120000" || got["max_elements"] != "160" || got["viewport_only"] != "true" {
+	if got["compact"] != "false" || got["context_budget_chars"] != "120000" || got["max_elements"] != "100" || got["viewport_only"] != "true" {
 		t.Fatalf("defaults overrode explicit values or were incomplete: %#v", got)
 	}
 	if _, mutated := input["max_elements"]; mutated {
@@ -166,9 +234,17 @@ func TestHawkEyeCallDefaultsAreBoundedAndExplicitValuesWin(t *testing.T) {
 	if alias["page_token"] != "opaqueTokenFromContext" || alias["next_page_token"] != "" || alias["context_budget_chars"] != "" {
 		t.Fatalf("next_page_token should collapse to page_token only: %#v", alias)
 	}
+	exam := applyHawkEyeCallDefaults("browser_exam_questions", nil)
+	if exam["context_budget_chars"] != "12000" {
+		t.Fatalf("exam questions should be bounded by default: %#v", exam)
+	}
 	numeric := applyHawkEyeCallDefaults("browser_snapshot", map[string]string{"cursor": "80", "compact": "false"})
 	if _, ok := numeric["cursor"]; ok {
 		t.Fatalf("numeric cursor must be stripped: %#v", numeric)
+	}
+	examCursor := applyHawkEyeCallDefaults("browser_exam_questions", map[string]string{"cursor": "80", "context_budget_chars": "12000"})
+	if _, ok := examCursor["cursor"]; ok {
+		t.Fatalf("numeric exam cursor must be stripped; use page_token: %#v", examCursor)
 	}
 	solve := applyHawkEyeCallDefaults("browser_captcha_assist", map[string]string{"action": "solve", "answer": "A8K2"})
 	if solve["authorized"] != "true" {
@@ -213,6 +289,7 @@ func TestHawkEyeWorkflowPromptForbidsInstallSelfCheck(t *testing.T) {
 		"禁止再用 execute", "browser_select_option", "inputMode=trusted", "禁止 read_file",
 		"load_skill", "playbackRate", "canvas.drawImage", "browser_browse", "?p=N",
 		"page_token", "site:", "captcha_assist",
+		"browser_fill_form", "browser_answer_questions", "nativeDownloadStarted", "browser_file_upload",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("workflow prompt missing %q", want)

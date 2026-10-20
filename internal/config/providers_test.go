@@ -48,7 +48,7 @@ func TestCanonicalModelIDRewritesRetiredDeepSeekIDs(t *testing.T) {
 		t.Fatalf("existing config was not rewritten: %q", cfg.ModelName)
 	}
 	capabilities := cfg.EffectiveModelCapabilities()
-	if !capabilities.SupportsVision || capabilities.ContextWindowTokens != 1_000_000 {
+	if !capabilities.SupportsVision || capabilities.ContextWindowTokens != 1_048_576 {
 		t.Fatalf("rewritten model lost vision/context: %+v", capabilities)
 	}
 }
@@ -72,7 +72,7 @@ func TestApplyProviderDefaultsLatestChineseVisionModels(t *testing.T) {
 				t.Fatalf("unexpected defaults: %+v", cfg)
 			}
 			capabilities := cfg.EffectiveModelCapabilities()
-			if !capabilities.SupportsVision || capabilities.ContextWindowTokens != 1_000_000 {
+			if !capabilities.SupportsVision || capabilities.ContextWindowTokens < 1_000_000 {
 				t.Fatalf("unexpected capabilities: %+v", capabilities)
 			}
 		})
@@ -131,7 +131,7 @@ func TestFindModelPresetPreservesTextOnlyVariants(t *testing.T) {
 		vision   bool
 		context  int
 	}{
-		{"deepseek", "deepseek-v4-pro", false, 1_000_000},
+		{"deepseek", "deepseek-v4-pro", false, 1_048_576},
 		{"minimax", "MiniMax-M2.7-highspeed", false, 204_800},
 		{"mimo", "mimo-v2.5-pro", false, 1_000_000},
 		{"custom", "GLM-5.3-FLASH", true, 1_000_000},
@@ -140,8 +140,8 @@ func TestFindModelPresetPreservesTextOnlyVariants(t *testing.T) {
 		{"openai", "gpt-6-luna", true, 1_050_000},
 		{"openai", "gpt-6", true, 1_050_000},
 		{"custom", "chatgpt6", true, 1_050_000},
-		{"deepseek", "deepseek-flash", true, 1_000_000},
-		{"deepseek", "deepseek-v4.1-flash", true, 1_000_000},
+		{"deepseek", "deepseek-flash", true, 1_048_576},
+		{"deepseek", "deepseek-v4.1-flash", true, 1_048_576},
 		{"openai", "gpt-5.6", true, 1_050_000},
 		{"anthropic", "claude-opus-5-5", true, 1_000_000},
 		{"anthropic", "claude-opus-5", true, 1_000_000},
@@ -277,6 +277,10 @@ func TestProtocolEndpointRouting(t *testing.T) {
 		{ProtocolOpenAIResponses, "https://proxy.test/prefix/v1/chat/completions", "https://proxy.test/prefix/v1/responses"},
 		{ProtocolOpenAIResponses, "https://api.deepseek.com", "https://api.deepseek.com/responses"},
 		{ProtocolAnthropicMessages, "https://proxy.test/anthropic/v1", "https://proxy.test/anthropic/v1/messages"},
+		{ProtocolAnthropicMessages, "https://api.deepseek.com", "https://api.deepseek.com/anthropic/v1/messages"},
+		{ProtocolAnthropicMessages, "https://api.deepseek.com/v1", "https://api.deepseek.com/anthropic/v1/messages"},
+		{ProtocolAnthropicMessages, "https://api.deepseek.com/anthropic", "https://api.deepseek.com/anthropic/v1/messages"},
+		{ProtocolAnthropicMessages, "https://api.deepseek.com/anthropic/v1", "https://api.deepseek.com/anthropic/v1/messages"},
 	} {
 		c := Config{Provider: "custom", APIProtocol: tc.protocol, ApiURL: tc.input, ModelName: "pinned-model"}
 		ApplyProviderDefaults(&c)

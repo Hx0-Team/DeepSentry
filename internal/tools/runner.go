@@ -3,6 +3,7 @@ package tools
 import (
 	"ai-edr/internal/builtin"
 	"ai-edr/internal/executor"
+	"context"
 	"fmt"
 )
 
@@ -12,6 +13,10 @@ func Run(name string, args map[string]string, isWindows bool) (string, string, e
 }
 
 func RunWithExecutor(name string, args map[string]string, isWindows bool, ex executor.Executor) (string, string, error) {
+	return RunWithExecutorContext(context.Background(), name, args, isWindows, ex)
+}
+
+func RunWithExecutorContext(ctx context.Context, name string, args map[string]string, isWindows bool, ex executor.Executor) (string, string, error) {
 	t, ok := Get(name)
 	if !ok {
 		names := ListNames()
@@ -24,6 +29,7 @@ func RunWithExecutor(name string, args map[string]string, isWindows bool, ex exe
 	isRemote := ex != nil && ex.IsRemote()
 	rt := builtin.NewRuntime(windowsHint(isWindows), isRemote)
 	rt = builtin.WithExecutor(rt, ex)
+	rt.Context = ctx
 
 	out, err := builtin.Run(name, args, rt)
 	if err != nil {

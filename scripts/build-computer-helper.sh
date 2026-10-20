@@ -7,7 +7,10 @@ STAGE="$(mktemp -d "${TMPDIR:-/tmp}/deepsentry-computer-helper.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 for ARCH in arm64 x86_64; do
- xcrun swiftc -O -sdk "$SDK" -target "${ARCH}-apple-macos12.0" \
+ # This synchronous Foundation/AppKit helper uses the stable system Swift
+ # ABI, not back-deployed concurrency or dynamic replacements. New CLTs can
+ # ship arm64-only compatibility archives, which break universal linking.
+ xcrun swiftc -O -sdk "$SDK" -target "${ARCH}-apple-macos12.0" -runtime-compatibility-version none \
   "$ROOT/internal/desktop/helpers/macos.swift" -o "$STAGE/$ARCH" \
   -framework AppKit -framework ApplicationServices
 done

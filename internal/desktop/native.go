@@ -109,7 +109,7 @@ func (nativeBackend) helper(ctx context.Context, r Request) ([]byte, error) {
 		return command(ctx, input, p)
 	}
 	if runtime.GOOS == "windows" {
-		idempotent := r.Action == "status" || r.Action == "capture" || r.Action == "elements"
+		idempotent := r.Action == "status" || r.Action == "capture" || r.Action == "elements" || r.Action == "query"
 		out, err := winPersistent.call(ctx, input, idempotent)
 		if err == nil {
 			return out, nil
@@ -182,7 +182,7 @@ func (n nativeBackend) Capture(ctx context.Context, path string) error {
 	return err
 }
 func (n nativeBackend) Elements(ctx context.Context) (string, []Element, error) {
-	if runtime.GOOS != "darwin" {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
 		return "unsupported", nil, nil
 	}
 	raw, err := n.helper(ctx, Request{Action: "elements"})
@@ -192,10 +192,32 @@ func (n nativeBackend) Elements(ctx context.Context) (string, []Element, error) 
 	var payload struct {
 		Elements []Element `json:"elements"`
 	}
-	if err = json.Unmarshal(bytes.TrimPrefix(raw, []byte{0xef, 0xbb, 0xbf}), &payload); err != nil || len(payload.Elements) == 0 {
+	if err = json.Unmarshal(bytes.TrimPrefix(raw, []byte{0xef, 0xbb, 0xbf}), &payload); err != nil {
+		return "vision", nil, err
+	}
+	if len(payload.Elements) == 0 {
 		return "vision", nil, nil
 	}
 	return "element", payload.Elements, nil
+}
+func (n nativeBackend) Query(ctx context.Context, r Request) (ElementQueryResult, error) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		return ElementQueryResult{}, fmt.Errorf("targeted query unsupported on this platform; use observe")
+	}
+	raw, err := n.helper(ctx, r)
+	if err != nil {
+		return ElementQueryResult{}, err
+	}
+	var payload struct {
+		Elements     []Element `json:"elements"`
+		VisitedNodes int       `json:"visited_nodes"`
+		Truncated    bool      `json:"truncated"`
+		StopReason   string    `json:"stop_reason"`
+	}
+	if err = json.Unmarshal(bytes.TrimPrefix(raw, []byte{0xef, 0xbb, 0xbf}), &payload); err != nil {
+		return ElementQueryResult{}, err
+	}
+	return ElementQueryResult{payload.Elements, payload.VisitedNodes, payload.Truncated, payload.StopReason}, nil
 }
 func (n nativeBackend) Input(ctx context.Context, r Request) error {
 	if runtime.GOOS != "linux" {

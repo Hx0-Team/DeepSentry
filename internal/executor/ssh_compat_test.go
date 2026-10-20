@@ -72,8 +72,8 @@ func TestBuildSSHClientConfigCanDisableLegacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(client.KeyExchanges) != 0 || len(client.Ciphers) != 0 {
-		t.Fatalf("modern mode should leave algorithm lists empty so Go defaults apply: kex=%v ciphers=%v", client.KeyExchanges, client.Ciphers)
+	if containsSSHAlgo(client.KeyExchanges, ssh.InsecureKeyExchangeDH14SHA1) || containsSSHAlgo(client.Ciphers, ssh.InsecureCipherAES128CBC) || containsSSHAlgo(client.MACs, ssh.InsecureHMACSHA196) {
+		t.Fatalf("modern mode must not offer weak algorithms: kex=%v ciphers=%v", client.KeyExchanges, client.Ciphers)
 	}
 }
 

@@ -144,7 +144,11 @@ func agentToolDefinitionsForContext(limit int, contextText string, pinned []stri
 			},
 		},
 	})
-	mcpTools := selectMCPToolsForContext(mcp.Global().ListTools(), limit, contextText, pinned)
+	catalog := mcp.Global().ListTools()
+	// A deferred subset may omit the proprietary tools that establish an
+	// aliased server's identity. Verify its signature against the full snapshot.
+	profiles := mcp.ProfilesForCatalog(catalog)
+	mcpTools := selectMCPToolsForContext(catalog, limit, contextText, pinned)
 	builtInLimit := limit
 	if limit > 0 && len(mcpTools) > 0 {
 		builtInLimit = limit - len(mcpTools)
@@ -160,13 +164,9 @@ func agentToolDefinitionsForContext(limit int, contextText string, pinned []stri
 			continue
 		}
 		description := fmt.Sprintf("DeepSentry built-in [%s, %s]. %s", tool.Category, tool.Perspective, tool.Description)
-		if help := deepsentrytools.FormatToolHelp(name); help != "" {
-			description += "\n" + truncateToolDescription(help, 800)
-		}
-		if aliases := deepsentrytools.SearchAliases(name); len(aliases) > 0 {
-			description += "\nTypical intents / 常见意图: " + strings.Join(aliases, ", ")
-		}
-		description = truncateToolDescription(description, 1020)
+		// Exact field contracts live in Parameters. Repeating help/examples
+		// and every search alias here bloats every provider request.
+		description = truncateToolDescription(description, 420)
 		definitions = append(definitions, ToolDefinition{
 			Type: "function",
 			Function: FunctionDef{
@@ -184,16 +184,17 @@ func agentToolDefinitionsForContext(limit int, contextText string, pinned []stri
 		if parameters == nil {
 			parameters = map[string]interface{}{"type": "object", "additionalProperties": true}
 		}
+		parameters = compactToolSchema(parameters)
 		description := truncateToolDescription(tool.Description, 800)
 		if description == "" {
 			description = "MCP tool exposed by server " + tool.Server
 		}
-		if mcp.IsHawkEyeTool(&tool, mcpTools) {
+		if profiles.IsHawkEye(&tool) {
 			if overlay := mcp.HawkEyeToolDescriptionOverlay(tool.OriginalName); overlay != "" {
 				description = truncateToolDescription(tool.Description, 420) + " " + overlay
 			}
 		}
-		if mcp.IsFofaMapTool(&tool, mcpTools) {
+		if profiles.IsFofaMap(&tool) {
 			if overlay := mcp.FofaMapToolDescriptionOverlay(tool.OriginalName); overlay != "" {
 				description = truncateToolDescription(tool.Description, 420) + " " + overlay
 			}
@@ -227,10 +228,11 @@ func selectMCPToolsForContext(tools []mcp.ExternalTool, limit int, contextText s
 		return tools
 	}
 	maxMCP := limit / 2
+	profiles := mcp.ProfilesForCatalog(tools)
 	query := strings.ToLower(contextText)
 	if hawkEyeTaskIntent(query) || fofaMapTaskIntent(query) {
 		for i := range tools {
-			if mcp.IsHawkEyeTool(&tools[i], tools) || mcp.IsFofaMapTool(&tools[i], tools) {
+			if profiles.IsHawkEye(&tools[i]) || profiles.IsFofaMap(&tools[i]) {
 				// HawkEye and FofaMap workflows commonly need a 4-6 tool chain.
 				// Give their exact MCP schemas more room while retaining at least
 				// two DeepSentry built-ins.
@@ -266,9 +268,9 @@ func selectMCPToolsForContext(tools []mcp.ExternalTool, limit int, contextText s
 		if strings.Contains(query, strings.ToLower(tool.Name)) || strings.Contains(query, original) {
 			score += 2000
 		}
-		if mcp.IsHawkEyeTool(&tool, tools) {
+		if profiles.IsHawkEye(&tool) {
 			score += hawkEyeMCPContextScore(original, query)
-		} else if mcp.IsFofaMapTool(&tool, tools) {
+		} else if profiles.IsFofaMap(&tool) {
 			score += fofaMapMCPContextScore(original, query)
 		} else {
 			for _, token := range strings.FieldsFunc(strings.ReplaceAll(original, "_", " "), func(r rune) bool { return r == '-' || r == ' ' }) {
@@ -373,7 +375,7 @@ func hawkEyeTaskIntent(query string) bool {
 		"抓包", "流量", "请求头", "请求体", "capture", "traffic", "request", "header", "body",
 		"拦截", "改包", "intercept", "release", "drop", "fuzz", "重放", "replay", "截图", "captcha",
 		"播放", "倍速", "全屏", "视频", "watch", "play", "fullscreen",
-		"证书", "tls", "验证码", "site:", "filetype:",
+		"证书", "tls", "验证码", "site:", "filetype:", "书签", "bookmark", "codec", "编解码", "脚本", "二维码", "条码",
 	} {
 		if strings.Contains(query, value) {
 			return true
@@ -403,8 +405,10 @@ func hawkEyeMCPContextScore(name, query string) int {
 	playbackIntent := containsAny("播放", "倍速", "2倍", "2x", "playback", "speed", "视频", "b站", "bilibili")
 	fileIntent := containsAny("上传", "下载", "文件", "upload", "download", "file")
 	scriptIntent := containsAny("脚本", "注入", "编解码", "javascript", "script", "evaluate", "codec")
+	bookmarkIntent := containsAny("书签", "bookmark", "收藏夹")
+	codecIntent := containsAny("编解码", "codec", "二维码", "条码", "smartdecode", "base64", "openssl", "ipcalc", "解码")
 	findingIntent := containsAny("报告", "发现", "敏感", "暗链", "finding", "sensitive", "darklink")
-	if !(browserIntent || captureIntent || interceptIntent || securityIntent || visualIntent || captchaIntent || researchIntent || tlsIntent || activationIntent || playbackIntent || fileIntent || scriptIntent || findingIntent || containsAny("hawkeye", "鹰眼", "hx0")) {
+	if !(browserIntent || captureIntent || interceptIntent || securityIntent || visualIntent || captchaIntent || researchIntent || tlsIntent || activationIntent || playbackIntent || fileIntent || scriptIntent || findingIntent || bookmarkIntent || codecIntent || containsAny("hawkeye", "鹰眼", "hx0")) {
 		return 0
 	}
 	score := 0
@@ -460,7 +464,13 @@ func hawkEyeMCPContextScore(name, query string) int {
 		add(850, "browser_file_upload", "browser_download_file", "browser_screenshot")
 	}
 	if scriptIntent {
-		add(820, "hawkeye_codec", "hawkeye_script_list", "hawkeye_script_run", "hawkeye_script_upsert", "hawkeye_evaluate")
+		add(820, "hawkeye_script_list", "hawkeye_script_manage", "hawkeye_script_run", "hawkeye_script_upsert", "hawkeye_evaluate")
+	}
+	if bookmarkIntent {
+		add(1300, "browser_bookmarks")
+	}
+	if codecIntent {
+		add(1300, "hawkeye_codec")
 	}
 	if findingIntent {
 		add(820, "hawkeye_findings", "hawkeye_sensitive_scan", "hawkeye_darklink_scan", "hawkeye_request_get", "hawkeye_capture_inspect")
@@ -502,7 +512,7 @@ func selectNativeToolNamesWithPinned(names []string, limit int, contextText stri
 		if seen[name] {
 			continue
 		}
-		if name == "config_manage" && !explicitDeepSentryConfigIntent(query) {
+		if name == "config_manage" && !SelfConfigIntent(query) {
 			continue
 		}
 		tool, ok := deepsentrytools.Get(name)
@@ -510,6 +520,9 @@ func selectNativeToolNamesWithPinned(names []string, limit int, contextText stri
 			continue
 		}
 		score := deepsentrytools.SearchRelevanceForQuery(tool, searchQuery)
+		if name == "config_manage" && SelfConfigIntent(query) {
+			score += 100
+		}
 		scored = append(scored, scoredTool{name: name, score: score})
 	}
 	sort.Slice(scored, func(i, j int) bool {
@@ -518,6 +531,13 @@ func selectNativeToolNamesWithPinned(names []string, limit int, contextText stri
 		}
 		return scored[i].score > scored[j].score
 	})
+	minimumRelevance := 1
+	if len(scored) > 0 && scored[0].score >= 24 {
+		// Generic words such as “安全/检查/结果” otherwise retrieve many
+		// unrelated schemas. Keep strong matches and all previously verified
+		// tools; weak matches remain discoverable through tool_catalog.
+		minimumRelevance = max(6, scored[0].score/8)
+	}
 	for _, item := range scored {
 		if len(selected) >= limit {
 			break
@@ -526,7 +546,7 @@ func selectNativeToolNamesWithPinned(names []string, limit int, contextText stri
 		// hidden and are available through tool_catalog. Alphabetically filling
 		// the remaining budget made config_manage and other unrelated tools look
 		// like recommendations, which measurably reduced long-tail selection.
-		if item.score <= 0 {
+		if item.score < minimumRelevance {
 			continue
 		}
 		selected = append(selected, item.name)
@@ -534,15 +554,28 @@ func selectNativeToolNamesWithPinned(names []string, limit int, contextText stri
 	return selected
 }
 
-func explicitDeepSentryConfigIntent(query string) bool {
+// SelfConfigIntent recognizes product settings without routing ordinary server
+// configuration tasks to the controller's own config file.
+func SelfConfigIntent(query string) bool {
 	query = strings.ToLower(query)
 	for _, marker := range []string{
-		"deepsentry", "config.yaml", "agent_runtime", "添加目标", "新增目标", "修改目标",
+		"deepsentry", "config.yaml", "agent_runtime", "controller_proxy", "控制端代理", "出站代理", "ssh 目标", "ssh目标", "ssh 连接配置", "添加目标", "新增目标", "修改目标",
 		"fleet目标", "mcp server", "mcp_server", "skill来源", "启用skill", "禁用skill",
 		"enable skill", "disable skill", "show config", "config status", "manage config", "配置状态",
 	} {
 		if strings.Contains(query, marker) {
 			return true
+		}
+	}
+	self := false
+	for _, marker := range []string{"你自己", "你自身", "你的配置", "你的设置", "你的模型", "给你配置", "给你添加", "给你接入", "为你配置", "自身配置", "本agent", "agent的配置", "agent 配置", "self config"} {
+		self = self || strings.Contains(query, marker)
+	}
+	if self {
+		for _, marker := range []string{"配置", "设置", "模型", "接口", "代理", "mcp", "skill", "主题", "上下文", "预算", "config", "setting"} {
+			if strings.Contains(query, marker) {
+				return true
+			}
 		}
 	}
 	return false

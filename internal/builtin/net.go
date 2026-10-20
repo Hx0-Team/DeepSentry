@@ -4,6 +4,7 @@ import (
 	"ai-edr/internal/config"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sort"
@@ -76,7 +77,7 @@ func DNSLookup(rt Runtime, host, rrType string) (string, error) {
 
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("%s DNS 查询\n", rt.tag()))
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(rt.context(), 10*time.Second)
 	defer cancel()
 	resolver := net.Resolver{}
 
@@ -148,7 +149,7 @@ func HTTPProbe(rt Runtime, rawURL, method string) (string, error) {
 		return "", fmt.Errorf("method 仅支持 HEAD/GET")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(rt.context(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
@@ -176,6 +177,19 @@ func HTTPProbe(rt Runtime, rawURL, method string) (string, error) {
 	b.WriteString("Headers:\n")
 	for k, vals := range resp.Header {
 		b.WriteString(fmt.Sprintf("  %s: %s\n", k, strings.Join(vals, ", ")))
+	}
+	if method == "GET" {
+		// GET already transfers the response. Return a small preview so the
+		// agent can verify an exposed API without fetching it a second time.
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 8193))
+		if readErr != nil {
+			return "", readErr
+		}
+		truncated := len(body) > 8192
+		if truncated {
+			body = body[:8192]
+		}
+		b.WriteString(fmt.Sprintf("\nBody preview (%d bytes, truncated=%t):\n%s\n", len(body), truncated, sanitizeBody(string(body))))
 	}
 	return b.String(), nil
 }
@@ -319,12 +333,12 @@ func FlowSnapshot(rt Runtime, intervalSec int) (string, error) {
 		intervalSec = 10
 	}
 
-	before, err := readProcNetTCP()
+	before, err := rt.readProcNetTCP()
 	if err != nil {
 		return "", fmt.Errorf("读取初始连接快照失败: %w", err)
 	}
 	time.Sleep(time.Duration(intervalSec) * time.Second)
-	after, err := readProcNetTCP()
+	after, err := rt.readProcNetTCP()
 	if err != nil {
 		return "", fmt.Errorf("读取二次连接快照失败: %w", err)
 	}

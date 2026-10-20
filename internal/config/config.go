@@ -24,73 +24,87 @@ import (
 var GlobalConfig Config
 
 func setViperDefaults() {
-	viper.SetDefault("provider", "deepseek")
-	viper.SetDefault("api_protocol", "auto")
-	viper.SetDefault("api_url", "https://api.deepseek.com")
-	viper.SetDefault("model_name", "deepseek-flash")
-	viper.SetDefault("temperature", 0.0)
-	viper.SetDefault("model_profile", "auto")
-	viper.SetDefault("model_parameter_b", 0.0)
-	viper.SetDefault("context_window_tokens", 0)
-	viper.SetDefault("context_utilization", 0.0)
-	viper.SetDefault("reserved_output_tokens", 0)
-	viper.SetDefault("native_tool_limit", 0)
-	viper.SetDefault("vision_mode", "auto")
-	viper.SetDefault("ssh_user", "root")
-	viper.SetDefault("ssh_host_key_policy", "accept-new")
-	viper.SetDefault("ssh_known_hosts_path", "~/.deepsentry/known_hosts")
-	viper.SetDefault("ssh_device_type", "auto")
-	viper.SetDefault("ssh_legacy_compat", "true")
-	viper.SetDefault("ssh_connect_timeout_sec", 25)
-	viper.SetDefault("telnet_user", "root")
-	viper.SetDefault("telnet_device_type", "auto")
-	viper.SetDefault("telnet_connect_timeout_sec", 10)
-	viper.SetDefault("telnet_login_timeout_sec", 20)
-	viper.SetDefault("telnet_command_timeout_sec", 90)
-	viper.SetDefault("ftp_user", "anonymous")
-	viper.SetDefault("ftp_tls_mode", "plain")
-	viper.SetDefault("ftp_data_mode", "passive")
-	viper.SetDefault("ftp_connect_timeout_sec", 10)
-	viper.SetDefault("ftp_command_timeout_sec", 30)
-	viper.SetDefault("ftp_transfer_timeout_sec", 90)
-	viper.SetDefault("use_native_tools", true)
-	viper.SetDefault("agent_runtime", "v3")
-	viper.SetDefault("trace_enabled", true)
-	viper.SetDefault("trace_dir", "reports/traces")
-	viper.SetDefault("terminal_theme", "auto")
-	viper.SetDefault("llm_timeout_sec", 120)
-	viper.SetDefault("llm_retries", 3)
-	viper.SetDefault("ssh_command_timeout_sec", 90)
-	viper.SetDefault("ssh_max_output_bytes", 512*1024)
-	viper.SetDefault("execution_budget.enabled", true)
-	viper.SetDefault("execution_budget.max_steps", 180)
-	viper.SetDefault("execution_budget.subagent_max_steps", 90)
-	viper.SetDefault("execution_budget.total_steps", 300)
-	viper.SetDefault("execution_budget.extension_steps", 15)
-	viper.SetDefault("execution_budget.no_progress_steps", 8)
-	viper.SetDefault("max_steps", 30)
-	viper.SetDefault("subagent_max_steps", 15)
-	viper.SetDefault("controller_proxy", "")
-	viper.SetDefault("browser_timeout_sec", 20)
-	viper.SetDefault("browser_artifact_dir", "reports/browser")
-	viper.SetDefault("archive_max_entries", 10_000)
-	viper.SetDefault("archive_max_file_bytes", int64(512*1024*1024))
-	viper.SetDefault("archive_max_total_bytes", int64(2*1024*1024*1024))
-	viper.SetDefault("scheduler_enabled", true)
-	viper.SetDefault("scheduler_store", "reports/schedules/tasks.json")
-	viper.SetDefault("scheduler_interval_sec", 30)
-	viper.SetDefault("scheduler_timezone", "Local")
-	viper.SetDefault("dingtalk_webhook", "")
-	viper.SetDefault("dingtalk_secret", "")
-	viper.SetDefault("feishu_webhook", "")
-	viper.SetDefault("feishu_secret", "")
-	viper.SetDefault("email_gateway_url", "")
-	viper.SetDefault("email_gateway_token", "")
-	viper.SetDefault("email_gateway_header", "Authorization")
-	viper.SetDefault("email_to", "")
-	viper.SetDefault("email_from", "")
-	viper.SetDefault("benchmark_base_url", "")
-	viper.SetDefault("benchmark_token", "")
+	setReaderDefaults(viper.GetViper())
+}
+
+func setReaderDefaults(reader *viper.Viper) {
+	reader.SetDefault("provider", "deepseek")
+	reader.SetDefault("api_protocol", "auto")
+	reader.SetDefault("api_url", "https://api.deepseek.com")
+	reader.SetDefault("model_name", "deepseek-flash")
+	reader.SetDefault("temperature", 0.0)
+	reader.SetDefault("model_profile", "auto")
+	reader.SetDefault("model_parameter_b", 0.0)
+	reader.SetDefault("context_window_tokens", 0)
+	reader.SetDefault("context_utilization", 0.0)
+	reader.SetDefault("reserved_output_tokens", 0)
+	reader.SetDefault("native_tool_limit", 0)
+	reader.SetDefault("vision_mode", "auto")
+	reader.SetDefault("thinking_mode", "auto")
+	reader.SetDefault("reasoning_effort", "auto")
+	reader.SetDefault("user_id", "")
+	reader.SetDefault("search.enabled", true)
+	reader.SetDefault("search.base_url", "")
+	reader.SetDefault("search.api_key", "")
+	reader.SetDefault("search.count", DefaultSearchCount)
+	reader.SetDefault("search.need_content", false)
+	reader.SetDefault("search.timeout_sec", DefaultSearchTimeoutSec)
+	reader.SetDefault("search.localization", "")
+	reader.SetDefault("ssh_user", "root")
+	reader.SetDefault("ssh_host_key_policy", "accept-new")
+	reader.SetDefault("ssh_known_hosts_path", "~/.deepsentry/known_hosts")
+	reader.SetDefault("ssh_device_type", "auto")
+	reader.SetDefault("ssh_legacy_compat", "true")
+	reader.SetDefault("ssh_connect_timeout_sec", 25)
+	reader.SetDefault("telnet_user", "root")
+	reader.SetDefault("telnet_device_type", "auto")
+	reader.SetDefault("telnet_connect_timeout_sec", 10)
+	reader.SetDefault("telnet_login_timeout_sec", 20)
+	reader.SetDefault("telnet_command_timeout_sec", 90)
+	reader.SetDefault("ftp_user", "anonymous")
+	reader.SetDefault("ftp_tls_mode", "plain")
+	reader.SetDefault("ftp_data_mode", "passive")
+	reader.SetDefault("ftp_connect_timeout_sec", 10)
+	reader.SetDefault("ftp_command_timeout_sec", 30)
+	reader.SetDefault("ftp_transfer_timeout_sec", 90)
+	reader.SetDefault("use_native_tools", true)
+	reader.SetDefault("agent_runtime", "v3")
+	reader.SetDefault("trace_enabled", true)
+	reader.SetDefault("trace_dir", "reports/traces")
+	reader.SetDefault("terminal_theme", "auto")
+	reader.SetDefault("llm_timeout_sec", 120)
+	reader.SetDefault("llm_retries", 3)
+	reader.SetDefault("ssh_command_timeout_sec", 90)
+	reader.SetDefault("ssh_max_output_bytes", 512*1024)
+	reader.SetDefault("execution_budget.enabled", true)
+	reader.SetDefault("execution_budget.max_steps", 180)
+	reader.SetDefault("execution_budget.subagent_max_steps", 90)
+	reader.SetDefault("execution_budget.total_steps", 300)
+	reader.SetDefault("execution_budget.extension_steps", 15)
+	reader.SetDefault("execution_budget.no_progress_steps", 8)
+	reader.SetDefault("max_steps", 30)
+	reader.SetDefault("subagent_max_steps", 15)
+	reader.SetDefault("controller_proxy", "")
+	reader.SetDefault("browser_timeout_sec", 20)
+	reader.SetDefault("browser_artifact_dir", "reports/browser")
+	reader.SetDefault("archive_max_entries", 10_000)
+	reader.SetDefault("archive_max_file_bytes", int64(512*1024*1024))
+	reader.SetDefault("archive_max_total_bytes", int64(2*1024*1024*1024))
+	reader.SetDefault("scheduler_enabled", true)
+	reader.SetDefault("scheduler_store", "reports/schedules/tasks.json")
+	reader.SetDefault("scheduler_interval_sec", 30)
+	reader.SetDefault("scheduler_timezone", "Local")
+	reader.SetDefault("dingtalk_webhook", "")
+	reader.SetDefault("dingtalk_secret", "")
+	reader.SetDefault("feishu_webhook", "")
+	reader.SetDefault("feishu_secret", "")
+	reader.SetDefault("email_gateway_url", "")
+	reader.SetDefault("email_gateway_token", "")
+	reader.SetDefault("email_gateway_header", "Authorization")
+	reader.SetDefault("email_to", "")
+	reader.SetDefault("email_from", "")
+	reader.SetDefault("benchmark_base_url", "")
+	reader.SetDefault("benchmark_token", "")
 }
 
 // Config 结构体定义
@@ -98,25 +112,32 @@ type Config struct {
 	Chat ChatConfig `mapstructure:"chat"`
 
 	// --- LLM 配置 ---
-	Provider    string  `mapstructure:"provider"`     // openai|anthropic|google|deepseek|qwen|hunyuan|teleai|minimax|mimo|glm|custom
-	APIProtocol string  `mapstructure:"api_protocol"` // openai_chat|anthropic_messages|openai_responses|auto
-	ApiURL      string  `mapstructure:"api_url"`
-	ModelName   string  `mapstructure:"model_name"`
-	ApiKey      string  `mapstructure:"api_key"`
-	Temperature float64 `mapstructure:"temperature"`
+	Provider     string             `mapstructure:"provider"`     // openai|anthropic|google|deepseek|qwen|hunyuan|teleai|minimax|mimo|glm|custom
+	APIProtocol  string             `mapstructure:"api_protocol"` // openai_chat|anthropic_messages|openai_responses|auto
+	ApiURL       string             `mapstructure:"api_url"`
+	ModelName    string             `mapstructure:"model_name"`
+	ApiKey       string             `mapstructure:"api_key"`
+	Temperature  float64            `mapstructure:"temperature"`
+	BalanceQuery BalanceQueryConfig `mapstructure:"balance_query" json:"balance_query" yaml:"balance_query"`
 
 	// --- Model capability / context adaptation ---
 	// Zero values use conservative auto-detection. Local runtimes should set
 	// context_window_tokens to their actual num_ctx/max_model_len for best use.
-	ModelProfile              string  `mapstructure:"model_profile"` // auto|compact|balanced|full
-	ModelParameterB           float64 `mapstructure:"model_parameter_b"`
-	ContextWindowTokens       int     `mapstructure:"context_window_tokens"`
-	LocalContextDiscovered    bool    `mapstructure:"-" json:"-" yaml:"-"`
-	LocalNativeToolsAvailable bool    `mapstructure:"-" json:"-" yaml:"-"`
-	ContextUtilization        float64 `mapstructure:"context_utilization"`
-	ReservedOutputTokens      int     `mapstructure:"reserved_output_tokens"`
-	NativeToolLimit           int     `mapstructure:"native_tool_limit"`
-	VisionMode                string  `mapstructure:"vision_mode"` // auto|enabled|disabled
+	ModelProfile                string       `mapstructure:"model_profile"` // auto|compact|balanced|full
+	ModelParameterB             float64      `mapstructure:"model_parameter_b"`
+	ContextWindowTokens         int          `mapstructure:"context_window_tokens"`
+	LocalContextDiscovered      bool         `mapstructure:"-" json:"-" yaml:"-"`
+	LocalNativeToolsAvailable   bool         `mapstructure:"-" json:"-" yaml:"-"`
+	ContextUtilization          float64      `mapstructure:"context_utilization"`
+	ReservedOutputTokens        int          `mapstructure:"reserved_output_tokens"`
+	HistoryBudgetTokens         int          `mapstructure:"history_budget_tokens"`          // 0=48K working history; -1=context capacity
+	SubAgentHistoryBudgetTokens int          `mapstructure:"subagent_history_budget_tokens"` // 0=16K; -1=capacity
+	NativeToolLimit             int          `mapstructure:"native_tool_limit"`
+	VisionMode                  string       `mapstructure:"vision_mode"`      // auto|enabled|disabled
+	ThinkingMode                string       `mapstructure:"thinking_mode"`    // auto|enabled|disabled (DeepSeek)
+	ReasoningEffort             string       `mapstructure:"reasoning_effort"` // auto|minimal|low|medium|high|xhigh|max|ultra|none
+	UserID                      string       `mapstructure:"user_id"`          // optional DeepSeek user isolation
+	Search                      SearchConfig `mapstructure:"search"`
 
 	// Runtime v3 is additive and can be rolled back to legacy without changing
 	// model or target configuration.
@@ -136,7 +157,7 @@ type Config struct {
 	SubAgentMaxSteps     int                   `mapstructure:"subagent_max_steps"`
 
 	// --- SSH 配置 ---
-	TargetProtocol           string         `mapstructure:"target_protocol"` // local|ssh|telnet|ftp，空值兼容旧 ssh_host
+	TargetProtocol           string         `mapstructure:"target_protocol"` // local|ssh|sftp|telnet|ftp，空值兼容旧 ssh_host
 	SSHHost                  string         `mapstructure:"ssh_host"`
 	SSHUser                  string         `mapstructure:"ssh_user"`
 	SSHPassword              string         `mapstructure:"ssh_password"`
@@ -229,20 +250,21 @@ func (c Config) EffectiveAgentRuntime() string {
 // inherit the legacy top-level configuration so existing config.yaml files
 // remain valid.
 type ModelConfig struct {
-	ID                   string  `mapstructure:"id" json:"id" yaml:"id"`
-	Role                 string  `mapstructure:"role" json:"role" yaml:"role"` // primary | fallback
-	Provider             string  `mapstructure:"provider" json:"provider" yaml:"provider"`
-	APIProtocol          string  `mapstructure:"api_protocol" json:"api_protocol" yaml:"api_protocol"`
-	APIURL               string  `mapstructure:"api_url" json:"api_url" yaml:"api_url"`
-	APIKey               string  `mapstructure:"api_key" json:"api_key" yaml:"api_key"`
-	ModelName            string  `mapstructure:"model_name" json:"model_name" yaml:"model_name"`
-	Temperature          float64 `mapstructure:"temperature" json:"temperature" yaml:"temperature"`
-	ModelProfile         string  `mapstructure:"model_profile" json:"model_profile" yaml:"model_profile"`
-	ContextWindowTokens  int     `mapstructure:"context_window_tokens" json:"context_window_tokens" yaml:"context_window_tokens"`
-	ReservedOutputTokens int     `mapstructure:"reserved_output_tokens" json:"reserved_output_tokens" yaml:"reserved_output_tokens"`
-	NativeToolLimit      int     `mapstructure:"native_tool_limit" json:"native_tool_limit" yaml:"native_tool_limit"`
-	VisionMode           string  `mapstructure:"vision_mode" json:"vision_mode" yaml:"vision_mode"`
-	MaxRetries           int     `mapstructure:"max_retries" json:"max_retries" yaml:"max_retries"`
+	BalanceQuery         *BalanceQueryConfig `mapstructure:"balance_query" json:"balance_query,omitempty" yaml:"balance_query,omitempty"`
+	ID                   string              `mapstructure:"id" json:"id" yaml:"id"`
+	Role                 string              `mapstructure:"role" json:"role" yaml:"role"` // primary | fallback
+	Provider             string              `mapstructure:"provider" json:"provider" yaml:"provider"`
+	APIProtocol          string              `mapstructure:"api_protocol" json:"api_protocol" yaml:"api_protocol"`
+	APIURL               string              `mapstructure:"api_url" json:"api_url" yaml:"api_url"`
+	APIKey               string              `mapstructure:"api_key" json:"api_key" yaml:"api_key"`
+	ModelName            string              `mapstructure:"model_name" json:"model_name" yaml:"model_name"`
+	Temperature          float64             `mapstructure:"temperature" json:"temperature" yaml:"temperature"`
+	ModelProfile         string              `mapstructure:"model_profile" json:"model_profile" yaml:"model_profile"`
+	ContextWindowTokens  int                 `mapstructure:"context_window_tokens" json:"context_window_tokens" yaml:"context_window_tokens"`
+	ReservedOutputTokens int                 `mapstructure:"reserved_output_tokens" json:"reserved_output_tokens" yaml:"reserved_output_tokens"`
+	NativeToolLimit      int                 `mapstructure:"native_tool_limit" json:"native_tool_limit" yaml:"native_tool_limit"`
+	VisionMode           string              `mapstructure:"vision_mode" json:"vision_mode" yaml:"vision_mode"`
+	MaxRetries           int                 `mapstructure:"max_retries" json:"max_retries" yaml:"max_retries"`
 }
 
 type ModelRoutingConfig struct {
@@ -318,6 +340,9 @@ func mergeModelConfig(base Config, model ModelConfig, index int) ModelConfig {
 // configuration consumed by legacy adapters.
 func (c Config) ConfigForModel(model ModelConfig) Config {
 	out := c
+	if model.BalanceQuery != nil {
+		out.BalanceQuery = *model.BalanceQuery
+	}
 	out.Provider = model.Provider
 	out.APIProtocol = model.APIProtocol
 	out.ApiURL = model.APIURL
@@ -356,7 +381,7 @@ func (c Config) EffectiveDisabledSkills() []string {
 
 type TargetConfig struct {
 	Name                     string   `mapstructure:"name" json:"name"`
-	Protocol                 string   `mapstructure:"protocol" json:"protocol"` // ssh|telnet|ftp
+	Protocol                 string   `mapstructure:"protocol" json:"protocol"` // ssh|sftp|telnet|ftp
 	Host                     string   `mapstructure:"host" json:"host"`
 	User                     string   `mapstructure:"user" json:"user"`
 	Password                 string   `mapstructure:"password" json:"password"`
@@ -575,7 +600,11 @@ func ControllerProxySummary(raw string) string {
 // configured HTTP CONNECT or SOCKS5 proxy. With no explicit proxy it dials
 // directly; environment HTTP_PROXY variables remain HTTP-only by design.
 func ControllerDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	raw := strings.TrimSpace(GlobalConfig.ControllerProxy)
+	return ControllerDialContextForProxy(ctx, network, addr, GlobalConfig.ControllerProxy)
+}
+
+func ControllerDialContextForProxy(ctx context.Context, network, addr, raw string) (net.Conn, error) {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return (&net.Dialer{}).DialContext(ctx, network, addr)
 	}

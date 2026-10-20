@@ -139,7 +139,7 @@ func RunFleetWithProgressAndStop(targets []config.TargetConfig, selector, comman
 			}
 			var out string
 			var err error
-			if strings.EqualFold(target.Protocol, "ftp") {
+			if strings.EqualFold(target.Protocol, "ftp") || strings.EqualFold(target.Protocol, "sftp") {
 				err = fmt.Errorf("FTP 目标不支持 shell 命令，请使用 fleet_file")
 			} else {
 				out, err = RunOnTargetWithStop(target, command, stop)
@@ -218,7 +218,7 @@ func isStopped(stop <-chan struct{}) bool {
 func NewEphemeralExecutor(target config.TargetConfig) (Executor, error) {
 	cfg := config.GlobalConfig
 	switch strings.ToLower(strings.TrimSpace(target.Protocol)) {
-	case "ssh":
+	case "ssh", "sftp":
 		cfg.TargetProtocol = "ssh"
 		cfg.SSHHost = target.Host
 		cfg.SSHUser = firstNonEmpty(target.User, cfg.SSHUser, "root")
@@ -228,6 +228,9 @@ func NewEphemeralExecutor(target config.TargetConfig) (Executor, error) {
 		cfg.SSHPrompt = target.Prompt
 		cfg.SSHDeviceType = target.DeviceType
 		cfg.SSHEnablePassword = target.EnablePassword
+		if strings.EqualFold(target.Protocol, "sftp") {
+			return newSFTPExecutor(cfg)
+		}
 		return newSSHExecutor(cfg)
 	case "telnet":
 		cfg.TargetProtocol = "telnet"

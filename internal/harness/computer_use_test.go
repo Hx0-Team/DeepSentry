@@ -33,6 +33,23 @@ func (b *desktopFixtureBackend) Release(context.Context) error                { 
 func (b *desktopFixtureBackend) Elements(context.Context) (string, []desktop.Element, error) {
 	return "vision", nil, nil
 }
+func (b *desktopFixtureBackend) Query(context.Context, desktop.Request) (desktop.ElementQueryResult, error) {
+	return desktop.ElementQueryResult{Elements: []desktop.Element{{Index: 0, Role: "Button", Name: "Cancel", Press: true, Path: "0", W: 10, H: 10}}, VisitedNodes: 2}, nil
+}
+
+func TestComputerUseQueryDoesNotPrepareEmptyImageAttachment(t *testing.T) {
+	oldService, oldConfig := desktop.Default, config.GlobalConfig
+	t.Cleanup(func() { desktop.Default = oldService; config.GlobalConfig = oldConfig })
+	backend := &desktopFixtureBackend{}
+	desktop.Default = desktop.New(backend, t.TempDir())
+	config.GlobalConfig.VisionMode = "enabled"
+	step := &StepContext{SessionID: "query-test"}
+	res := handleComputerUse(step, &AgentAction{ToolArgs: map[string]string{"action": "query", "text": "Cancel"}})
+	if backend.calls != 0 || len(res.Attachments) != 0 || !strings.Contains(res.Output, `"ok":true`) || strings.Contains(res.Output, "image_attachment_failed") {
+		t.Fatalf("query treated as broken screenshot: %+v", res)
+	}
+	handleComputerUse(step, &AgentAction{ToolArgs: map[string]string{"action": "release"}})
+}
 func TestComputerUseImageReachesAgentAndVisionIsRequired(t *testing.T) {
 	oldService, oldConfig := desktop.Default, config.GlobalConfig
 	t.Cleanup(func() { desktop.Default = oldService; config.GlobalConfig = oldConfig })
@@ -58,7 +75,7 @@ func TestComputerUseImageReachesAgentAndVisionIsRequired(t *testing.T) {
 	handleComputerUse(step, &AgentAction{ToolArgs: map[string]string{"action": "release"}})
 }
 func TestComputerUseRiskAndSchema(t *testing.T) {
-	for _, action := range []string{"status", "observe", "stop", "release", "wait"} {
+	for _, action := range []string{"status", "observe", "query", "stop", "release", "wait"} {
 		risk, _ := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: "computer_use", ToolArgs: map[string]string{"action": action}})
 		if risk != tools.RiskLow {
 			t.Fatalf("%s risk %s", action, risk)
@@ -75,6 +92,14 @@ func TestComputerUseRiskAndSchema(t *testing.T) {
 	}
 	if tools.ValidateCall("computer_use", map[string]string{"action": "click_element", "action_id": "element-01"}) == nil {
 		t.Fatal("schema permits element click without a screenshot")
+	}
+	if tools.ValidateCall("computer_use", map[string]string{"action": "query"}) == nil {
+		t.Fatal("query must require text and/or role")
+	}
+	for _, args := range []map[string]string{{"action": "query", "text": "Send"}, {"action": "query", "role": "Button"}} {
+		if err := tools.ValidateCall("computer_use", args); err != nil {
+			t.Fatalf("valid query rejected: %v", err)
+		}
 	}
 }
 

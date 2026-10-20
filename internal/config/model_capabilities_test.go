@@ -77,11 +77,11 @@ func TestModelDisplayInfoDistinguishesConfiguredFromAssumedContext(t *testing.T)
 }
 
 func TestEffectiveVisionCapabilityRecognizesDeepSeekVisionAndExplicitOverrides(t *testing.T) {
-	auto := (Config{ModelName: "deepseek-v4-flash-vision-exp", VisionMode: "auto"}).EffectiveModelCapabilities()
-	if !auto.SupportsVision || auto.VisionSource != "model-catalog" || auto.ContextWindowTokens != 1_000_000 || auto.DetectionSource != "model-catalog" {
+	auto := (Config{Provider: "deepseek", ModelName: "deepseek-v4-flash-vision-exp", VisionMode: "auto"}).EffectiveModelCapabilities()
+	if !auto.SupportsVision || auto.VisionSource != "model-catalog" || auto.ContextWindowTokens != 1_048_576 || auto.DetectionSource != "model-catalog" {
 		t.Fatalf("DeepSeek vision model was not recognized: %#v", auto)
 	}
-	disabled := (Config{ModelName: "deepseek-v4-flash-vision-exp", VisionMode: "disabled"}).EffectiveModelCapabilities()
+	disabled := (Config{Provider: "deepseek", ModelName: "deepseek-v4-flash-vision-exp", VisionMode: "disabled"}).EffectiveModelCapabilities()
 	if disabled.SupportsVision || disabled.VisionSource != "config" {
 		t.Fatalf("explicit vision disable did not win: %#v", disabled)
 	}
@@ -97,9 +97,9 @@ func TestOfficialChineseMultimodalModelsAreAutoDetected(t *testing.T) {
 		model    string
 		context  int
 	}{
-		{"deepseek", "deepseek-flash", 1_000_000},
-		{"deepseek", "deepseek-v4.1-flash", 1_000_000},
-		{"deepseek", "deepseek-v4-flash-vision-exp", 1_000_000},
+		{"deepseek", "deepseek-flash", 1_048_576},
+		{"deepseek", "deepseek-v4.1-flash", 1_048_576},
+		{"deepseek", "deepseek-v4-flash-vision-exp", 1_048_576},
 		{"glm", "glm-5.3-flash", 1_000_000},
 		{"minimax", "MiniMax-M3", 1_000_000},
 		{"mimo", "mimo-v2.6-pro", 1_000_000},

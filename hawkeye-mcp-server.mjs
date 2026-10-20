@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 /**
- * Hx0 HawkEye MCP Server v1.0.12
+ * Hx0 HawkEye MCP Server v1.0.14
  *
  * Zero-dependency local bridge:
  *   Any MCP host --stdio / Streamable HTTP / legacy SSE--> this process
  *   this process --WebSocket on 127.0.0.1--> Hx0 HawkEye extension
  *
  * stdout is reserved for JSON-RPC. Diagnostics are written to stderr.
+ *
+ * DeepSentry local patch: honor DEEPSENTRY_MCP_PARENT_PID and exit with the
+ * owning process / on stdio EOF. Keep this block when syncing upstream 1.0.14;
+ * the public upstream file intentionally omits host-specific lifecycle code.
  */
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -16,8 +20,8 @@ import path from 'node:path';
 import process from 'node:process';
 
 const SERVER_NAME = 'hx0-hawkeye-mcp';
-const SERVER_VERSION = '1.0.12';
-const SEARCH_OPERATOR_GUIDE = 'When the user request is specific, or more public evidence is needed to finish the task, you MUST use Google-style search operators in browser_search/browser_research as a problem-solving step. Do not send bare keywords. Triggers: official/full names, a known site, file types (pdf/doc/xls), year/number ranges, excluding noise, unknown missing words, alternate names. Operators: "exact phrase"; " -term" (space before minus, none after); site:domain; filetype:pdf|doc|xls|ppt; * wildcard; intitle:/allintitle:; inurl:; uppercase OR or |; 2020..2025. Operator support varies by engine; relax overly strict syntax after empty results while preserving explicit user constraints. Combine to solve the question, e.g. "official title" filetype:pdf site:gov.cn. Also exactMatch, includeDomains, excludeDomains, timeRange. If the first page is noisy or incomplete, rewrite operators and search again. When general results are thin, also search well-known forums with site: zhihu.com, hupu.com, tieba.baidu.com, reddit.com, v2ex.com, github.com. For security, CVE, malware, or IOC questions, also check public threat-intel and vendor centers: threatbook.cn, x.threatbook.com, ti.360.net, ti.qianxin.com, nti.nsfocus.com, virustotal.com, freebuf.com. Example: keyword site:zhihu.com ; CVE-xxxx site:threatbook.cn. Use public pages only and cite the source. Smart search: query is the main question and queries adds distinct evidence variants; includeDomains means any listed domain. Prefer primary sources and read bodies with maxFetches or browser_research before verification claims. evidenceScore is retrieval relevance, not truth. Never cite challenge pages as evidence; disclose blockedByChallenge, degraded engines, stale cache and missing sources. Rewrite the query or change engines when evidence is insufficient.';
+const SERVER_VERSION = '1.0.14';
+const SEARCH_OPERATOR_GUIDE = 'When the user request is specific, or more public evidence is needed to finish the task, you MUST use Google-style search operators in browser_search/browser_research as a problem-solving step. Do not send bare keywords. Triggers: official/full names, a known site, file types (pdf/doc/xls), year/number ranges, excluding noise, unknown missing words, alternate names. Operators: "exact phrase"; " -term" (space before minus, none after); site:domain; filetype:pdf|doc|xls|ppt; * wildcard; intitle:/allintitle:; inurl:; uppercase OR or |; 2020..2025. Operator support varies by engine; relax overly strict syntax after empty results while preserving explicit user constraints. Combine to solve the question, e.g. "official title" filetype:pdf site:gov.cn. Also exactMatch, includeDomains, excludeDomains, timeRange. If the first page is noisy or incomplete, rewrite operators and search again. When general results are thin, also search well-known forums with site: zhihu.com, hupu.com, tieba.baidu.com, reddit.com, v2ex.com, github.com. For security, CVE, malware, or IOC questions, also check public threat-intel and vendor centers: threatbook.cn, x.threatbook.com, ti.360.net, ti.qianxin.com, nti.nsfocus.com, virustotal.com, freebuf.com. Example: keyword site:zhihu.com ; CVE-xxxx site:threatbook.cn. Use public pages only and cite the source. Smart search: query is the main question and queries adds distinct evidence variants; includeDomains means any listed domain. Prefer primary sources and read bodies with maxFetches or browser_research before verification claims. evidenceScore is retrieval relevance, not truth. Never cite challenge pages as evidence; disclose blockedByChallenge, degraded engines, stale cache and missing sources. Rewrite the query or change engines when evidence is insufficient. Choose source count by evidence needs, not a fixed three-site batch: maxFetches accepts 0–7, maxPages 1–15 total pages; concurrency accepts auto or 1–7 simultaneous tabs. Broad comparisons can read 5–7 independent sites concurrently, simple questions need fewer. The runtime reduces subsequent concurrency on slow/blocked pages and closes temporary tabs on cancellation.';
 const DEFAULT_WS_PORT = 19016;
 const WS_PATH = '/hx0-mcp';
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -264,7 +268,8 @@ if (process.argv.includes('--help')) {
   process.stdout.write([
     'Hx0 HawkEye MCP Server v' + SERVER_VERSION,
     '',
-    'Usage: node hawkeye-mcp-server.mjs [--port 19016] [--profile full|core|research|security] [--caps vision,files,forms,devtools,research,security]',
+    'Usage: node hawkeye-mcp-server.mjs [--port 19016] [--profile full|core|research|security] [--caps codec,scripts,vision,files,forms,devtools,research,security]',
+    '       node hawkeye-mcp-server.mjs --diagnose [--port 19016]',
     'Environment: HX0_MCP_WS_PORT=19016 HX0_MCP_PROFILE=full HX0_MCP_CAPS=',
     '',
     'VIP / Pro access is required to enable the HawkEye extension bridge and call tools.',
@@ -279,6 +284,39 @@ if (process.argv.includes('--help')) {
   ].join('\n'));
   process.exit(0);
 }
+if (process.argv.includes('--diagnose')) {
+  let port;
+  try { port = parsePort(); }
+  catch (error) { process.stderr.write(String(error && error.message || error) + '\n'); process.exit(2); }
+  const result = await new Promise((resolve) => {
+    const request = http.get({ hostname: '127.0.0.1', port, path: '/health', timeout: 1500 }, (response) => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 8192) request.destroy(new Error('health response too large'));
+      });
+      response.on('end', () => {
+        try {
+          const health = JSON.parse(body);
+          if (health?.name === SERVER_NAME) { resolve({ kind: 'hawkeye', health }); return; }
+        } catch { /* A non-HawkEye process may return non-JSON. */ }
+        resolve({ kind: 'occupied' });
+      });
+    });
+    request.on('timeout', () => request.destroy(new Error('health check timed out')));
+    request.on('error', (error) => resolve({ kind: error?.code === 'ECONNREFUSED' ? 'free' : 'occupied' }));
+  });
+  process.stdout.write('Hx0 HawkEye MCP Server v' + SERVER_VERSION + ' | Node ' + process.version + ' | port ' + port + '\n');
+  if (result.kind === 'hawkeye') {
+    process.stdout.write('Port is already used by HawkEye MCP Server v' + String(result.health.version || 'unknown') + '. Extension connected: ' + (result.health.extensionConnected ? 'yes' : 'no') + '. Do not start a second stdio server on this port.\n');
+  } else if (result.kind === 'occupied') {
+    process.stdout.write('Port is occupied by another process. Stop it or change the port in both the MCP host and HawkEye popup.\n');
+  } else {
+    process.stdout.write('Port is available. If Codex still reports connection closed, inspect the MCP child-process stderr and verify the configured file path.\n');
+  }
+  process.exit(result.kind === 'free' ? 0 : 2);
+}
 
 const TOOLS = [
   {
@@ -289,7 +327,7 @@ const TOOLS = [
   {
     name: 'browser_search',
     description: 'Search the public web with multiple engines and/or query variants, deduplicate URLs, fuse rankings, expose engine telemetry, and optionally fetch top evidence. Supported engines: auto, bing, baidu, google, duckduckgo, sogou, so360, yahoo, yandex, brave, sm. ' + SEARCH_OPERATOR_GUIDE + ' This is HawkEye-owned and has no external search-service dependency.',
-    inputSchema: { type: 'object', properties: { query: { type: 'string', description: SEARCH_OPERATOR_GUIDE }, queries: { type: 'array', maxItems: 6, items: { type: 'string', description: SEARCH_OPERATOR_GUIDE }, description: 'Optional extra query variants. Each item should also use search operators when a tighter query is possible.' }, engine: { type: 'string', enum: ['auto', 'bing', 'baidu', 'google', 'duckduckgo', 'ddg', 'sogou', 'so360', '360', 'qihoo', 'so', 'yahoo', 'yandex', 'brave', 'sm', 'shenma'] }, engines: { type: 'array', maxItems: 8, items: { type: 'string', enum: ['auto', 'bing', 'baidu', 'google', 'duckduckgo', 'ddg', 'sogou', 'so360', '360', 'qihoo', 'so', 'yahoo', 'yandex', 'brave', 'sm', 'shenma'] } }, maxResults: { type: 'integer', minimum: 1, maximum: 25 }, maxFetches: { type: 'integer', minimum: 0, maximum: 5 }, includeDomains: { type: 'array', maxItems: 12, items: { type: 'string' } }, excludeDomains: { type: 'array', maxItems: 12, items: { type: 'string' } }, timeRange: { type: 'string', enum: ['day', 'week', 'month', 'year'] }, exactMatch: { type: 'boolean' }, cacheMode: { type: 'string', enum: ['prefer', 'refresh', 'only'] }, context_budget_chars: { type: 'integer', minimum: 12000, maximum: 300000 } }, additionalProperties: false },
+    inputSchema: { type: 'object', properties: { query: { type: 'string', description: SEARCH_OPERATOR_GUIDE }, queries: { type: 'array', maxItems: 6, items: { type: 'string', description: SEARCH_OPERATOR_GUIDE }, description: 'Optional extra query variants. Each item should also use search operators when a tighter query is possible.' }, engine: { type: 'string', enum: ['auto', 'bing', 'baidu', 'google', 'duckduckgo', 'ddg', 'sogou', 'so360', '360', 'qihoo', 'so', 'yahoo', 'yandex', 'brave', 'sm', 'shenma'] }, engines: { type: 'array', maxItems: 8, items: { type: 'string', enum: ['auto', 'bing', 'baidu', 'google', 'duckduckgo', 'ddg', 'sogou', 'so360', '360', 'qihoo', 'so', 'yahoo', 'yandex', 'brave', 'sm', 'shenma'] } }, maxResults: { type: 'integer', minimum: 1, maximum: 25 }, maxFetches: { type: 'integer', minimum: 0, maximum: 7 }, concurrency: { anyOf: [{ type: 'string', enum: ['auto'] }, { type: 'integer', minimum: 1, maximum: 7 }], description: 'Choose auto or 1–7 simultaneous research tabs for this task. Slow networks, limited devices and failed/challenge pages may reduce subsequent concurrency.' }, includeDomains: { type: 'array', maxItems: 12, items: { type: 'string' } }, excludeDomains: { type: 'array', maxItems: 12, items: { type: 'string' } }, timeRange: { type: 'string', enum: ['day', 'week', 'month', 'year'] }, exactMatch: { type: 'boolean' }, cacheMode: { type: 'string', enum: ['prefer', 'refresh', 'only'] }, context_budget_chars: { type: 'integer', minimum: 12000, maximum: 300000 } }, additionalProperties: false },
   },
   {
     name: 'browser_fetch',
@@ -299,7 +337,7 @@ const TOOLS = [
   {
     name: 'browser_research',
     description: 'Run a bounded autonomous public-web evidence-gathering loop: derive query variants, search multiple engines, fuse rankings, fetch top pages, and return citation-ready sources plus gaps and transparent degradation telemetry. When supplying queries, ' + SEARCH_OPERATOR_GUIDE,
-    inputSchema: { type: 'object', properties: { prompt: { type: 'string' }, queries: { type: 'array', maxItems: 6, items: { type: 'string', description: SEARCH_OPERATOR_GUIDE } }, depth: { type: 'string', enum: ['quick', 'standard', 'deep'] }, engines: { type: 'array', maxItems: 8, items: { type: 'string', enum: ['auto', 'bing', 'baidu', 'google', 'duckduckgo', 'ddg', 'sogou', 'so360', '360', 'qihoo', 'so', 'yahoo', 'yandex', 'brave', 'sm', 'shenma'] } }, maxPages: { type: 'integer', minimum: 1, maximum: 15 }, maxTimeMs: { type: 'integer', minimum: 10000, maximum: 180000 }, includeDomains: { type: 'array', maxItems: 12, items: { type: 'string' } }, excludeDomains: { type: 'array', maxItems: 12, items: { type: 'string' } }, timeRange: { type: 'string', enum: ['day', 'week', 'month', 'year'] }, cacheMode: { type: 'string', enum: ['prefer', 'refresh', 'only'] }, context_budget_chars: { type: 'integer', minimum: 16000, maximum: 300000 } }, required: ['prompt'], additionalProperties: false },
+    inputSchema: { type: 'object', properties: { prompt: { type: 'string' }, queries: { type: 'array', maxItems: 6, items: { type: 'string', description: SEARCH_OPERATOR_GUIDE } }, depth: { type: 'string', enum: ['quick', 'standard', 'deep'] }, engines: { type: 'array', maxItems: 8, items: { type: 'string', enum: ['auto', 'bing', 'baidu', 'google', 'duckduckgo', 'ddg', 'sogou', 'so360', '360', 'qihoo', 'so', 'yahoo', 'yandex', 'brave', 'sm', 'shenma'] } }, maxPages: { type: 'integer', minimum: 1, maximum: 15 }, concurrency: { anyOf: [{ type: 'string', enum: ['auto'] }, { type: 'integer', minimum: 1, maximum: 7 }], description: 'Choose auto or 1–7 simultaneous research tabs for this task. Slow networks, limited devices and failed/challenge pages may reduce subsequent concurrency.' }, maxTimeMs: { type: 'integer', minimum: 10000, maximum: 180000 }, includeDomains: { type: 'array', maxItems: 12, items: { type: 'string' } }, excludeDomains: { type: 'array', maxItems: 12, items: { type: 'string' } }, timeRange: { type: 'string', enum: ['day', 'week', 'month', 'year'] }, cacheMode: { type: 'string', enum: ['prefer', 'refresh', 'only'] }, context_budget_chars: { type: 'integer', minimum: 16000, maximum: 300000 } }, required: ['prompt'], additionalProperties: false },
   },
   {
     name: 'browser_go_back',
@@ -363,7 +401,7 @@ const TOOLS = [
   },
   {
     name: 'browser_screenshot',
-    description: 'Capture the viewport, full page, or one element and return the image together with a compact accessibility note by default, so both vision and text-only models can reason about the same state.',
+    description: 'Capture the viewport, full page, or one element, with a compact accessibility note by default. width/height report encoded image pixels; sourceWidth/sourceHeight are CSS dimensions. Compatible element capture may scroll and stitch a stable top-frame element, then restore the capture starting scroll. A moving target or unexposable region fails explicitly. Firefox fullPage degrades to viewport and reports fullPageDegraded.',
     inputSchema: { type: 'object', properties: { fullPage: { type: 'boolean', description: 'Capture the complete scrollable page. Cannot be combined with an element target.' }, element: { type: 'string', description: 'Human-readable element description.' }, ref: { type: 'string', description: 'Element ref from browser_snapshot.' }, selector: { type: 'string', description: 'CSS selector fallback for an element screenshot.' }, target: { type: 'string', description: 'Playwright-compatible shorthand: an element ref or CSS selector.' }, type: { type: 'string', enum: ['png', 'jpeg'] }, quality: { type: 'integer', minimum: 1, maximum: 100, description: 'JPEG quality. Ignored for PNG.' }, includeSnapshot: { type: 'boolean', description: 'Include a compact accessibility note. Defaults to true.' }, compact: { type: 'boolean' }, exclude_img: { type: 'boolean' }, focus: { type: 'string' }, max_elements: { type: 'integer', minimum: 20, maximum: 1000 }, save_to_file: { type: 'boolean', description: 'Also save the screenshot to a local image file. Defaults to false; the image response is always preserved.' }, file_path: { type: 'string', maxLength: 4096, description: 'Optional destination. Absolute paths are used directly; relative paths are resolved below HAWKEYE_SCREENSHOT_DIR or $CWD/screenshots.' }, overwrite: { type: 'boolean', description: 'Allow replacement of an existing screenshot file. Defaults to false.' } }, additionalProperties: false },
   },
   {
@@ -386,8 +424,13 @@ const TOOLS = [
   },
   {
     name: 'browser_resize',
-    description: 'Resize the page CSS viewport for responsive-layout testing. Prefers Chrome DevTools Emulation.setDeviceMetricsOverride; falls back to resizing the browser window. Returns requested vs applied viewport. Use action=reset after testing.',
+    description: 'Resize the page CSS viewport for responsive-layout testing. Prefers Chrome DevTools Emulation.setDeviceMetricsOverride; falls back to resizing the browser window. Returns requested vs applied viewport. Use action=reset after testing on the same tab; saved sizes are per tab.',
     inputSchema: { type: 'object', properties: { width: { type: 'integer', minimum: 320, maximum: 3840 }, height: { type: 'integer', minimum: 240, maximum: 2160 }, action: { type: 'string', enum: ['resize', 'reset'] }, reset: { type: 'boolean', description: 'Equivalent to action=reset.' } }, additionalProperties: false },
+  },
+  {
+    name: 'browser_bookmarks',
+    description: 'Read and organize the real browser bookmark library without an injectable tab. list/search return paginated flat records with folder paths; create/update/move/remove modify explicit IDs, keep a pre-change backup and verify receipts. Root, managed and non-empty folder deletion is rejected. remove requires the user to have requested deletion/deduplication. backup returns the current tree and checkpoint metadata.',
+    inputSchema: { type: 'object', properties: { action: { type: 'string', enum: ['list','search','get','backup','create','update','move','remove'] }, id: { type: 'string' }, ids: { type: 'array', items: { type: 'string' }, maxItems: 100 }, parentId: { type: 'string' }, title: { type: 'string' }, url: { type: 'string' }, query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 500 }, index: { type: 'integer', minimum: 0 }, expectedUrl: { type: 'string' }, expectedTitle: { type: 'string' } }, additionalProperties: false },
   },
   {
     name: 'browser_tabs',
@@ -510,8 +553,8 @@ const TOOLS = [
   },
   {
     name: 'hawkeye_fuzz_run',
-    description: 'Run a bounded security-test fuzz job (maximum 12 requests) only for a host explicitly authorized in HawkEye scope with fuzzing enabled.',
-    inputSchema: { type: 'object', properties: { recordId: { type: 'string' }, rawRequest: { type: 'string' }, url: { type: 'string' }, parameter: { type: 'string' }, variants: { type: 'array', maxItems: 6, items: {} }, payloads: { type: 'array', maxItems: 12, items: { type: 'string' } }, executeLimit: { type: 'integer', minimum: 1, maximum: 12 }, stopOnFlags: { type: 'boolean' } }, additionalProperties: false },
+    description: 'Run a bounded security-test fuzz job with 1–3 §...§ points and independent payload_sets (maximum 12 requests) only for a host explicitly authorized in HawkEye scope with fuzzing enabled.',
+    inputSchema: { type: 'object', properties: { recordId: { type: 'string' }, rawRequest: { type: 'string' }, url: { type: 'string' }, parameter: { type: 'string' }, variants: { type: 'array', maxItems: 6, items: {} }, payloads: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string' } }, payload_sets: { type: 'array', minItems: 1, maxItems: 3, items: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string' } } }, attack_mode: { type: 'string', enum: ['sequential', 'parallel', 'cartesian'] }, use_dom: { type: 'boolean' }, executeLimit: { type: 'integer', minimum: 1, maximum: 12 }, stopOnFlags: { type: 'boolean' } }, additionalProperties: false },
   },
   {
     name: 'hawkeye_response_compare',
@@ -530,13 +573,18 @@ const TOOLS = [
   },
   {
     name: 'hawkeye_codec',
-    description: "HawkEye's built-in encode/decode, hashing and crypto helpers. Runs a single transform locally in the extension (no network). Encoders: base64, base64url, url, hex, unicode, html, base32, rot13 (encode/decode). Digests: md5, sha1, sha256, sha512, sm3, hmacsha256 (needs key). Utilities: jwt_parse, timestamp_convert, json_pretty/compact/escape/unescape. Use action=auto_probe to auto-detect and decode suspicious base64/url tokens (e.g. flags) inside arbitrary text.",
-    inputSchema: { type: 'object', properties: { action: { type: 'string', description: 'Transform to run, e.g. base64_decode, base64url_encode, url_encode, hex_decode, md5, sha256, sm3, hmacsha256, jwt_parse, timestamp_convert, json_pretty, auto_probe.' }, text: { type: 'string', description: 'The input string to transform.' }, key: { type: 'string', description: 'Secret key for keyed transforms such as hmacsha256.' } }, required: ['action'], additionalProperties: true },
+    description: 'Full offline Codec Lab. action=catalog discovers the current operation catalog, parameter schemas, Pro requirements and smart-decoder coverage; never assume a fixed operation count. action=run executes up to 16 steps on text using the same UI engine. action=diff compares left/right (options.json, ignoreWhitespace, ignoreCase). code_generate returns SVG for QR_CODE/CODE128/CODE39/EAN13/EAN8/UPC/ITF/ITF14/CODABAR/CODE93. code_decode reads a raster image_data data URL (6 MiB) and defaults to up to 32 codes, ordered by original-pixel bounds/index. options.maxResults (1–32) and options.region={x,y,width,height} support result limits and cropping. page_scan reads images/canvases/inline SVG from the bound webpage and returns actual QR/barcode results plus per-image failures. maxImages (1–24, default 12), offset and nextOffset continue successive page batches without user reupload. Attachment IDs belong to Agent conversations; external MCP should use image_data or page_scan. Decoded links are never opened automatically. workbench with command=read/run/diff/generate/decode/svg/png/export/save_file controls the visible extension workbench and downloads outputs; decode can reuse its imported image. smartdecode performs bounded layered decoding (options.maxDepth 1-8, maxAttempts 1-1200, minScore 0-100 defaults to 35 and filters returned candidates without discarding intermediate layers, classical, password, parameters, dictionary, ai). Local keys/IVs/matrices/dictionaries stay local; ai=true sends bounded input/candidates to the configured AI provider. ipcalc handles IPv4/IPv6 CIDR/address conversion. workbench also supports network/smart/stop. SM9 master generation, identity-key extraction and encryption/decryption are available through catalog actions. Query catalog first and use its action/options directly; do not inject replacement crypto scripts or load a CDN. Hex decode options.outputFormat=auto/utf8/raw/hex/base64; options.delimiter=auto/space/percent/comma/semicolon/colon/lf/crlf/0x/\\x/none. Binary decoding returns binary.encoding=base64, data, byteLength, filename and MIME; binary data has its own offset/truncated flags. Save original bytes via action=workbench, command=save_file (options.filename optional) after command=run; export remains UTF-8 text. Check truncated and paginate text and binary bytes with offset/maxLength; diff uses offset/limit (1-500 rows). OpenSSL AES-CBC (openssl_decrypt and aesdec with explicit kdf; aesdec without kdf uses raw keys and its catalog formats): kdf=evp defaults to MD5 for CryptoJS compatibility; set digest=sha256 for modern OpenSSL EVP. kdf=pbkdf2 defaults to SHA-256/10000 iterations/saltLength=8. kdf=raw requires key+iv (hex by default; keyFormat/ivFormat may be base64). cipher accepts AES-128/192/256-CBC. auto_probe is a bounded single-layer clue scanner for URL/Unicode/HTML/Hex/Base32/Base64 and digest fingerprints; use smartdecode for nested decoding; fingerprints are not recovered plaintext.',
+    inputSchema: {type:'object',properties:{action:{type:'string'},text:{type:'string'},query:{type:'string'},summary:{type:'boolean',description:'Return compact action metadata and parameter keys.'},category:{type:'string',description:'Filter by a category from catalog.categories.'},includeMeta:{type:'boolean',description:'Set false to omit repeated coverage, capabilities, limits and smartCatalog metadata.'},includeSmartCatalog:{type:'boolean',description:'Include full smart decoder descriptions; filtered/summary queries omit them by default.'},steps:{type:'array',maxItems:16,items:{type:'object',properties:{action:{type:'string'},options:{type:'object'},enabled:{type:'boolean'}},required:['action']}},options:{type:'object'},left:{type:'string'},right:{type:'string'},format:{type:'string'},ecc:{type:'string',enum:['L','M','Q','H']},image_data:{type:'string',description:'Original raster image as a data URL, at most 6 MiB. No remote image service is used.'},maxResults:{type:'integer',minimum:1,maximum:32},maxImages:{type:'integer',minimum:1,maximum:24},command:{type:'string',enum:['read','run','diff','network','smart','stop','generate','decode','svg','png','export','save_file']},limit:{type:'integer',minimum:1,maximum:500},offset:{type:'integer',minimum:0},maxLength:{type:'integer',minimum:1,maximum:2097152},key:{type:'string'},password:{type:'string'},iv:{type:'string'},keyFormat:{type:'string',enum:['utf8','hex','base64','base64url']},ivFormat:{type:'string',enum:['utf8','hex','base64','base64url']},kdf:{type:'string',enum:['evp','pbkdf2','raw']},digest:{type:'string',enum:['md5','sha256']},iterations:{type:'integer',minimum:1,maximum:1000000},cipher:{type:'string',enum:['aes-128-cbc','aes-192-cbc','aes-256-cbc']},saltLength:{type:'integer',enum:[8,16]}},required:['action'],additionalProperties:true},
   },
   {
     name: 'hawkeye_script_list',
     description: 'List the user script plugins installed in the HawkEye extension (Tampermonkey-style), including each script id, name, enabled state, match rules, and how well it matches a given page URL or host. Use this before hawkeye_script_run to pick the right script.',
     inputSchema: { type: 'object', properties: { url: { type: 'string', description: 'Optional page URL to rank scripts by match relevance.' }, host: { type: 'string', description: 'Optional host to rank scripts by match relevance.' } }, additionalProperties: false },
+  },
+  {
+    name: 'hawkeye_script_manage',
+    description: 'Read and manage persistent HawkEye user scripts. list returns metadata; get returns the full source and updatedAt for editing. Use hawkeye_script_upsert with scriptId and expectedUpdatedAt to save edited source, then get to verify and hawkeye_script_run to execute. enable/disable change one script; global_enable/global_disable control automatic script dispatch; remove deletes a custom script (built-ins can only be disabled). Prefer exact scriptId; ambiguous names fail. Requires Pro and shares the same local storage and registration engine as the UI. Creating/editing does not execute the script.',
+    inputSchema: { type: 'object', properties: { action: { type: 'string', enum: ['list', 'get', 'enable', 'disable', 'global_enable', 'global_disable', 'remove'] }, scriptId: { type: 'string', minLength: 1 }, name: { type: 'string', minLength: 1 }, url: { type: 'string' }, host: { type: 'string' } }, required: ['action'], additionalProperties: false },
   },
   {
     name: 'hawkeye_script_run',
@@ -550,8 +598,8 @@ const TOOLS = [
   },
   {
     name: 'hawkeye_script_upsert',
-    description: "Create or update a persistent HawkEye user script plugin (Tampermonkey-style). Provide the JavaScript in `code` (a full ==UserScript== metadata block is also accepted). Use this to author a reusable script that solves a page problem, then run it with hawkeye_script_run. Prefer hawkeye_evaluate for one-off computations; use this when the logic should persist and re-run on matching pages.",
-    inputSchema: { type: 'object', properties: { code: { type: 'string', description: 'The script source. May include a Tampermonkey ==UserScript== header.' }, scriptId: { type: 'string', description: 'Existing script id to update; omit to create a new script.' }, name: { type: 'string' }, description: { type: 'string' }, matchMode: { type: 'string', enum: ['manual', 'auto'], description: 'manual = only runs when explicitly invoked; auto = runs on matching pages.' }, matches: { type: 'array', items: { type: 'string' }, description: 'URL match patterns for auto mode, e.g. https://example.com/*.' }, runAt: { type: 'string', enum: ['document_start', 'document_end', 'document_idle'] }, world: { type: 'string', enum: ['USER_SCRIPT', 'MAIN'] }, enabled: { type: 'boolean' } }, required: ['code'], additionalProperties: true },
+    description: "Create or update a persistent HawkEye user script plugin (Tampermonkey-style). Provide the JavaScript in `code` (a full ==UserScript== metadata block is also accepted). Use this to author a reusable script that solves a page problem, then run it with hawkeye_script_run. For edits, read hawkeye_script_manage action=get first and supply expectedUpdatedAt; a missing scriptId is rejected instead of silently creating another script. Omitted metadata is preserved on update. Prefer hawkeye_evaluate for one-off computations; use this when the logic should persist and re-run on matching pages.",
+    inputSchema: { type: 'object', properties: { code: { type: 'string', description: 'The script source. May include a Tampermonkey ==UserScript== header.' }, scriptId: { type: 'string', description: 'Existing script id to update; omit to create a new script.' }, name: { type: 'string' }, description: { type: 'string' }, matchMode: { type: 'string', enum: ['manual', 'matches', 'all', 'auto'], description: 'manual runs only when invoked; matches (legacy alias auto) runs on matches URL patterns; all runs on every HTTP(S) page.' }, matches: { type: 'array', items: { type: 'string' }, description: 'URL match patterns for auto mode, e.g. https://example.com/*.' }, runAt: { type: 'string', enum: ['document_start', 'document_end', 'document_idle'] }, world: { type: 'string', enum: ['USER_SCRIPT', 'MAIN'] }, enabled: { type: 'boolean' }, allFrames: { type: 'boolean' }, expectedUpdatedAt: { type: 'integer', minimum: 0, description: 'Optional optimistic concurrency guard from hawkeye_script_manage get. Rejects stale edits instead of overwriting newer changes.' } }, required: ['code'], additionalProperties: true },
   },
   {
     name: 'hawkeye_sensitive_scan',
@@ -575,15 +623,21 @@ TOOLS.find((tool) => tool.name === 'browser_navigate').inputSchema.properties.in
 TOOLS.find((tool) => tool.name === 'hawkeye_evaluate').description += ' Console logs are omitted by default; include_logs=true opts in.';
 TOOLS.find((tool) => tool.name === 'browser_navigate').description += ' Default output is a bounded page preview; include_snapshot=true restores the full observation.';
 
-const ACTION_RECEIPT_TOOLS = new Set(['browser_click', 'browser_type', 'browser_fill_form', 'browser_select_option', 'browser_press_key', 'browser_wait', 'browser_wait_for']);
+const ACTION_RECEIPT_TOOLS = new Set(['browser_click', 'browser_type', 'browser_fill_form', 'browser_select_option', 'browser_press_key', 'browser_scroll', 'browser_wait', 'browser_wait_for']);
 for (const tool of TOOLS) {
   if (!ACTION_RECEIPT_TOOLS.has(tool.name)) continue;
   tool.inputSchema.properties.include_elements = { type: 'boolean', description: 'Include the post-action page snapshot and element list. Defaults to false. Prefer browser_snapshot for a separate observation; never repeat an action just to fetch its page details.' };
   tool.description += ' Returns a concise action receipt by default, retaining outcome and input evidence. Set include_elements=true to include the post-action snapshot and elements.';
 }
 
-const READ_ONLY_TOOLS = new Set(['browser_snapshot', 'browser_find', 'browser_search', 'browser_fetch', 'browser_research', 'browser_exam_questions', 'browser_read_text', 'browser_get_console_logs', 'browser_wait', 'browser_wait_for', 'hawkeye_capture_state', 'hawkeye_capture_history', 'hawkeye_capture_inspect', 'hawkeye_request_get', 'hawkeye_request_mutate', 'hawkeye_response_compare', 'hawkeye_codec', 'hawkeye_script_list', 'hawkeye_sensitive_scan', 'hawkeye_darklink_scan']);
-const CLOSED_WORLD_TOOLS = new Set(['hawkeye_capture_start', 'hawkeye_capture_stop', 'hawkeye_capture_state', 'hawkeye_capture_history', 'hawkeye_capture_inspect', 'hawkeye_request_get', 'hawkeye_request_mutate', 'hawkeye_response_compare', 'hawkeye_scope', 'hawkeye_findings', 'hawkeye_codec', 'hawkeye_script_list', 'hawkeye_sensitive_scan']);
+for (const tool of TOOLS) {
+  if (!['browser_click', 'browser_hover', 'browser_type', 'browser_select_option'].includes(tool.name)) continue;
+  tool.inputSchema.properties.autoWait = { type: 'boolean', description: 'Wait for a visible target; click/type/select require enabled controls and type requires editable fields. Click/hover also wait for stable geometry and an unobstructed pointer. Defaults to true. false skips waiting, not applicable disabled/read-only checks.' };
+  tool.inputSchema.properties.timeoutMs = { type: 'integer', minimum: 100, maximum: 10000, description: 'Actionability wait budget in milliseconds, default 2500. No click/value write occurs on timeout.' };
+}
+
+const READ_ONLY_TOOLS = new Set(['browser_snapshot', 'browser_find', 'browser_search', 'browser_fetch', 'browser_research', 'browser_exam_questions', 'browser_read_text', 'browser_get_console_logs', 'browser_wait', 'browser_wait_for', 'hawkeye_capture_state', 'hawkeye_capture_history', 'hawkeye_capture_inspect', 'hawkeye_request_get', 'hawkeye_request_mutate', 'hawkeye_response_compare', 'hawkeye_script_list', 'hawkeye_sensitive_scan', 'hawkeye_darklink_scan']);
+const CLOSED_WORLD_TOOLS = new Set(['hawkeye_capture_start', 'hawkeye_capture_stop', 'hawkeye_capture_state', 'hawkeye_capture_history', 'hawkeye_capture_inspect', 'hawkeye_request_get', 'hawkeye_request_mutate', 'hawkeye_response_compare', 'hawkeye_scope', 'hawkeye_findings', 'hawkeye_codec', 'hawkeye_script_list', 'hawkeye_script_manage', 'hawkeye_sensitive_scan']);
 const TOOL_BY_NAME = new Map(TOOLS.map((tool) => [tool.name, tool]));
 for (const tool of TOOLS) {
   const readOnly = READ_ONLY_TOOLS.has(tool.name);
@@ -666,12 +720,14 @@ function validateSchema(schema, value, location = '$', depth = 0) {
 }
 
 const TOOL_CAPABILITIES = {
-  core: ['browser_navigate', 'browser_go_back', 'browser_go_forward', 'browser_snapshot', 'browser_find', 'browser_click', 'browser_hover', 'browser_type', 'browser_select_option', 'browser_press_key', 'browser_wait', 'browser_tabs', 'browser_reload', 'browser_wait_for', 'browser_fill_form', 'browser_handle_dialog', 'browser_scroll', 'browser_read_text'],
+  codec: ['hawkeye_codec'],
+  scripts: ['hawkeye_script_list', 'hawkeye_script_manage', 'hawkeye_script_run', 'hawkeye_script_upsert'],
+  core: ['browser_navigate', 'browser_go_back', 'browser_go_forward', 'browser_snapshot', 'browser_find', 'browser_click', 'browser_hover', 'browser_type', 'browser_select_option', 'browser_press_key', 'browser_wait', 'browser_tabs', 'browser_reload', 'browser_wait_for', 'browser_fill_form', 'browser_handle_dialog', 'browser_scroll', 'browser_read_text', 'browser_bookmarks'],
   research: ['browser_search', 'browser_fetch', 'browser_research'],
   vision: ['browser_screenshot', 'browser_captcha_assist', 'browser_resize', 'browser_drag'],
   files: ['browser_file_upload', 'browser_download_file'],
   forms: ['browser_exam_questions', 'browser_answer_questions'],
-  devtools: ['browser_get_console_logs', 'browser_security', 'hawkeye_evaluate', 'hawkeye_script_list', 'hawkeye_script_run', 'hawkeye_script_upsert'],
+  devtools: ['browser_get_console_logs', 'browser_security', 'hawkeye_evaluate', 'hawkeye_script_list', 'hawkeye_script_run', 'hawkeye_script_upsert', 'hawkeye_script_manage'],
   security: ['hawkeye_capture_start', 'hawkeye_capture_stop', 'hawkeye_capture_state', 'hawkeye_capture_history', 'hawkeye_capture_inspect', 'hawkeye_request_get', 'hawkeye_request_replay', 'hawkeye_request_mutate', 'hawkeye_fuzz_run', 'hawkeye_response_compare', 'hawkeye_scope', 'hawkeye_findings', 'hawkeye_codec', 'hawkeye_sensitive_scan', 'hawkeye_darklink_scan', 'hawkeye_intercept'],
 };
 function resolveToolProfile(argv = process.argv.slice(2), env = process.env) {
@@ -701,7 +757,7 @@ const ENABLED_TOOL_NAMES = new Set(TOOL_PROFILE.tools.map((tool) => tool.name));
 // Model providers accept a narrower vocabulary than MCP's JSON Schema contract.
 // Keep the executable schemas above intact; publish a simple object at the root.
 // Root fields must be optional because page_token alone is a valid continuation.
-// Build once, rather than cloning 51 schemas on each tools/list request.
+// Build once, rather than cloning the schemas on each tools/list request.
 function publicToolDefinition(tool) {
   const schema = JSON.parse(JSON.stringify(tool.inputSchema));
   const requirements = schema.anyOf[0];
@@ -743,9 +799,9 @@ function pruneSnapshots(now = Date.now(), hostId) {
 function pageError(message, category = 'invalid_page_token') {
   return Object.assign(new Error(message), { rpcCode: -32602, category, hint: 'Start a fresh read without cursor/page_token. Never retry a write merely to obtain its old output.' });
 }
-function cacheResultPage(tool, text, metadata, input, context, defaultBudget) {
+function cacheResultPage(tool, text, metadata, input, context, defaultBudget, format = 'text') {
   const budget = Math.max(12_000, Math.min(400_000, Number(input.context_budget_chars) || defaultBudget));
-  const entry = { id: crypto.randomBytes(16).toString('hex'), hostId: context.hostId, tool, text, metadata, input, budget, capturedAt: Date.now(), expiresAt: Date.now() + SNAPSHOT_TTL_MS, tokens: new Map() };
+  const entry = { id: crypto.randomBytes(16).toString('hex'), hostId: context.hostId, tool, text, metadata, input, budget, format, capturedAt: Date.now(), expiresAt: Date.now() + SNAPSHOT_TTL_MS, tokens: new Map() };
   entry.bytes = Buffer.byteLength(text) + Buffer.byteLength(JSON.stringify(metadata)) + Buffer.byteLength(JSON.stringify(input));
   if (text.length > budget) {
     if (entry.bytes > MAX_SNAPSHOT_BYTES) throw pageError('Result exceeds the 4 MiB immutable-page limit; narrow the query or reduce extraction size', 'result_too_large');
@@ -769,6 +825,12 @@ function renderResultPage(entry, offset) {
     const structuredContent = { ...entry.metadata, value: entry.text.slice(offset, end), context };
     // Keep structured-only and text-only MCP hosts consistent, including continuation pages.
     return { content: [{ type: 'text', text: JSON.stringify(structuredContent) }], structuredContent };
+  }
+  // Generic JSON pages must remain readable to structured-only Hosts too.
+  // Join value chunks, then parse once; a single chunk need not be valid JSON.
+  if (entry.format === 'json') {
+    context.payload_format = 'json';
+    return { content: [{ type: 'text', text: entry.text.slice(offset, end) }, { type: 'text', text: JSON.stringify({ ...entry.metadata, context }) }], structuredContent: { ...entry.metadata, value: entry.text.slice(offset, end), context } };
   }
   return { content: [{ type: 'text', text: entry.text.slice(offset, end) }, { type: 'text', text: JSON.stringify({ ...entry.metadata, context }) }], structuredContent: { ...entry.metadata, context } };
 }
@@ -1229,25 +1291,22 @@ function compactObservationResult(tool, result, input) {
 
 function compactActionReceipt(tool, result, input) {
   if (!ACTION_RECEIPT_TOOLS.has(tool) || input?.include_elements === true) return result;
-  const receipt = {};
-  for (const key of ['ok', 'error', 'category', 'hint', 'action', 'operation', 'tabId', 'frameId', 'url', 'urlBefore', 'urlAfter', 'stateChanged', 'routeChanged', 'navigatedTo', 'outcomeVerified', 'inputDispatched', 'eventEvidence', 'userActivationObserved', 'nativeInput']) {
-    if (Object.hasOwn(result, key)) receipt[key] = result[key];
+  const omitted = new Set();
+  const pageFields = new Set(['snapshot', 'elements', 'visibleText', 'visible_text', 'accessibilitySnapshot']);
+  function compact(value, path = '') {
+    if (Array.isArray(value)) return value.map((row, i) => compact(row, path + '[' + i + ']'));
+    if (!value || typeof value !== 'object') return value;
+    const out = {};
+    for (const [key, child] of Object.entries(value)) {
+      if (pageFields.has(key)) { omitted.add(path + key); continue; }
+      out[key] = compact(child, path + key + '.');
+    }
+    return out;
   }
-  for (const [key, value] of Object.entries(result)) {
-    if (key !== 'snapshot' && key !== 'elements' && key !== 'frames' && !Object.hasOwn(receipt, key)) receipt[key] = value;
-  }
-  if (Array.isArray(result.frames)) {
-    receipt.frames = result.frames.map((frame) => {
-      if (!frame || typeof frame !== 'object') return frame;
-      const { snapshot, elements, ...metadata } = frame;
-      return metadata;
-    });
-  }
-  const omitted = ['snapshot', 'elements'].filter((key) => Object.hasOwn(result, key));
-  if (Array.isArray(result.frames) && result.frames.some((frame) => frame && (Object.hasOwn(frame, 'snapshot') || Object.hasOwn(frame, 'elements')))) omitted.push('frames[].snapshot/elements');
-  if (omitted.length) {
+  const receipt = compact(result);
+  if (omitted.size) {
     receipt.transport_compacted = true;
-    receipt.transport_compaction = { scope: 'action_receipt', omitted_fields: omitted, omitted_element_count: Array.isArray(result.elements) ? result.elements.length : 0 };
+    receipt.transport_compaction = { scope: 'action_receipt', omitted_fields: Array.from(omitted), omitted_element_count: Array.isArray(result.elements) ? result.elements.length : 0 };
   }
   return receipt;
 }
@@ -1316,7 +1375,7 @@ async function toolResultContent(tool, result, requestInput, context = stdioCont
         : saveResult.saved_to
           ? '\n已保存到: ' + saveResult.saved_to
           : '\n截图已生成但保存失败: ' + saveResult.save_error;
-      const screenshotMetadata = { ok: result.ok !== false, value: null, error: result.error, hint: result.hint, url: result.url, scope: result.scope, fullPage: result.fullPage, element: result.element, mimeType: result.mimeType, bytes: result.bytes, width: result.width, height: result.height, sourceWidth: result.sourceWidth, sourceHeight: result.sourceHeight, scale: result.scale, accessibility: result.accessibility };
+      const screenshotMetadata = { ok: result.ok !== false, value: null, error: result.error, hint: result.hint, url: result.url, scope: result.scope, fullPage: result.fullPage, fullPageDegraded: result.fullPageDegraded, note: result.note, element: result.element, mimeType: result.mimeType, bytes: result.bytes, width: result.width, height: result.height, sourceWidth: result.sourceWidth, sourceHeight: result.sourceHeight, scale: result.scale, scaleY: result.scaleY, compatibleFallback: result.compatibleFallback, tiles: result.tiles, accessibility: result.accessibility };
       return {
         content: [
           { type: 'image', data: match[2], mimeType: match[1] },
@@ -1337,7 +1396,7 @@ async function toolResultContent(tool, result, requestInput, context = stdioCont
   const serialized = JSON.stringify(result, null, 2);
   if (serialized.length <= budget) return { content: [{ type: 'text', text: serialized }], structuredContent: result };
   const metadata = { ok: result.ok, value: null, error: result.error, hint: result.hint };
-  return cacheResultPage(tool, serialized, metadata, requestInput, context, budget);
+  return cacheResultPage(tool, serialized, metadata, requestInput, context, budget, 'json');
 }
 
 function rpcResult(id, result) {
@@ -1407,7 +1466,7 @@ async function handleRpc(message, context = createRpcContext()) {
       const input = params.arguments || {};
       if (Object.hasOwn(input, 'cursor') && input.cursor !== 0) return rpcError(id, -32602, 'Numeric continuation cursors are unstable and no longer accepted; use context.next_page_token', { category: 'unstable_cursor', hint: 'Request a fresh result with cursor omitted, then send page_token alone.' });
       const validation = validateSchema(TOOL_BY_NAME.get(name).inputSchema, input);
-      if (validation.length) return rpcError(id, -32602, 'Invalid tool arguments', { category: 'invalid_arguments', hint: 'Fix the listed parameter paths before retrying; no browser action was executed.', errors: validation });
+      if (validation.length) return rpcError(id, -32602, 'Invalid tool arguments: ' + validation.map(e => e.path + ' ' + e.message).join('; ').slice(0, 1500), { category: 'invalid_arguments', hint: 'Fix the listed parameter paths before retrying; no browser action was executed.', errors: validation });
       if (input.page_token) {
         const content = continueResultPage(name, input, context);
         return rpcResult(id, compatibleToolResult({ ...content, ...(content.structuredContent.ok === false ? { isError: true } : {}) }, context));
@@ -1519,7 +1578,7 @@ async function handleHttpRpc(request, res) {
     return;
   }
   let payload;
-  try { payload = await readJsonBody(request); }
+  try { payload = await readJsonBody(request, 12 * 1024 * 1024); }
   catch (error) {
     writeJson(res, 400, rpcError(null, -32700, error.message));
     return;
@@ -1605,7 +1664,7 @@ const httpServer = http.createServer((request, res) => {
     const contentType = String(request.headers['content-type'] || '').toLowerCase();
     if (!contentType.startsWith('application/json')) { writeJson(res, 415, rpcError(null, -32600, 'Content-Type must be application/json')); return; }
     const { stream, context } = session;
-    readJsonBody(request).then((payload) => handleRpc(payload, context)).then((response) => {
+    readJsonBody(request, 12 * 1024 * 1024).then((payload) => handleRpc(payload, context)).then((response) => {
       if (response && !stream.destroyed && !stream.writableEnded) {
         if (stream.writableLength > MAX_WS_MESSAGE_BYTES) stream.destroy();
         else stream.write('event: message\ndata: ' + JSON.stringify(response) + '\n\n');
@@ -1780,7 +1839,8 @@ const stdioInput = createBoundedInput((line) => {
   Promise.resolve(handleRpc(message, stdioContext)).then((response) => {
     if (response && !stdioClosed) stdioWriter.send(response);
   }).catch((error) => stderr(error && error.stack || error)).finally(() => { stdioRequests -= 1; });
-}, closeStdio);
+}, closeStdio, { maxLineBytes: 12 * 1024 * 1024, maxBufferedBytes: 32 * 1024 * 1024 });
+// DeepSentry owns this bridge only when it supplies the parent PID.
 const ownedParentPID = Number(process.env.DEEPSENTRY_MCP_PARENT_PID || '');
 const ownedByDeepSentry = Number.isInteger(ownedParentPID) && ownedParentPID > 0 && ownedParentPID !== process.pid;
 if (ownedByDeepSentry) {

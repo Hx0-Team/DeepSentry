@@ -1,6 +1,7 @@
 package builtin
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -62,7 +63,7 @@ func startHTTPProxy(rt Runtime, listenHost, listenPort, username, password strin
 	forwardManager.items[id] = sess
 	forwardManager.Unlock()
 	server := &http.Server{
-		Handler:           httpProxyHandler{sess: sess, username: username, password: password},
+		Handler:           newHTTPProxyHandler(sess, username, password),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 	go func() { _ = server.Serve(sess.Listener) }()
@@ -70,10 +71,36 @@ func startHTTPProxy(rt Runtime, listenHost, listenPort, username, password strin
 }
 
 type httpProxyHandler struct {
-	sess     *forwardSession
-	username string
-	password string
+	transport *http.Transport
+	sess      *forwardSession
+	username  string
+	password  string
 }
+
+func newHTTPProxyHandler(sess *forwardSession, username, password string) httpProxyHandler {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.MaxIdleConnsPerHost = 8
+	transport.MaxConnsPerHost = 64
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		if !sess.track(conn) {
+			return nil, net.ErrClosed
+		}
+		return &forwardConn{Conn: conn, session: sess}, nil
+	}
+	sess.track(transportCloser{transport})
+	return httpProxyHandler{sess: sess, username: username, password: password, transport: transport}
+}
+
+type transportCloser struct{ *http.Transport }
+
+func (t transportCloser) Close() error { t.CloseIdleConnections(); return nil }
 
 func (h httpProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !proxyBasicOK(r, h.username, h.password) {
@@ -94,10 +121,20 @@ func (h httpProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	out := r.Clone(r.Context())
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	stop := context.AfterFunc(h.sess.context(), cancel)
+	defer stop()
+	out := r.Clone(ctx)
 	out.RequestURI = ""
 	stripHopHeaders(out.Header)
-	resp, err := http.DefaultTransport.RoundTrip(out)
+	transport := h.transport
+	if transport == nil {
+		temporary := newHTTPProxyHandler(h.sess, h.username, h.password)
+		transport = temporary.transport
+		defer transport.CloseIdleConnections()
+	}
+	resp, err := transport.RoundTrip(out)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -124,7 +161,7 @@ func (h httpProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	// #nosec G704 -- CONNECT intentionally dials the proxy client-selected target; listener defaults to loopback, LAN exposure requires allow_lan, and configured proxy authentication is checked first.
-	dst, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 10*time.Second)
+	dst, err := h.sess.dial(net.JoinHostPort(host, port), 10*time.Second)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -135,13 +172,13 @@ func (h httpProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) 
 	defer h.sess.closeResource(dst)
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		_ = dst.Close()
+		_ = h.sess.closeResource(dst)
 		http.Error(w, "无法建立 CONNECT 隧道", http.StatusInternalServerError)
 		return
 	}
 	client, bufrw, err := hijacker.Hijack()
 	if err != nil {
-		_ = dst.Close()
+		_ = h.sess.closeResource(dst)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -154,11 +191,7 @@ func (h httpProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	noteForwardConn(h.sess)
-	if n := bufrw.Reader.Buffered(); n > 0 {
-		peek, _ := bufrw.Reader.Peek(n)
-		_, _ = dst.Write(peek)
-	}
-	spliceConns(h.sess, dst, client)
+	spliceConnReader(h.sess, dst, bufrw.Reader, client)
 }
 
 func splitProxyHost(raw string) (string, string, error) {

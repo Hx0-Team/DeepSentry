@@ -79,6 +79,257 @@ func TestOpenAICompatibleSendsNativeBuiltinSchemasAndParsesName(t *testing.T) {
 	}
 }
 
+func TestDeepSeekChatSendsThinkingEffortUserIDAndOutputBudget(t *testing.T) {
+	var raw map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	_, err := callOpenAICompatible(context.Background(), config.Config{
+		Provider: "deepseek", ApiURL: server.URL, ModelName: "deepseek-flash", ApiKey: "none",
+		Temperature: 0.7, ReasoningEffort: "max", UserID: "user_01",
+	}, []Message{{Role: "user", Content: "hi"}}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thinking, _ := raw["thinking"].(map[string]interface{})
+	if thinking["type"] != "enabled" {
+		t.Fatalf("thinking=%#v", raw["thinking"])
+	}
+	if raw["reasoning_effort"] != "max" || raw["user_id"] != "user_01" {
+		t.Fatalf("DeepSeek controls missing: %#v", raw)
+	}
+	if raw["max_tokens"] != float64(131_072) {
+		t.Fatalf("max_tokens=%#v, want 131072", raw["max_tokens"])
+	}
+	if _, ok := raw["temperature"]; ok {
+		t.Fatalf("temperature must be omitted in DeepSeek thinking mode: %#v", raw["temperature"])
+	}
+}
+
+func TestDeepSeekChatNonThinkingKeepsSamplingAndSmallerBudget(t *testing.T) {
+	var raw map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	_, err := callOpenAICompatible(context.Background(), config.Config{
+		Provider: "deepseek", ApiURL: server.URL, ModelName: "deepseek-flash", ApiKey: "none",
+		Temperature: 0.7, ThinkingMode: "disabled",
+	}, []Message{{Role: "user", Content: "hi"}}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thinking, _ := raw["thinking"].(map[string]interface{})
+	if thinking["type"] != "disabled" {
+		t.Fatalf("thinking=%#v", raw["thinking"])
+	}
+	if raw["temperature"] != float64(0.7) {
+		t.Fatalf("temperature=%#v", raw["temperature"])
+	}
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Fatalf("reasoning_effort should be omitted when thinking is disabled")
+	}
+	if raw["max_tokens"] != float64(16_384) {
+		t.Fatalf("max_tokens=%#v, want 16384", raw["max_tokens"])
+	}
+}
+
+func TestDeepSeekResponsesSendsReasoningUserAndNativeTools(t *testing.T) {
+	var raw map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("path=%s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"tool_catalog","arguments":"{\"name\":\"ping\"}"}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15,"input_tokens_details":{"cached_tokens":4}}}`))
+	}))
+	defer server.Close()
+
+	result, err := callOpenAIResponses(context.Background(), config.Config{
+		Provider: "deepseek", ApiURL: server.URL + "/responses", ModelName: "deepseek-flash", ApiKey: "none",
+		ReasoningEffort: "max", UserID: "user_01",
+	}, []Message{{Role: "system", Content: "system rules"}, {Role: "user", Content: "hi"}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reasoning, _ := raw["reasoning"].(map[string]interface{})
+	if reasoning["effort"] != "max" || raw["user"] != "user_01" {
+		t.Fatalf("DeepSeek Responses controls missing: %#v", raw)
+	}
+	if raw["max_output_tokens"] != float64(131_072) {
+		t.Fatalf("max_output_tokens=%#v", raw["max_output_tokens"])
+	}
+	if _, ok := raw["temperature"]; ok {
+		t.Fatalf("temperature must be omitted in thinking mode")
+	}
+	tools, _ := raw["tools"].([]interface{})
+	if len(tools) == 0 {
+		t.Fatalf("native tools missing: %#v", raw["tools"])
+	}
+	input, _ := raw["input"].([]interface{})
+	if len(input) < 2 {
+		t.Fatalf("role-preserving input missing: %#v", raw["input"])
+	}
+	if result.ToolCallName != "tool_catalog" || result.ToolCallID != "call_1" || result.ToolCallArgs != `{"name":"ping"}` {
+		t.Fatalf("function_call not parsed: %#v", result)
+	}
+	if result.Usage.CacheReadTokens != 4 {
+		t.Fatalf("cached tokens not parsed: %#v", result.Usage)
+	}
+}
+
+func TestDeepSeekAnthropicSendsThinkingMetadataAndNativeTools(t *testing.T) {
+	var raw map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" || r.Header.Get("x-api-key") != "none" {
+			t.Fatalf("unexpected Anthropic request: %s %q", r.URL.Path, r.Header.Get("x-api-key"))
+		}
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"thinking","thinking":"plan"},{"type":"tool_use","id":"call_1","name":"tool_catalog","input":{"name":"ping"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5}}`))
+	}))
+	defer server.Close()
+
+	result, err := callAnthropic(context.Background(), config.Config{
+		Provider: "deepseek", APIProtocol: config.ProtocolAnthropicMessages,
+		ApiURL: server.URL + "/v1/messages", ModelName: "deepseek-flash", ApiKey: "none",
+		ReasoningEffort: "high", UserID: "user_01",
+	}, []Message{{Role: "user", Content: "hi"}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, _ := raw["metadata"].(map[string]interface{})
+	thinking, _ := raw["thinking"].(map[string]interface{})
+	outputConfig, _ := raw["output_config"].(map[string]interface{})
+	if metadata["user_id"] != "user_01" || thinking["type"] != "enabled" || outputConfig["effort"] != "high" {
+		t.Fatalf("DeepSeek Anthropic controls missing: %#v", raw)
+	}
+	if raw["max_tokens"] != float64(65_536) {
+		t.Fatalf("max_tokens=%#v", raw["max_tokens"])
+	}
+	tools, _ := raw["tools"].([]interface{})
+	if len(tools) == 0 {
+		t.Fatalf("native Anthropic tools missing")
+	}
+	if result.ToolCallName != "tool_catalog" || result.ToolCallID != "call_1" || result.ToolCallArgs != `{"name":"ping"}` {
+		t.Fatalf("tool_use not parsed: %#v", result)
+	}
+	if result.ReasoningContent != "plan" {
+		t.Fatalf("thinking block not parsed: %q", result.ReasoningContent)
+	}
+}
+
+func TestDeepSeekLengthFinishReasonReturnsPartialResult(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"finish_reason":"length","message":{"content":"{\"action\":\"finish\"","reasoning_content":"partial thought"}}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}`))
+	}))
+	defer server.Close()
+
+	result, err := callOpenAICompatible(context.Background(), config.Config{
+		Provider: "deepseek", ApiURL: server.URL, ModelName: "deepseek-flash", ApiKey: "none",
+	}, []Message{{Role: "user", Content: "hi"}}, false, nil)
+	var partial *PartialStreamError
+	if !errors.As(err, &partial) || !strings.Contains(err.Error(), "finish_reason=length") {
+		t.Fatalf("expected length partial error, got %v", err)
+	}
+	if result.Usage.TotalTokens != 30 || result.Content != `{"action":"finish"` || result.ReasoningContent != "partial thought" {
+		t.Fatalf("partial result lost evidence: %#v", result)
+	}
+}
+
+func TestDeepSeekResponsesPreservesToolHistory(t *testing.T) {
+	var raw map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		_, _ = w.Write([]byte(`{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
+	}))
+	defer server.Close()
+
+	call := ToolCall{ID: "call_1", Type: "function"}
+	call.Function.Name = "tool_catalog"
+	call.Function.Arguments = `{"name":"ping"}`
+	_, err := callOpenAIResponses(context.Background(), config.Config{
+		Provider: "deepseek", ApiURL: server.URL + "/responses", ModelName: "deepseek-flash", ApiKey: "none",
+	}, []Message{
+		{Role: "user", Content: "inspect"},
+		{Role: "assistant", ReasoningContent: "plan", ToolCalls: []ToolCall{call}},
+		{Role: "tool", ToolCallID: "call_1", Name: "tool_catalog", Content: "usage"},
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, _ := raw["input"].([]interface{})
+	var types []string
+	for _, item := range input {
+		m, _ := item.(map[string]interface{})
+		types = append(types, fmt.Sprint(m["type"]))
+	}
+	joined := strings.Join(types, ",")
+	if !strings.Contains(joined, "function_call") || !strings.Contains(joined, "function_call_output") || !strings.Contains(joined, "reasoning") {
+		t.Fatalf("tool history lost: %#v", input)
+	}
+}
+
+func TestDeepSeekAnthropicPreservesThinkingAndToolHistory(t *testing.T) {
+	var raw map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`))
+	}))
+	defer server.Close()
+
+	call := ToolCall{ID: "call_1", Type: "function"}
+	call.Function.Name = "tool_catalog"
+	call.Function.Arguments = `{"name":"ping"}`
+	_, err := callAnthropic(context.Background(), config.Config{
+		Provider: "deepseek", APIProtocol: config.ProtocolAnthropicMessages,
+		ApiURL: server.URL + "/v1/messages", ModelName: "deepseek-flash", ApiKey: "none",
+	}, []Message{
+		{Role: "user", Content: "inspect"},
+		{Role: "assistant", ReasoningContent: "plan", ToolCalls: []ToolCall{call}},
+		{Role: "tool", ToolCallID: "call_1", Name: "tool_catalog", Content: "usage"},
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := raw["messages"].([]interface{})
+	if len(msgs) != 3 {
+		t.Fatalf("messages=%#v", msgs)
+	}
+	assistant, _ := msgs[1].(map[string]interface{})
+	blocks, _ := assistant["content"].([]interface{})
+	var blockTypes []string
+	for _, block := range blocks {
+		m, _ := block.(map[string]interface{})
+		blockTypes = append(blockTypes, fmt.Sprint(m["type"]))
+	}
+	if strings.Join(blockTypes, ",") != "thinking,tool_use" {
+		t.Fatalf("assistant blocks=%#v", blocks)
+	}
+	toolMsg, _ := msgs[2].(map[string]interface{})
+	toolBlocks, _ := toolMsg["content"].([]interface{})
+	first, _ := toolBlocks[0].(map[string]interface{})
+	if first["type"] != "tool_result" || first["tool_use_id"] != "call_1" {
+		t.Fatalf("tool result block=%#v", first)
+	}
+}
+
 func TestOpenAICompatiblePreservesReasoningContentAcrossToolTurn(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -358,11 +609,11 @@ func TestGenericBadRequestDoesNotDisableNativeTools(t *testing.T) {
 	defer server.Close()
 	cfg := config.Config{Provider: "custom", APIProtocol: config.ProtocolOpenAIChat, ApiURL: server.URL, ModelName: "local-model", ApiKey: "none"}
 	for i := 0; i < 2; i++ {
-		if _, err := callLLMOnce(context.Background(), cfg, []Message{{Role: "user", Content: "inspect"}}, true, nil); err != nil {
-			t.Fatal(err)
+		if _, err := callLLMOnce(context.Background(), cfg, []Message{{Role: "user", Content: "inspect"}}, true, nil); err == nil {
+			t.Fatal("generic bad request must propagate without guessing tools are unsupported")
 		}
 	}
-	if requests != 4 || withTools != 2 {
+	if requests != 2 || withTools != 2 {
 		t.Fatalf("generic 400 disabled native tools: requests=%d with_tools=%d", requests, withTools)
 	}
 }
@@ -525,7 +776,7 @@ func TestClaude5MessagesUsesThinkingBudgetAndParsesThinking(t *testing.T) {
 	result, err := callAnthropic(context.Background(), config.Config{
 		ApiURL: server.URL + "/v1/messages", APIProtocol: config.ProtocolAnthropicMessages,
 		ModelName: "claude-opus-5", ApiKey: "test",
-	}, []Message{{Role: "user", Content: "hi"}})
+	}, []Message{{Role: "user", Content: "hi"}}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,7 +810,7 @@ func TestClaudeOpus55UsesDefaultMediumEffort(t *testing.T) {
 	if _, err := callAnthropic(context.Background(), config.Config{
 		ApiURL: server.URL + "/v1/messages", APIProtocol: config.ProtocolAnthropicMessages,
 		ModelName: "claude-opus-5-5", ApiKey: "test",
-	}, []Message{{Role: "user", Content: "hi"}}); err != nil {
+	}, []Message{{Role: "user", Content: "hi"}}, false); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -583,7 +834,7 @@ func TestClaudeHaikuSkipsEffortAndHonorsReservedOutput(t *testing.T) {
 	if _, err := callAnthropic(context.Background(), config.Config{
 		ApiURL: server.URL + "/v1/messages", APIProtocol: config.ProtocolAnthropicMessages,
 		ModelName: "claude-haiku-4-5", ApiKey: "test", ReservedOutputTokens: 4096,
-	}, []Message{{Role: "user", Content: "hi"}}); err != nil {
+	}, []Message{{Role: "user", Content: "hi"}}, false); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -597,7 +848,7 @@ func TestClaudeRefusalStopReasonIsError(t *testing.T) {
 	_, err := callAnthropic(context.Background(), config.Config{
 		ApiURL: server.URL + "/v1/messages", APIProtocol: config.ProtocolAnthropicMessages,
 		ModelName: "claude-sonnet-5", ApiKey: "test",
-	}, []Message{{Role: "user", Content: "hi"}})
+	}, []Message{{Role: "user", Content: "hi"}}, false)
 	if err == nil || !strings.Contains(err.Error(), "拒绝回答") {
 		t.Fatalf("expected refusal error, got %v", err)
 	}

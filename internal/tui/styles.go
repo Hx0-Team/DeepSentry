@@ -83,6 +83,7 @@ var (
 	styleAnswer             lipgloss.Style
 	styleSuccess            lipgloss.Style
 	styleError              lipgloss.Style
+	styleWarning            lipgloss.Style
 	styleInfo               lipgloss.Style
 	styleConfirmBox         lipgloss.Style
 	styleHelp               lipgloss.Style
@@ -157,11 +158,11 @@ func applyTerminalPalette(p terminalPalette) {
 	styleStep = lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
 	styleThought = lipgloss.NewStyle().Foreground(colorThought).Italic(true).PaddingLeft(2)
 	styleStream = lipgloss.NewStyle().Foreground(colorThought).PaddingLeft(2)
-	styleToolBox = lipgloss.NewStyle().Border(terminalBorder()).BorderForeground(colorAccent).Padding(0, 1).MarginLeft(2)
+	styleToolBox = lipgloss.NewStyle().Border(terminalBorder(), true, false, true, false).BorderForeground(colorAccent).Padding(0, 1).MarginLeft(2)
 	styleSubAgentBox = lipgloss.NewStyle().Border(terminalBorder()).BorderForeground(colorYellow).Padding(0, 1).MarginLeft(2)
 	styleTargetBox = lipgloss.NewStyle().Border(terminalBorder()).BorderForeground(colorGreen).Padding(0, 1).MarginLeft(2)
 	styleTodoBox = lipgloss.NewStyle().Border(terminalBorder()).BorderForeground(colorGreen).Padding(0, 1).MarginLeft(2)
-	styleSubAgentResult = lipgloss.NewStyle().Foreground(colorMuted).Border(terminalBorder()).BorderForeground(colorBorder).Padding(0, 1).MarginLeft(4)
+	styleSubAgentResult = lipgloss.NewStyle().Foreground(colorMuted).Border(terminalBorder(), true, false, true, false).BorderForeground(colorBorder).Padding(0, 1).MarginLeft(4)
 	styleInputLine = lipgloss.NewStyle().Foreground(colorText).Background(colorSurface)
 	styleInputCursor = lipgloss.NewStyle().Foreground(colorBg).Background(colorAccent).Bold(true)
 	styleInputBorder = lipgloss.NewStyle().Foreground(colorBorder)
@@ -170,8 +171,9 @@ func applyTerminalPalette(p terminalPalette) {
 	styleAnswer = lipgloss.NewStyle().Foreground(colorText).PaddingLeft(2)
 	styleSuccess = lipgloss.NewStyle().Foreground(colorGreen)
 	styleError = lipgloss.NewStyle().Foreground(colorRed)
+	styleWarning = lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
 	styleInfo = lipgloss.NewStyle().Foreground(colorMuted)
-	styleConfirmBox = lipgloss.NewStyle().Border(terminalBorder()).BorderForeground(colorYellow).Background(colorSurface).Padding(1, 2).MarginLeft(2)
+	styleConfirmBox = lipgloss.NewStyle().Border(terminalBorder(), true, false, true, false).BorderForeground(colorYellow).Background(colorSurface).Padding(1, 2).MarginLeft(2)
 	styleHelp = lipgloss.NewStyle().Foreground(colorMuted).Italic(true)
 	styleHelpHint = lipgloss.NewStyle().Foreground(p.help)
 	if ui.LegacyConsole() {
@@ -197,6 +199,8 @@ func applyTerminalPalette(p terminalPalette) {
 	mdH3Style = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
 	mdBoldStyle = lipgloss.NewStyle().Bold(true).Foreground(colorText)
 	mdCodeStyle = lipgloss.NewStyle().Foreground(colorYellow).Background(colorSurface)
+	mdCodeBodyStyle = lipgloss.NewStyle().Foreground(colorText)
+	mdCodeCommentStyle = lipgloss.NewStyle().Foreground(colorMuted)
 	mdMutedStyle = lipgloss.NewStyle().Foreground(colorMuted)
 	mdTableBorder = lipgloss.NewStyle().Foreground(colorBorder)
 	mdTableHeader = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
@@ -210,11 +214,11 @@ func applyNoColorStyles() {
 	styleStep = lipgloss.NewStyle().Bold(true)
 	styleThought = lipgloss.NewStyle().Italic(true).PaddingLeft(2)
 	styleStream = lipgloss.NewStyle().PaddingLeft(2)
-	styleToolBox = lipgloss.NewStyle().Border(terminalBorder()).Padding(0, 1).MarginLeft(2)
+	styleToolBox = lipgloss.NewStyle().Border(terminalBorder(), true, false, true, false).Padding(0, 1).MarginLeft(2)
 	styleSubAgentBox = lipgloss.NewStyle().Border(terminalBorder()).Padding(0, 1).MarginLeft(2)
 	styleTargetBox = lipgloss.NewStyle().Border(terminalBorder()).Padding(0, 1).MarginLeft(2)
 	styleTodoBox = lipgloss.NewStyle().Border(terminalBorder()).Padding(0, 1).MarginLeft(2)
-	styleSubAgentResult = lipgloss.NewStyle().Border(terminalBorder()).Padding(0, 1).MarginLeft(4)
+	styleSubAgentResult = lipgloss.NewStyle().Border(terminalBorder(), true, false, true, false).Padding(0, 1).MarginLeft(4)
 	styleInputLine = lipgloss.NewStyle()
 	styleInputCursor = lipgloss.NewStyle().Reverse(true).Bold(true)
 	styleInputBorder = lipgloss.NewStyle()
@@ -223,8 +227,9 @@ func applyNoColorStyles() {
 	styleAnswer = lipgloss.NewStyle().PaddingLeft(2)
 	styleSuccess = lipgloss.NewStyle()
 	styleError = lipgloss.NewStyle()
+	styleWarning = lipgloss.NewStyle().Bold(true)
 	styleInfo = lipgloss.NewStyle()
-	styleConfirmBox = lipgloss.NewStyle().Border(terminalBorder()).Padding(1, 2).MarginLeft(2)
+	styleConfirmBox = lipgloss.NewStyle().Border(terminalBorder(), true, false, true, false).Padding(1, 2).MarginLeft(2)
 	styleHelp = lipgloss.NewStyle().Italic(true)
 	styleHelpHint = lipgloss.NewStyle()
 
@@ -246,6 +251,8 @@ func applyNoColorStyles() {
 	mdH3Style = lipgloss.NewStyle().Bold(true)
 	mdBoldStyle = lipgloss.NewStyle().Bold(true)
 	mdCodeStyle = lipgloss.NewStyle()
+	mdCodeBodyStyle = lipgloss.NewStyle()
+	mdCodeCommentStyle = lipgloss.NewStyle()
 	mdMutedStyle = lipgloss.NewStyle()
 	mdTableBorder = lipgloss.NewStyle()
 	mdTableHeader = lipgloss.NewStyle().Bold(true)

@@ -13,6 +13,35 @@ import (
 // it can reach an executor. Zero-valued tuning fields retain their documented
 // auto/default semantics.
 func ValidateRuntimeConfig(cfg Config) error {
+	for key, n := range map[string]int{"execution_budget.max_steps": cfg.ExecutionBudget.MaxSteps, "execution_budget.subagent_max_steps": cfg.ExecutionBudget.SubagentMaxSteps, "execution_budget.extension_steps": cfg.ExecutionBudget.ExtensionSteps, "execution_budget.no_progress_steps": cfg.ExecutionBudget.NoProgressSteps} {
+		if n < 0 || n > 1000 {
+			return fmt.Errorf("%s 必须是 0-1000", key)
+		}
+	}
+	if cfg.ExecutionBudget.TotalSteps < 0 || cfg.ExecutionBudget.TotalSteps > 10000 {
+		return fmt.Errorf("execution_budget.total_steps 必须是 0-10000")
+	}
+	if err := validateBalanceQuery(cfg.BalanceQuery); err != nil {
+		return err
+	}
+	if cfg.Search.Count < 0 || cfg.Search.Count > 50 {
+		return fmt.Errorf("search.count 必须在 1-50；0 表示默认 %d", DefaultSearchCount)
+	}
+	if cfg.Search.TimeoutSec < 0 || cfg.Search.TimeoutSec > 120 {
+		return fmt.Errorf("search.timeout_sec 必须在 0-120；0 表示默认 %d", DefaultSearchTimeoutSec)
+	}
+	if base := strings.TrimSpace(cfg.Search.BaseURL); base != "" {
+		if err := validateHTTPURL("search.base_url", base); err != nil {
+			return err
+		}
+	}
+	for _, model := range cfg.Models {
+		if model.BalanceQuery != nil {
+			if err := validateBalanceQuery(*model.BalanceQuery); err != nil {
+				return err
+			}
+		}
+	}
 	runtimeMode := cfg.EffectiveAgentRuntime()
 	if runtimeMode != "legacy" && runtimeMode != "v3" {
 		return fmt.Errorf("agent_runtime=%q 无效；可选 legacy|v3", cfg.AgentRuntime)
@@ -65,6 +94,12 @@ func ValidateRuntimeConfig(cfg Config) error {
 	if cfg.ReservedOutputTokens < 0 || cfg.NativeToolLimit < 0 {
 		return fmt.Errorf("reserved_output_tokens/native_tool_limit 不能为负数")
 	}
+	if cfg.HistoryBudgetTokens != -1 && cfg.HistoryBudgetTokens != 0 && (cfg.HistoryBudgetTokens < 1_024 || cfg.HistoryBudgetTokens > 4_194_304) {
+		return fmt.Errorf("history_budget_tokens 必须为 -1(模型容量)、0(48K默认) 或 1024~4194304")
+	}
+	if cfg.SubAgentHistoryBudgetTokens != -1 && cfg.SubAgentHistoryBudgetTokens != 0 && (cfg.SubAgentHistoryBudgetTokens < 1_024 || cfg.SubAgentHistoryBudgetTokens > 4_194_304) {
+		return fmt.Errorf("subagent_history_budget_tokens 必须为 -1、0(16K默认) 或 1024~4194304")
+	}
 	if cfg.ContextWindowTokens > 0 && cfg.ReservedOutputTokens >= cfg.ContextWindowTokens {
 		return fmt.Errorf("reserved_output_tokens 必须小于 context_window_tokens")
 	}
@@ -72,6 +107,19 @@ func ValidateRuntimeConfig(cfg Config) error {
 	case "", "auto", "enabled", "enable", "true", "required", "on", "disabled", "disable", "false", "off":
 	default:
 		return fmt.Errorf("vision_mode=%q 无效；可选 auto|enabled|disabled", cfg.VisionMode)
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.ThinkingMode)) {
+	case "", "auto", "enabled", "enable", "true", "on", "disabled", "disable", "false", "off":
+	default:
+		return fmt.Errorf("thinking_mode=%q 无效；可选 auto|enabled|disabled", cfg.ThinkingMode)
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.ReasoningEffort)) {
+	case "", "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+	default:
+		return fmt.Errorf("reasoning_effort=%q 无效；可选 auto|none|minimal|low|medium|high|xhigh|max|ultra", cfg.ReasoningEffort)
+	}
+	if cfg.UserID != "" && !regexp.MustCompile(`^[A-Za-z0-9_-]{1,512}$`).MatchString(cfg.UserID) {
+		return fmt.Errorf("user_id 只能包含 A-Z、a-z、0-9、下划线和连字符，长度 1-512")
 	}
 	if cfg.LLMTimeoutSec < 0 || cfg.LLMRetries < 0 || cfg.SSHCommandTimeoutSec < 0 || cfg.SSHMaxOutputBytes < 0 || cfg.MaxSteps < 0 || cfg.SubAgentMaxSteps < 0 {
 		return fmt.Errorf("timeout/retries/output/max_steps 配置不能为负数")
@@ -137,9 +185,9 @@ func ValidateRuntimeConfig(cfg Config) error {
 
 	targetProtocol := strings.ToLower(strings.TrimSpace(cfg.TargetProtocol))
 	switch targetProtocol {
-	case "", "local", "ssh", "telnet", "ftp":
+	case "", "local", "ssh", "sftp", "telnet", "ftp":
 	default:
-		return fmt.Errorf("target_protocol=%q 无效；可选 local|ssh|telnet|ftp", cfg.TargetProtocol)
+		return fmt.Errorf("target_protocol=%q 无效；可选 local|ssh|sftp|telnet|ftp", cfg.TargetProtocol)
 	}
 	policy := strings.ToLower(strings.TrimSpace(cfg.SSHHostKeyPolicy))
 	switch policy {
@@ -210,7 +258,8 @@ func validateModelChain(cfg Config) error {
 	if primary != 1 {
 		return fmt.Errorf("models 必须且只能包含一个 primary，当前为 %d", primary)
 	}
-	allowed := map[string]bool{"rate_limit": true, "timeout": true, "server_error": true, "connection": true, "invalid_output": true}
+	allowed := map[string]bool{"rate_limit": true, "timeout": true, "server_error": true, "connection": true, "invalid_output": true,
+		"authentication": true, "quota_exhausted": true, "invalid_request": true}
 	for _, kind := range cfg.ModelRouting.FailoverOn {
 		if !allowed[strings.ToLower(strings.TrimSpace(kind))] {
 			return fmt.Errorf("model_routing.failover_on 包含未知错误类型 %q", kind)
@@ -235,7 +284,7 @@ func validateTargets(targets []TargetConfig) error {
 	for i, target := range targets {
 		protocol := strings.ToLower(strings.TrimSpace(target.Protocol))
 		switch protocol {
-		case "ssh", "telnet", "ftp":
+		case "ssh", "sftp", "telnet", "ftp":
 		default:
 			return fmt.Errorf("targets[%d].protocol=%q 无效", i, target.Protocol)
 		}

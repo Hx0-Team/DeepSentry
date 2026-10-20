@@ -40,6 +40,9 @@ func WriteFileWithExecutor(ex Executor, path string, content []byte) error {
 	if se, ok := ex.(*SSHExecutor); ok && ex.IsRemote() {
 		return se.writeTargetFile(path, content)
 	}
+	if se, ok := ex.(*SFTPExecutor); ok {
+		return se.writeTargetFile(path, content)
+	}
 	if fe, ok := ex.(*FTPExecutor); ok && ex.IsRemote() {
 		return fe.writeTargetFile(path, content)
 	}
@@ -79,15 +82,9 @@ func (s *SSHExecutor) writeTargetFile(path string, content []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	_ = s.ensureSFTP()
 	if s.sftpClient != nil {
-		dir := filepath.Dir(path)
-		_ = s.sftpClient.MkdirAll(dir)
-		f, err := s.sftpClient.Create(path)
-		if err == nil {
-			defer f.Close()
-			_, werr := f.Write(content)
-			return werr
-		}
+		return s.sftpAdapter().writeTargetFile(path, content)
 	}
 	// fallback: base64 heredoc via shell (minimal systems)
 	tmp := fmt.Sprintf("/tmp/deepsentry_write_%d", time.Now().UnixNano())
@@ -126,6 +123,8 @@ func ReadEntriesWithExecutor(ex Executor, path string) ([]DirEntry, error) {
 		return readLocalEntries(path)
 	case *SSHExecutor:
 		return e.readTargetEntries(path)
+	case *SFTPExecutor:
+		return e.readEntries(path)
 	case *TelnetExecutor, *FTPExecutor:
 		names, err := ex.ListTargetDir(path)
 		if err != nil {

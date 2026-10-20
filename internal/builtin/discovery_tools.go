@@ -101,7 +101,7 @@ func HTTPFetch(rt Runtime, rawURL, method string, maxBytes int) (string, error) 
 	if method != "GET" && method != "HEAD" {
 		return "", fmt.Errorf("http_fetch 仅支持 GET/HEAD")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(rt.context(), 12*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, u, nil)
 	if err != nil {
@@ -113,7 +113,10 @@ func HTTPFetch(rt Runtime, rawURL, method string, maxBytes int) (string, error) 
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)))
+	if readErr != nil {
+		return "", readErr
+	}
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("%s HTTP Fetch\nURL: %s\nStatus: %s\n", rt.tag(), u, resp.Status))
 	b.WriteString("Headers:\n")
@@ -134,7 +137,7 @@ func WebSnapshot(rt Runtime, rawURL string, maxBytes int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(rt.context(), 12*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
@@ -146,11 +149,23 @@ func WebSnapshot(rt Runtime, rawURL string, maxBytes int) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)))
+	bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)))
+	if readErr != nil {
+		return "", readErr
+	}
 	body := string(bodyBytes)
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("%s Web Snapshot\nURL: %s\nStatus: %s\n", rt.tag(), u, resp.Status))
 	b.WriteString("Server: " + resp.Header.Get("Server") + "\n")
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if contentType == "" {
+		contentType = strings.ToLower(http.DetectContentType(bodyBytes))
+	}
+	if !strings.Contains(contentType, "text/html") && !strings.Contains(contentType, "application/xhtml+xml") {
+		b.WriteString("Content-Type: " + contentType + "\n")
+		b.WriteString("Non-HTML response; no forms/scripts to render. Body preview:\n" + sanitizeBody(body) + "\n")
+		return b.String(), nil
+	}
 	b.WriteString("Title: " + firstMatch(body, `(?is)<title[^>]*>(.*?)</title>`) + "\n")
 	b.WriteString("Meta generator: " + firstMatch(body, `(?is)<meta[^>]+name=["']generator["'][^>]+content=["']([^"']+)`) + "\n")
 	b.WriteString("\nForms:\n")

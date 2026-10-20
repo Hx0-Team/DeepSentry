@@ -15,14 +15,17 @@ import (
 type ErrorKind string
 
 const (
-	ErrorUnknown       ErrorKind = "unknown"
-	ErrorCanceled      ErrorKind = "canceled"
-	ErrorTimeout       ErrorKind = "timeout"
-	ErrorRateLimit     ErrorKind = "rate_limit"
-	ErrorServer        ErrorKind = "server_error"
-	ErrorInvalidOutput ErrorKind = "invalid_output"
-	ErrorUnsupported   ErrorKind = "unsupported"
-	ErrorConnection    ErrorKind = "connection"
+	ErrorUnknown        ErrorKind = "unknown"
+	ErrorCanceled       ErrorKind = "canceled"
+	ErrorTimeout        ErrorKind = "timeout"
+	ErrorRateLimit      ErrorKind = "rate_limit"
+	ErrorServer         ErrorKind = "server_error"
+	ErrorInvalidOutput  ErrorKind = "invalid_output"
+	ErrorUnsupported    ErrorKind = "unsupported"
+	ErrorConnection     ErrorKind = "connection"
+	ErrorAuthentication ErrorKind = "authentication"
+	ErrorInvalidRequest ErrorKind = "invalid_request"
+	ErrorQuotaExhausted ErrorKind = "quota_exhausted"
 )
 
 type ClassifiedError struct {
@@ -44,15 +47,34 @@ func ClassifyError(err error) ErrorKind {
 	if err == nil {
 		return ""
 	}
-	var classified *ClassifiedError
-	if errors.As(err, &classified) && classified.Kind != "" {
-		return classified.Kind
-	}
 	if errors.Is(err, context.Canceled) {
 		return ErrorCanceled
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ErrorTimeout
+	}
+	var quota interface{ IsQuotaExhausted() bool }
+	if errors.As(err, &quota) && quota.IsQuotaExhausted() {
+		return ErrorQuotaExhausted
+	}
+	var classified *ClassifiedError
+	if errors.As(err, &classified) && classified.Kind != "" {
+		return classified.Kind
+	}
+	var status interface{ HTTPStatusCode() int }
+	if errors.As(err, &status) {
+		switch code := status.HTTPStatusCode(); {
+		case code == 401 || code == 403:
+			return ErrorAuthentication
+		case code == 429:
+			return ErrorRateLimit
+		case code == 408:
+			return ErrorTimeout
+		case code >= 500 && code <= 599:
+			return ErrorServer
+		default:
+			return ErrorInvalidRequest
+		}
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
@@ -99,6 +121,9 @@ type Router struct {
 }
 
 func (r *Router) Generate(ctx context.Context, request ModelRequest) (ModelResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if len(r.Endpoints) == 0 {
 		return ModelResponse{}, errors.New("model router has no endpoints")
 	}
@@ -116,6 +141,13 @@ func (r *Router) Generate(ctx context.Context, request ModelRequest) (ModelRespo
 			}
 			if attempt > 0 {
 				delay := r.retryDelay(attempt)
+				var hint interface{ RetryAfterDelay() time.Duration }
+				if errors.As(lastErr, &hint) {
+					delay = max(delay, hint.RetryAfterDelay())
+				}
+				if delay > 30*time.Second {
+					break
+				}
 				r.emit(ctx, RunEvent{Kind: EventModelRetry, ModelID: endpoint.ID, ErrorClass: ClassifyError(lastErr), Message: fmt.Sprintf("attempt=%d backoff=%s", attempt, delay)})
 				timer := time.NewTimer(delay)
 				select {
@@ -143,6 +175,9 @@ func (r *Router) Generate(ctx context.Context, request ModelRequest) (ModelRespo
 		if !r.shouldFailover(ClassifyError(lastErr)) {
 			break
 		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no available model client")
 	}
 	return ModelResponse{}, fmt.Errorf("model router exhausted: %w", lastErr)
 }

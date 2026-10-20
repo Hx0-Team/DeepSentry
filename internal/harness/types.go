@@ -79,13 +79,14 @@ type AgentAction struct {
 	MemoryScope string `json:"memory_scope"` // target | global
 
 	// tool (内置场景工具)
-	ToolName         string            `json:"tool_name"`
-	ToolArgs         map[string]string `json:"tool_args"`
-	ToolCallID       string            `json:"tool_call_id,omitempty"`
-	NativeCallName   string            `json:"-"`
-	ReasoningContent string            `json:"-"`
-	ToolCalls        []ToolCallAction  `json:"tool_calls,omitempty"`
-	SkipToolCallIDs  map[string]bool   `json:"-"`
+	ToolName            string            `json:"tool_name"`
+	ToolArgs            map[string]string `json:"tool_args"`
+	ToolCallID          string            `json:"tool_call_id,omitempty"`
+	NativeCallName      string            `json:"-"`
+	NativeCallArguments string            `json:"-"`
+	ReasoningContent    string            `json:"-"`
+	ToolCalls           []ToolCallAction  `json:"tool_calls,omitempty"`
+	SkipToolCallIDs     map[string]bool   `json:"-"`
 
 	// common
 	Thought    string `json:"thought"`
@@ -117,6 +118,7 @@ func RedactedAction(action AgentAction) AgentAction {
 	out.MemoryValue = security.RedactSensitiveText(out.MemoryValue)
 	out.Thought = security.RedactSensitiveText(out.Thought)
 	out.ReasoningContent = security.RedactSensitiveText(out.ReasoningContent)
+	out.NativeCallArguments = ""
 	out.ToolArgs = make(map[string]string, len(action.ToolArgs))
 	for key, value := range action.ToolArgs {
 		tagged := key + "=" + value
@@ -134,6 +136,7 @@ func RedactedAction(action AgentAction) AgentAction {
 	out.ToolCalls = append([]ToolCallAction(nil), action.ToolCalls...)
 	for i := range out.ToolCalls {
 		out.ToolCalls[i].Args = redactToolArgs(out.ToolCalls[i].Args)
+		out.ToolCalls[i].Arguments = ""
 	}
 	out.ParallelTasks = append([]SubAgentTaskAction(nil), action.ParallelTasks...)
 	for i := range out.ParallelTasks {
@@ -147,9 +150,10 @@ func RedactedAction(action AgentAction) AgentAction {
 }
 
 type ToolCallAction struct {
-	ID   string            `json:"id"`
-	Name string            `json:"name"`
-	Args map[string]string `json:"args"`
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Args      map[string]string `json:"args"`
+	Arguments string            `json:"-"` // exact native JSON; execution still uses string args
 }
 
 func redactToolArgs(args map[string]string) map[string]string {

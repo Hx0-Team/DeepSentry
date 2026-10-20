@@ -7,11 +7,12 @@ import (
 
 // Spec 子 Agent 规格（对标 deepagents SubAgent TypedDict）
 type Spec struct {
-	Name             string
-	Description      string
-	SystemPrompt     string
-	MaxSteps         int
-	ExecutionProfile string // host (default) | network_device
+	Name                string
+	Description         string
+	SystemPrompt        string
+	MaxSteps            int
+	ExecutionProfile    string // host (default) | network_device
+	HistoryBudgetTokens int    // optional role-specific auto-compaction window
 }
 
 // Registry 预置安全子 Agent 注册表

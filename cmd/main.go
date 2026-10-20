@@ -155,6 +155,9 @@ func runCLI() (exitCode int) {
 		fmt.Printf("DeepSentry v%s Ultimate (build %s)\n", ui.Version, ui.BuildTime)
 		return
 	}
+	if !*jsonOutput && !*webshellMode && !*replyFinal {
+		defer ui.SetTerminalWindowTitle()()
+	}
 	startupProxy, proxyErr := config.ResolveStartupProxy(*httpProxyFlag, *socks5ProxyFlag)
 	if proxyErr != nil {
 		fmt.Printf("%s代理参数无效: %v\n", ui.Prefix("❌", "[ERR]"), proxyErr)
@@ -655,6 +658,8 @@ func runCLI() (exitCode int) {
 
 	connInfo := "本地模式"
 	switch executor.CurrentMode() {
+	case "sftp":
+		connInfo = fmt.Sprintf("SFTP -> %s（仅文件传输）", config.GlobalConfig.SSHHost)
 	case "ssh":
 		connInfo = fmt.Sprintf("SSH -> %s", config.GlobalConfig.SSHHost)
 		if deviceReporter, ok := executor.Current.(executor.NetworkDeviceReporter); ok {
@@ -1806,7 +1811,7 @@ func runTargetEntriesWizard(count int) ([]config.TargetConfig, error) {
 		defaultName := fmt.Sprintf("target-%02d", i)
 		if err := ask([]*survey.Question{
 			{Name: "name", Prompt: &survey.Input{Message: fmt.Sprintf("第 %d 台名称:", i), Default: defaultName}},
-			{Name: "protocol", Prompt: &survey.Select{Message: "连接协议:", Options: []string{"ssh", "telnet", "ftp"}, Default: "ssh"}},
+			{Name: "protocol", Prompt: &survey.Select{Message: "连接协议:", Options: []string{"ssh", "sftp", "telnet", "ftp"}, Default: "ssh"}},
 			{Name: "host", Prompt: &survey.Input{Message: "主机 (IP[:Port]):"}, Validate: survey.Required},
 			{Name: "user", Prompt: &survey.Input{Message: "用户名:", Default: "root"}},
 		}, &t); err != nil {
@@ -1820,7 +1825,7 @@ func runTargetEntriesWizard(count int) ([]config.TargetConfig, error) {
 			t.Host = normalizeTargetHost(t.Protocol, t.Host)
 		}
 		switch t.Protocol {
-		case "ssh":
+		case "ssh", "sftp":
 			auth := ""
 			if err := askOne(&survey.Select{Message: "SSH 认证方式:", Options: []string{"Password", "Private Key"}, Default: "Password"}, &auth); err != nil {
 				return nil, err
@@ -1833,10 +1838,16 @@ func runTargetEntriesWizard(count int) ([]config.TargetConfig, error) {
 				if err := askOne(&survey.Input{Message: "私钥路径:", Default: defKey}, &t.KeyPath); err != nil {
 					return nil, err
 				}
+				if err := askOne(&survey.Password{Message: "私钥口令（未加密留空）:"}, &t.KeyPassphrase); err != nil {
+					return nil, err
+				}
 			} else {
 				if err := askOne(&survey.Password{Message: "密码:"}, &t.Password); err != nil {
 					return nil, err
 				}
+			}
+			if t.Protocol == "sftp" {
+				break
 			}
 			if err := askOne(&survey.Select{Message: "SSH 目标类型:", Options: []string{"auto", "linux", "huawei", "h3c", "ruijie", "cisco", "generic"}, Default: "auto", Help: "网络设备将使用 PTY 交互 CLI，不会拼接 Linux shell marker。"}, &t.DeviceType); err != nil {
 				return nil, err
@@ -1923,11 +1934,16 @@ func applySingleTargetConfig(t config.TargetConfig) {
 		viper.Set("ftp_data_mode", firstNonEmptyString(t.FTPDataMode, "passive"))
 		viper.Set("ftp_active_address", t.FTPActiveAddress)
 	default:
-		viper.Set("target_protocol", "ssh")
+		if t.Protocol == "sftp" {
+			viper.Set("target_protocol", "sftp")
+		} else {
+			viper.Set("target_protocol", "ssh")
+		}
 		viper.Set("ssh_host", t.Host)
 		viper.Set("ssh_user", firstNonEmptyString(t.User, "root"))
 		viper.Set("ssh_password", t.Password)
 		viper.Set("ssh_key_path", t.KeyPath)
+		viper.Set("ssh_key_passphrase", t.KeyPassphrase)
 		viper.Set("ssh_device_type", firstNonEmptyString(t.DeviceType, "auto"))
 		viper.Set("ssh_prompt", t.Prompt)
 		viper.Set("ssh_enable_password", t.EnablePassword)
@@ -1936,7 +1952,7 @@ func applySingleTargetConfig(t config.TargetConfig) {
 
 func clearSingleTargetConfig() {
 	for _, key := range []string{
-		"ssh_host", "ssh_user", "ssh_password", "ssh_key_path", "ssh_device_type", "ssh_prompt", "ssh_enable_password",
+		"ssh_host", "ssh_user", "ssh_password", "ssh_key_path", "ssh_key_passphrase", "ssh_device_type", "ssh_prompt", "ssh_enable_password",
 		"telnet_host", "telnet_user", "telnet_password", "telnet_prompt", "telnet_auth_prompt_regex", "telnet_device_type", "telnet_enable_password",
 		"ftp_host", "ftp_user", "ftp_password", "ftp_tls_mode", "ftp_tls_server_name", "ftp_tls_ca_file", "ftp_data_mode", "ftp_active_address",
 	} {
@@ -2136,6 +2152,23 @@ var wizardThemeOptions = []string{
 	"自动适应终端背景（推荐）",
 	"深色主题（固定）",
 	"日间主题（固定）",
+}
+
+var wizardThinkingOptions = []string{
+	"默认（开启思考，effort=high）",
+	"开启思考 + max（更慢更深入）",
+	"关闭思考（更快更省）",
+}
+
+func wizardThinkingDefault() string {
+	if strings.EqualFold(strings.TrimSpace(viper.GetString("thinking_mode")), "disabled") ||
+		strings.EqualFold(strings.TrimSpace(viper.GetString("reasoning_effort")), "none") {
+		return wizardThinkingOptions[2]
+	}
+	if strings.EqualFold(strings.TrimSpace(viper.GetString("reasoning_effort")), "max") {
+		return wizardThinkingOptions[1]
+	}
+	return wizardThinkingOptions[0]
 }
 
 func wizardTerminalTheme(choice string) string {
@@ -2473,6 +2506,56 @@ func runElegantWizard() error {
 		}
 	}
 
+	if providerID == "deepseek" {
+		thinkingChoice := wizardThinkingDefault()
+		if err := askOne(&survey.Select{
+			Message: ui.Prefix("🧠", "[THINK]") + "DeepSeek 思考模式:",
+			Options: wizardThinkingOptions,
+			Default: thinkingChoice,
+			Help:    "DeepSeek 默认开启思考模式并自动使用 effort=high。max 更深入但更慢；关闭后可让 temperature/top_p 生效。",
+		}, &thinkingChoice); err != nil {
+			return err
+		}
+		switch thinkingChoice {
+		case wizardThinkingOptions[2]:
+			viper.Set("thinking_mode", "disabled")
+			viper.Set("reasoning_effort", "auto")
+		case wizardThinkingOptions[1]:
+			viper.Set("thinking_mode", "enabled")
+			viper.Set("reasoning_effort", "max")
+		default:
+			viper.Set("thinking_mode", "auto")
+			viper.Set("reasoning_effort", "auto")
+		}
+	} else {
+		viper.Set("thinking_mode", "auto")
+		viper.Set("reasoning_effort", "auto")
+	}
+
+	// Optional DeepSeek Search integration. The default follows the selected
+	// chat provider so a fresh DeepSeek setup gets live-web capabilities while
+	// other providers stay opt-in and never receive their API key.
+	searchEnabled := providerID == "deepseek"
+	if err := askOne(&survey.Confirm{
+		Message: ui.Prefix("🔎", "[SEARCH]") + "启用 DeepSeek 联网搜索（Search API）?",
+		Default: searchEnabled,
+		Help:    "按需加载：仅在 Agent 需要实时网页/新闻/版本/漏洞信息时调用 web_search。成功请求 5 元/1000 次；可用 /search on|off 随时切换。非 DeepSeek 主模型需另配 search.api_key。",
+	}, &searchEnabled); err != nil {
+		return err
+	}
+	searchAPIKey := ""
+	if searchEnabled && providerID != "deepseek" && strings.TrimSpace(viper.GetString("search.api_key")) == "" {
+		if err := askOne(&survey.Password{
+			Message: ui.Prefix("🔑", "[SEARCH]") + "DeepSeek Search API Key (可回车跳过):",
+			Help:    "当前主模型不是 DeepSeek，Search 需要独立的 DeepSeek API Key；留空则暂时不生效，可稍后通过 config_manage 设置 search.api_key。",
+		}, &searchAPIKey); err != nil {
+			return err
+		}
+		if strings.TrimSpace(searchAPIKey) == "" {
+			fmt.Printf("%s当前主模型不是 DeepSeek 且未填写 Search Key；联网搜索暂不生效，配置 search.api_key 后自动可用，或稍后 /search off 关闭。\n", ui.Prefix("⚠️", "[WARN]"))
+		}
+	}
+
 	// 4. 保存配置
 	viper.Set("provider", providerID)
 	viper.Set("api_protocol", answers.Protocol)
@@ -2482,6 +2565,10 @@ func runElegantWizard() error {
 	viper.Set("model_profile", "auto")
 	viper.Set("context_window_tokens", contextWindowTokens)
 	viper.Set("vision_mode", visionMode)
+	viper.Set("search.enabled", searchEnabled)
+	if strings.TrimSpace(searchAPIKey) != "" {
+		viper.Set("search.api_key", strings.TrimSpace(searchAPIKey))
+	}
 	if preset, ok := config.FindProvider(providerID); ok {
 		viper.Set("use_native_tools", preset.NativeTools)
 	}

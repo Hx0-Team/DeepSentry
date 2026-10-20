@@ -50,8 +50,9 @@ func Run(name string, args map[string]string, rt Runtime) (string, error) {
 	if args == nil {
 		args = map[string]string{}
 	}
-	unlock := lockRuntimeExecutor(rt.Exec)
-	defer unlock()
+	if err := rt.context().Err(); err != nil {
+		return "", err
+	}
 
 	switch name {
 	case "computer_use":
@@ -120,6 +121,8 @@ func Run(name string, args map[string]string, rt Runtime) (string, error) {
 		return Ping(rt, host, 5)
 	case "http_fetch":
 		return HTTPFetch(rt, arg(args, "url", "target"), arg(args, "method"), argInt(args, "max_bytes", 65536, 524288))
+	case "web_search":
+		return WebSearch(rt, args)
 	case "web_snapshot":
 		return WebSnapshot(rt, arg(args, "url", "target"), argInt(args, "max_bytes", 131072, 524288))
 	case "headless_browser":
@@ -137,7 +140,9 @@ func Run(name string, args map[string]string, rt Runtime) (string, error) {
 	case "file_strings":
 		return FileStrings(rt, arg(args, "path", "file"), argInt(args, "min_len", 4, 32), argInt(args, "limit", 500, 2000), arg(args, "pattern", "grep"))
 	case "document_parse":
-		return DocumentParse(rt, arg(args, "path", "file"), arg(args, "mode"), argInt(args, "max_text", 30000, 100000), argInt(args, "max_rows", 120, 1000), argInt(args, "max_sheets", 8, 50))
+		return DocumentParseWindow(rt, arg(args, "path", "file"), arg(args, "mode"), argInt(args, "max_text", 12000, 100000), argInt(args, "max_rows", 120, 1000), argInt(args, "max_sheets", 8, 50), argInt(args, "offset", 0, 1000000))
+	case "document_create":
+		return DocumentCreate(arg(args, "path"), arg(args, "format"), arg(args, "spec"))
 	case "chat_send_file":
 		return ChatSendFile(arg(args, "path", "file", "local_path"), arg(args, "name", "filename"))
 	case "read_gzip":
@@ -207,7 +212,16 @@ func Run(name string, args map[string]string, rt Runtime) (string, error) {
 	case "fleet_file":
 		return FleetFile(rt, arg(args, "selector", "target", "targets"), arg(args, "action"), arg(args, "remote_path", "remote", "path"), arg(args, "local_path", "local"), argInt(args, "concurrency", 5, 20))
 	case "config_manage":
-		return config.ManageConfig(args)
+		if args["action"] == "probe_ssh" || args["action"] == "probe_proxy" {
+			return manageConfigConnection(args, rt)
+		}
+		out, err := config.ManageConfig(args)
+		if err == nil && !argBool(args, "dry_run") {
+			if ex := rt.executor(); ex != nil {
+				out += "\n当前执行器连接保持不变（模式 " + executorMode(ex) + "）；保存目标配置不会自动切换正在使用的连接。"
+			}
+		}
+		return out, err
 	case "skill_market":
 		return skills.ManageMarketplace(args)
 	case "mcp_resource":
@@ -350,7 +364,7 @@ func firewallNative(rt Runtime) (string, error) {
 	b.WriteString(fmt.Sprintf("%s 防火墙/网络内核状态\n", rt.tag()))
 	found := false
 	for _, p := range paths {
-		data, err := readTarget(p)
+		data, err := rt.readTarget(p)
 		if err == nil {
 			found = true
 			b.WriteString(fmt.Sprintf("--- %s ---\n%s\n", p, strings.TrimSpace(string(data))))

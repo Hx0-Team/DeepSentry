@@ -53,9 +53,49 @@ func (e *PartialStreamError) Error() string { return "partial stream response: "
 func (e *PartialStreamError) Unwrap() error { return e.Err }
 
 type TokenUsage struct {
-	PromptTokens     int `json:"prompt_tokens,omitempty"`
-	CompletionTokens int `json:"completion_tokens,omitempty"`
-	TotalTokens      int `json:"total_tokens,omitempty"`
+	PromptTokens       int  `json:"prompt_tokens,omitempty"`
+	CompletionTokens   int  `json:"completion_tokens,omitempty"`
+	TotalTokens        int  `json:"total_tokens,omitempty"`
+	CacheReadTokens    int  `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens   int  `json:"cache_write_tokens,omitempty"`
+	ReasoningTokens    int  `json:"reasoning_tokens,omitempty"`
+	CacheUsageReported bool `json:"cache_usage_reported,omitempty"`
+}
+
+// Normalize provider usage without treating cache reads as free or adding
+// them twice to prompt_tokens. DeepSeek and OpenAI use different field names.
+func (u *TokenUsage) UnmarshalJSON(data []byte) error {
+	type plain TokenUsage
+	var raw struct {
+		plain
+		Hit     *int `json:"prompt_cache_hit_tokens"`
+		Miss    *int `json:"prompt_cache_miss_tokens"`
+		Details struct {
+			Cached *int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+		CompletionDetails struct {
+			Reasoning int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*u = TokenUsage(raw.plain)
+	if raw.Hit != nil {
+		u.CacheReadTokens = *raw.Hit
+		u.CacheUsageReported = true
+	}
+	if raw.Miss != nil {
+		u.CacheUsageReported = true
+	}
+	if raw.Details.Cached != nil {
+		u.CacheReadTokens = *raw.Details.Cached
+		u.CacheUsageReported = true
+	}
+	if raw.CompletionDetails.Reasoning > 0 {
+		u.ReasoningTokens = raw.CompletionDetails.Reasoning
+	}
+	return nil
 }
 
 func (u TokenUsage) HasAny() bool {
@@ -68,9 +108,16 @@ func CallLLMWithRetry(messages []Message, useNativeTools bool, onStream func(str
 }
 
 func CallLLMWithRetryContext(ctx context.Context, messages []Message, useNativeTools bool, onStream func(string)) (LLMResult, error) {
+	return callLLMWithUsageContext(ctx, messages, useNativeTools, onStream, nil)
+}
+
+// Report every provider-returned usage record, including an empty/partial
+// response that is subsequently retried. Missing usage is never estimated.
+func callLLMWithUsageContext(ctx context.Context, messages []Message, useNativeTools bool, onStream func(string), onUsage func(TokenUsage)) (LLMResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = withRequestToolsCache(ctx)
 	baseCfg := config.GlobalConfig
 	models := baseCfg.EffectiveModels()
 	hasImages := MessagesHaveImages(messages)
@@ -87,7 +134,11 @@ func CallLLMWithRetryContext(ctx context.Context, messages []Message, useNativeT
 		for attempt := 0; attempt <= retries; attempt++ {
 			totalAttempts++
 			if attempt > 0 {
-				timer := time.NewTimer(llmRetryDelay(attempt))
+				delay := retryDelayForError(attempt, lastErr)
+				if delay > maxLLMRetryWait {
+					break // Honor the server hint; do not hammer it before reset.
+				}
+				timer := time.NewTimer(delay)
 				select {
 				case <-timer.C:
 				case <-ctx.Done():
@@ -97,6 +148,14 @@ func CallLLMWithRetryContext(ctx context.Context, messages []Message, useNativeT
 			}
 
 			result, err := callLLMOnce(ctx, cfg, messages, useNativeTools, onStream)
+			usage := result.Usage
+			var partial *PartialStreamError
+			if !usage.HasAny() && errors.As(err, &partial) {
+				usage = partial.Result.Usage
+			}
+			if onUsage != nil && usage.HasAny() {
+				onUsage(usage)
+			}
 			if err == nil && !hasActionableLLMOutput(result) {
 				err = errors.New("empty response: no content or tool call")
 			}
@@ -140,15 +199,25 @@ func hasActionableLLMOutput(result LLMResult) bool {
 }
 
 func callLLMOnce(ctx context.Context, cfg config.Config, messages []Message, useNativeTools bool, onStream func(string)) (LLMResult, error) {
-	native := useNativeTools && cfg.IsOpenAICompatible() && !isGPT6ReasoningModel(cfg.ModelName)
-	if native && isKnownUnsupported(cfg, "tools") {
-		native = false
+	native := NativeToolTransportAvailable(cfg, useNativeTools)
+	nativeResponses := useNativeTools && cfg.IsOpenAIResponses() && cfg.IsDeepSeek()
+	nativeAnthropic := useNativeTools && cfg.IsAnthropic() && cfg.IsDeepSeek()
+	if useNativeTools && !native && !nativeResponses && !nativeAnthropic {
+		messages = withJSONActionProtocol(messages)
 	}
 	if cfg.IsAnthropic() {
-		return callAnthropic(ctx, cfg, messages)
+		result, err := callAnthropic(ctx, cfg, messages, nativeAnthropic)
+		if err != nil && nativeAnthropic && isToolsUnsupported(err) {
+			return callAnthropic(ctx, cfg, withJSONActionProtocol(messages), false)
+		}
+		return result, err
 	}
 	if cfg.IsOpenAIResponses() {
-		return callOpenAIResponses(ctx, cfg, messages)
+		result, err := callOpenAIResponses(ctx, cfg, messages, nativeResponses)
+		if err != nil && nativeResponses && isToolsUnsupported(err) {
+			return callOpenAIResponses(ctx, cfg, withJSONActionProtocol(messages), false)
+		}
+		return result, err
 	}
 	if native {
 		result, err := callOpenAICompatible(ctx, cfg, messages, true, onStream)
@@ -159,7 +228,7 @@ func callLLMOnce(ctx context.Context, cfg config.Config, messages []Message, use
 			if explicitlyUnsupported(err, "tool") {
 				rememberUnsupported(cfg, "tools")
 			}
-			return callOpenAICompatible(ctx, cfg, messages, false, onStream)
+			return callOpenAICompatible(ctx, cfg, withJSONActionProtocol(messages), false, onStream)
 		}
 		return result, err
 	}
@@ -171,6 +240,15 @@ func callLLMOnce(ctx context.Context, cfg config.Config, messages []Message, use
 		return result, err
 	}
 	return callOpenAICompatible(ctx, cfg, messages, false, nil)
+}
+
+func NativeToolTransportAvailable(cfg config.Config, requested bool) bool {
+	return requested && cfg.IsOpenAICompatible() && !cfg.IsOpenAIResponses() && !isGPT6ReasoningModel(cfg.ModelName) && !isKnownUnsupported(cfg, "tools")
+}
+
+func withJSONActionProtocol(messages []Message) []Message {
+	out := append([]Message(nil), messages...)
+	return append(out, Message{Role: "system", Content: `【当前实际传输：JSON动作兼容】本次请求没有提供原生函数schema；优先遵守此实际传输规则。只返回一个纯JSON动作对象，不能输出伪工具调用、Markdown或自然语言计划。执行：{"action":"execute","command":"实际命令","thought":"简短目的"}；工具：{"action":"tool","tool_name":"精确工具名","tool_args":{}}；加载Skill：{"action":"load_skill","skill_name":"精确名称"}；完成：{"action":"finish","final_report":"已核验的结果"}。遵守原有授权与安全限制。`})
 }
 
 const unsupportedFeatureTTL = 5 * time.Minute
@@ -242,6 +320,25 @@ func classifyLLMError(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "timeout"
 	}
+	var quota interface{ IsQuotaExhausted() bool }
+	if errors.As(err, &quota) && quota.IsQuotaExhausted() {
+		return "quota_exhausted"
+	}
+	var status interface{ HTTPStatusCode() int }
+	if errors.As(err, &status) {
+		switch code := status.HTTPStatusCode(); {
+		case code == 401 || code == 403:
+			return "authentication"
+		case code == 429:
+			return "rate_limit"
+		case code == 408:
+			return "timeout"
+		case code >= 500 && code <= 599:
+			return "server_error"
+		default:
+			return "invalid_request"
+		}
+	}
 	s := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(s, "429"), strings.Contains(s, "rate limit"):
@@ -273,10 +370,25 @@ func llmRetryDelay(attempt int) time.Duration {
 }
 
 type responsesRequest struct {
-	Model           string      `json:"model"`
-	Input           interface{} `json:"input"`
-	Temperature     float64     `json:"temperature,omitempty"`
-	MaxOutputTokens int         `json:"max_output_tokens,omitempty"`
+	Model           string              `json:"model"`
+	Input           interface{}         `json:"input"`
+	Instructions    string              `json:"instructions,omitempty"`
+	Temperature     *float64            `json:"temperature,omitempty"`
+	MaxOutputTokens int                 `json:"max_output_tokens,omitempty"`
+	Reasoning       *responsesReasoning `json:"reasoning,omitempty"`
+	Tools           []responsesTool     `json:"tools,omitempty"`
+	User            string              `json:"user,omitempty"`
+}
+
+type responsesReasoning struct {
+	Effort string `json:"effort"`
+}
+
+type responsesTool struct {
+	Type        string                 `json:"type"`
+	Name        string                 `json:"name,omitempty"`
+	Description string                 `json:"description,omitempty"`
+	Parameters  map[string]interface{} `json:"parameters,omitempty"`
 }
 
 type responsesInputMessage struct {
@@ -291,26 +403,61 @@ type responsesContentBlock struct {
 	Detail   string `json:"detail,omitempty"`
 }
 
+type responsesFunctionCall struct {
+	Type      string `json:"type"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type responsesFunctionCallOutput struct {
+	Type   string      `json:"type"`
+	CallID string      `json:"call_id"`
+	Output interface{} `json:"output"`
+}
+
+type responsesReasoningItem struct {
+	Type    string                  `json:"type"`
+	Content []responsesContentBlock `json:"content"`
+}
+
 type responsesResponse struct {
+	Status     string `json:"status"`
 	OutputText string `json:"output_text"`
 	Output     []struct {
-		Type    string `json:"type"`
-		Content []struct {
+		Type      string `json:"type"`
+		ID        string `json:"id"`
+		CallID    string `json:"call_id"`
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+		Role      string `json:"role"`
+		Content   []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
 	} `json:"output"`
+	IncompleteDetails struct {
+		Reason string `json:"reason"`
+	} `json:"incomplete_details"`
 	Error *struct {
 		Message string `json:"message"`
+		Code    string `json:"code"`
+		Type    string `json:"type"`
 	} `json:"error"`
 	Usage struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 		TotalTokens  int `json:"total_tokens"`
+		InputDetails struct {
+			Cached *int `json:"cached_tokens"`
+		} `json:"input_tokens_details"`
+		OutputDetails struct {
+			Reasoning int `json:"reasoning_tokens"`
+		} `json:"output_tokens_details"`
 	} `json:"usage"`
 }
 
-func callOpenAIResponses(ctx context.Context, cfg config.Config, messages []Message) (LLMResult, error) {
+func callOpenAIResponses(ctx context.Context, cfg config.Config, messages []Message, useNativeTools bool) (LLMResult, error) {
 	url := config.NormalizeAPIURL(cfg.ApiURL, config.ProtocolOpenAIResponses)
 	input, err := buildOpenAIResponsesInput(messages)
 	if err != nil {
@@ -319,100 +466,198 @@ func callOpenAIResponses(ctx context.Context, cfg config.Config, messages []Mess
 	reqBody := responsesRequest{
 		Model:           cfg.ModelName,
 		Input:           input,
-		Temperature:     effectiveTemperature(cfg),
 		MaxOutputTokens: cfg.EffectiveModelCapabilities().ReservedOutputTokens,
 	}
-	if isGPT6ReasoningModel(cfg.ModelName) {
-		reqBody.Temperature = 0
+	if !isGPT6ReasoningModel(cfg.ModelName) && !(cfg.IsDeepSeek() && cfg.EffectiveThinkingMode() == "enabled") {
+		temp := effectiveTemperature(cfg)
+		reqBody.Temperature = &temp
 	}
-	body, status, err := doHTTPPost(ctx, url, cfg, reqBody)
+	if cfg.IsDeepSeek() {
+		effort := cfg.EffectiveReasoningEffort()
+		if cfg.EffectiveThinkingMode() == "disabled" {
+			effort = "none"
+		}
+		if effort != "" {
+			reqBody.Reasoning = &responsesReasoning{Effort: effort}
+		}
+		reqBody.User = strings.TrimSpace(cfg.UserID)
+	}
+	if useNativeTools {
+		definitions := nativeToolDefinitionsForRequest(cfg, messages)
+		reqBody.Tools = make([]responsesTool, 0, len(definitions))
+		for _, definition := range definitions {
+			reqBody.Tools = append(reqBody.Tools, responsesTool{
+				Type: "function", Name: definition.Function.Name,
+				Description: definition.Function.Description, Parameters: definition.Function.Parameters,
+			})
+		}
+	}
+	body, status, headers, err := doHTTPPostReply(ctx, url, cfg, reqBody)
 	if err != nil {
 		return LLMResult{}, err
 	}
 	if status != 200 {
-		return LLMResult{}, fmt.Errorf("调用 Responses API 失败 %d: %s", status, truncateStr(string(body), 500))
+		return LLMResult{}, apiResponseError(status, headers, body)
 	}
 	var rr responsesResponse
 	if err := json.Unmarshal(body, &rr); err != nil {
 		return LLMResult{}, err
 	}
-	if rr.Error != nil {
-		return LLMResult{}, errors.New(rr.Error.Message)
-	}
 	usage := TokenUsage{
 		PromptTokens:     rr.Usage.InputTokens,
 		CompletionTokens: rr.Usage.OutputTokens,
 		TotalTokens:      rr.Usage.TotalTokens,
+		ReasoningTokens:  rr.Usage.OutputDetails.Reasoning,
 	}
-	if strings.TrimSpace(rr.OutputText) != "" {
-		return LLMResult{Content: rr.OutputText, Usage: usage}, nil
+	if rr.Usage.InputDetails.Cached != nil {
+		usage.CacheReadTokens = *rr.Usage.InputDetails.Cached
+		usage.CacheUsageReported = true
 	}
-	var b strings.Builder
+	if rr.Error != nil {
+		return LLMResult{Usage: usage}, errors.New(rr.Error.Message)
+	}
+	var content, reasoning strings.Builder
+	var calls []LLMToolCall
 	for _, out := range rr.Output {
+		switch out.Type {
+		case "function_call":
+			id := strings.TrimSpace(out.CallID)
+			if id == "" {
+				id = strings.TrimSpace(out.ID)
+			}
+			if strings.TrimSpace(out.Name) != "" {
+				calls = append(calls, LLMToolCall{ID: id, Name: out.Name, Arguments: out.Arguments})
+			}
+		case "reasoning":
+			for _, c := range out.Content {
+				if c.Type == "reasoning_text" {
+					reasoning.WriteString(c.Text)
+				}
+			}
+		}
 		for _, c := range out.Content {
-			if c.Text != "" {
-				b.WriteString(c.Text)
+			if c.Type == "output_text" || c.Type == "text" || c.Type == "input_text" {
+				content.WriteString(c.Text)
 			}
 		}
 	}
-	if b.Len() == 0 {
-		return LLMResult{}, errors.New("empty responses output")
+	if content.Len() == 0 && strings.TrimSpace(rr.OutputText) != "" {
+		content.WriteString(rr.OutputText)
 	}
-	return LLMResult{Content: b.String(), Usage: usage}, nil
-}
-
-func messagesToTranscript(messages []Message) string {
-	var b strings.Builder
-	for _, m := range messages {
-		role := strings.ToUpper(strings.TrimSpace(m.Role))
-		if role == "" {
-			role = "USER"
-		}
-		b.WriteString(role)
-		b.WriteString(":\n")
-		b.WriteString(m.Content)
-		if summary := attachmentSummary(m.Attachments); summary != "" {
-			if strings.TrimSpace(m.Content) != "" {
-				b.WriteString("\n")
-			}
-			b.WriteString(summary)
-		}
-		b.WriteString("\n\n")
+	result := LLMResult{Content: content.String(), ReasoningContent: reasoning.String(), ToolCalls: calls, Usage: usage}
+	if len(calls) > 0 {
+		result.ToolCallID = calls[0].ID
+		result.ToolCallName = calls[0].Name
+		result.ToolCallArgs = calls[0].Arguments
 	}
-	return b.String()
+	if strings.EqualFold(rr.Status, "incomplete") {
+		reason := strings.TrimSpace(rr.IncompleteDetails.Reason)
+		if reason == "" {
+			reason = "达到输出上限"
+		}
+		return result, &PartialStreamError{Result: result, Err: fmt.Errorf("Responses 响应未完成: %s", reason)}
+	}
+	if strings.EqualFold(rr.Status, "failed") {
+		return result, errors.New("Responses 响应失败")
+	}
+	if content.Len() == 0 && len(calls) == 0 {
+		return LLMResult{Usage: usage}, errors.New("empty responses output")
+	}
+	return result, nil
 }
 
 func buildOpenAIResponsesInput(messages []Message) (interface{}, error) {
-	if !MessagesHaveImages(messages) {
-		return messagesToTranscript(messages), nil
-	}
-	blocks := []responsesContentBlock{{Type: "input_text", Text: messagesToTranscript(messages)}}
+	items := make([]interface{}, 0, len(messages))
 	for _, message := range messages {
-		if len(message.Attachments) == 0 {
-			continue
-		}
-		images, err := materializeImages(message.Attachments)
-		if err != nil {
-			return nil, err
-		}
-		for _, image := range images {
-			detail := image.Attachment.Detail
-			if detail == "" {
-				detail = "auto"
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		switch role {
+		case "system", "user", "assistant":
+			if role == "assistant" && strings.TrimSpace(message.ReasoningContent) != "" {
+				items = append(items, responsesReasoningItem{
+					Type:    "reasoning",
+					Content: []responsesContentBlock{{Type: "reasoning_text", Text: message.ReasoningContent}},
+				})
 			}
-			blocks = append(blocks, responsesContentBlock{
-				Type:     "input_image",
-				ImageURL: "data:" + image.Attachment.MediaType + ";base64," + base64.StdEncoding.EncodeToString(image.Data),
-				Detail:   detail,
-			})
+			blocks := make([]responsesContentBlock, 0, 1+len(message.Attachments))
+			text := strings.TrimSpace(message.Content)
+			if text != "" {
+				blockType := "input_text"
+				if role == "assistant" {
+					blockType = "output_text"
+				}
+				blocks = append(blocks, responsesContentBlock{Type: blockType, Text: text})
+			}
+			if len(message.Attachments) > 0 {
+				if role != "user" {
+					return nil, fmt.Errorf("Responses 图片附件只能出现在 user 消息中，当前 role=%s", role)
+				}
+				images, err := materializeImages(message.Attachments)
+				if err != nil {
+					return nil, err
+				}
+				for _, image := range images {
+					detail := image.Attachment.Detail
+					if detail == "" {
+						detail = "auto"
+					}
+					blocks = append(blocks, responsesContentBlock{
+						Type:     "input_image",
+						ImageURL: "data:" + image.Attachment.MediaType + ";base64," + base64.StdEncoding.EncodeToString(image.Data),
+						Detail:   detail,
+					})
+				}
+			}
+			if len(blocks) > 0 {
+				items = append(items, responsesInputMessage{Role: role, Content: blocks})
+			}
+			if role == "assistant" {
+				for _, call := range message.ToolCalls {
+					items = append(items, responsesFunctionCall{
+						Type: "function_call", CallID: call.ID,
+						Name: call.Function.Name, Arguments: call.Function.Arguments,
+					})
+				}
+			}
+		case "tool":
+			if strings.TrimSpace(message.ToolCallID) == "" {
+				items = append(items, responsesInputMessage{
+					Role: "user",
+					Content: []responsesContentBlock{{
+						Type: "input_text",
+						Text: fmt.Sprintf("Tool result (%s):\n%s", message.Name, message.Content),
+					}},
+				})
+			} else {
+				items = append(items, responsesFunctionCallOutput{
+					Type: "function_call_output", CallID: message.ToolCallID, Output: message.Content,
+				})
+			}
 		}
 	}
-	return []responsesInputMessage{{Role: "user", Content: blocks}}, nil
+	if len(items) == 0 {
+		return nil, errors.New("Responses 输入为空")
+	}
+	return items, nil
 }
 
 func isRetryable(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var quota interface{ IsQuotaExhausted() bool }
+	if errors.As(err, &quota) && quota.IsQuotaExhausted() {
+		return false
+	}
+	var status interface{ HTTPStatusCode() int }
+	if errors.As(err, &status) {
+		code := status.HTTPStatusCode()
+		return code == 408 || code == 409 || code == 425 || code == 429 || (code >= 500 && code <= 599 && code != 501 && code != 505)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 	s := strings.ToLower(err.Error())
 	for _, code := range []string{"429", "500", "502", "503", "504", "timeout", "connection reset", "eof"} {
@@ -424,36 +669,28 @@ func isRetryable(err error) bool {
 }
 
 func isToolsUnsupported(err error) bool {
-	if err == nil {
+	if !canRejectRequestFeature(err) {
 		return false
 	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "tool") || strings.Contains(s, "400") || strings.Contains(s, "404")
+	return explicitlyUnsupported(err, "tool") || explicitlyUnsupported(err, "function")
 }
 
 func isStreamUnsupported(err error) bool {
-	if err == nil {
+	if !canRejectRequestFeature(err) {
 		return false
 	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "stream") || strings.Contains(s, "400") ||
-		strings.Contains(s, "404") || strings.Contains(s, "not support")
+	return explicitlyUnsupported(err, "stream")
 }
 
 func isStreamOptionsUnsupported(err error) bool {
-	if err == nil {
+	if !canRejectRequestFeature(err) {
 		return false
 	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "stream_options") ||
-		strings.Contains(s, "include_usage") ||
-		strings.Contains(s, "unknown parameter") ||
-		strings.Contains(s, "unrecognized") ||
-		strings.Contains(s, "unsupported parameter")
+	return explicitlyUnsupported(err, "stream_options") || explicitlyUnsupported(err, "include_usage")
 }
 
 func isMaxTokensUnsupported(err error) bool {
-	if err == nil {
+	if !canRejectRequestFeature(err) {
 		return false
 	}
 	s := strings.ToLower(err.Error())
@@ -462,7 +699,19 @@ func isMaxTokensUnsupported(err error) bool {
 	}
 	return strings.Contains(s, "unknown") || strings.Contains(s, "unrecognized") ||
 		strings.Contains(s, "unsupported") || strings.Contains(s, "not support") ||
-		strings.Contains(s, "extra inputs") || strings.Contains(s, "400")
+		strings.Contains(s, "extra inputs")
+}
+
+func canRejectRequestFeature(err error) bool {
+	if err == nil {
+		return false
+	}
+	var status interface{ HTTPStatusCode() int }
+	if !errors.As(err, &status) {
+		return true
+	}
+	code := status.HTTPStatusCode()
+	return code == 400 || code == 404 || code == 422
 }
 
 func callOpenAICompatible(ctx context.Context, cfg config.Config, messages []Message, withTools bool, onStream func(string)) (LLMResult, error) {
@@ -479,11 +728,26 @@ func callOpenAICompatible(ctx context.Context, cfg config.Config, messages []Mes
 		Temperature: effectiveTemperature(cfg),
 		MaxTokens:   cfg.EffectiveModelCapabilities().ReservedOutputTokens,
 	}
+	if cfg.IsDeepSeek() {
+		thinking := cfg.EffectiveThinkingMode() == "enabled"
+		thinkingType := "disabled"
+		if thinking {
+			thinkingType = "enabled"
+		}
+		reqBody.Thinking = &ThinkingConfig{Type: thinkingType}
+		reqBody.ReasoningEffort = cfg.EffectiveReasoningEffort()
+		reqBody.UserID = strings.TrimSpace(cfg.UserID)
+		reqBody.deepSeekThinking = thinking
+	}
 	if isKnownUnsupported(cfg, "max_tokens") {
 		reqBody.MaxTokens = 0
 	}
 	if withTools {
-		reqBody.Tools = nativeToolDefinitionsForRequest(cfg, messages)
+		prepared, err := prepareNativeTools(ctx, cfg, messages)
+		if err != nil {
+			return LLMResult{}, err
+		}
+		reqBody.preparedTools = prepared.encoded
 		// auto lets the model select a strongly typed built-in function, while
 		// agent_action remains available for shell/file/task/finish actions.
 		reqBody.ToolChoice = "auto"
@@ -511,25 +775,25 @@ func callOpenAICompatible(ctx context.Context, cfg config.Config, messages []Mes
 		return result, err
 	}
 
-	body, status, err := doHTTPPost(ctx, url, cfg, reqBody)
+	body, status, headers, err := doHTTPPostReply(ctx, url, cfg, reqBody)
 	if err != nil {
 		return LLMResult{}, err
 	}
 	if status != 200 && reqBody.MaxTokens > 0 {
-		apiErr := fmt.Errorf("API Error %d: %s", status, truncateStr(string(body), 500))
+		apiErr := apiResponseError(status, headers, body)
 		if isMaxTokensUnsupported(apiErr) {
 			if explicitlyUnsupported(apiErr, "max_tokens") {
 				rememberUnsupported(cfg, "max_tokens")
 			}
 			reqBody.MaxTokens = 0
-			body, status, err = doHTTPPost(ctx, url, cfg, reqBody)
+			body, status, headers, err = doHTTPPostReply(ctx, url, cfg, reqBody)
 			if err != nil {
 				return LLMResult{}, err
 			}
 		}
 	}
 	if status != 200 {
-		return LLMResult{}, fmt.Errorf("API Error %d: %s", status, truncateStr(string(body), 500))
+		return LLMResult{}, apiResponseError(status, headers, body)
 	}
 
 	var chatResp ChatResponse
@@ -537,7 +801,7 @@ func callOpenAICompatible(ctx context.Context, cfg config.Config, messages []Mes
 		return LLMResult{}, fmt.Errorf("parse error: %w", err)
 	}
 	if len(chatResp.Choices) == 0 {
-		return LLMResult{}, errors.New("empty response")
+		return LLMResult{Usage: chatResp.Usage}, errors.New("empty response")
 	}
 	msg := chatResp.Choices[0].Message
 	if len(msg.ToolCalls) > 0 {
@@ -545,27 +809,20 @@ func callOpenAICompatible(ctx context.Context, cfg config.Config, messages []Mes
 		for _, call := range msg.ToolCalls {
 			calls = append(calls, LLMToolCall{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments})
 		}
-		return LLMResult{Content: msg.Content, ReasoningContent: msg.ReasoningContent, ToolCallID: calls[0].ID, ToolCallName: calls[0].Name, ToolCallArgs: calls[0].Arguments, ToolCalls: calls, Usage: chatResp.Usage}, nil
+		result := LLMResult{Content: msg.Content, ReasoningContent: msg.ReasoningContent, ToolCallID: calls[0].ID, ToolCallName: calls[0].Name, ToolCallArgs: calls[0].Arguments, ToolCalls: calls, Usage: chatResp.Usage}
+		return result, finishReasonError(chatResp.Choices[0].FinishReason, result)
 	}
-	return LLMResult{Content: msg.Content, ReasoningContent: msg.ReasoningContent, Usage: chatResp.Usage}, nil
+	result := LLMResult{Content: msg.Content, ReasoningContent: msg.ReasoningContent, Usage: chatResp.Usage}
+	return result, finishReasonError(chatResp.Choices[0].FinishReason, result)
 }
 
 const runtimeV3DeferredToolLimit = 16
 
+const maxDeepSeekRequestBodyBytes = 48 << 20
+
 func nativeToolDefinitionsForRequest(cfg config.Config, messages []Message) []ToolDefinition {
-	capabilities := cfg.EffectiveModelCapabilities()
-	contextText := recentToolSelectionContext(messages, 12000)
-	if cfg.EffectiveAgentRuntime() != "v3" {
-		return AgentToolDefinitionsForContext(capabilities.NativeToolLimit, contextText)
-	}
-	limit := capabilities.NativeToolLimit
-	if limit <= 0 {
-		// A large context window is not a reason to resend every tool schema.
-		// Keep a small goal-ranked candidate set so models without native
-		// deferred-tool APIs can still complete common tasks in one turn.
-		limit = runtimeV3DeferredToolLimit
-	}
-	return AgentToolDefinitionsForContextWithPinned(limit, contextText, pinnedNativeToolNames(messages))
+	limit, contextText, pinned := nativeToolSelection(cfg, messages)
+	return canonicalNativeTools(AgentToolDefinitionsForContextWithPinned(limit, contextText, pinned))
 }
 
 func pinnedNativeToolNames(messages []Message) []string {
@@ -638,6 +895,9 @@ func callOpenAICompatibleStream(ctx context.Context, url string, cfg config.Conf
 	if err != nil {
 		return LLMResult{}, err
 	}
+	if cfg.IsDeepSeek() && len(jsonData) > maxDeepSeekRequestBodyBytes {
+		return LLMResult{}, fmt.Errorf("DeepSeek 请求体超过 48 MiB（当前 %.1f MiB），请减少图片或历史文本", float64(len(jsonData))/(1<<20))
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return LLMResult{}, err
@@ -655,7 +915,7 @@ func callOpenAICompatibleStream(ctx context.Context, url string, cfg config.Conf
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		body, _ := readLimitedResponseBody(resp.Body, maxLLMResponseBytes(cfg))
-		return LLMResult{}, fmt.Errorf("API Error %d: %s", resp.StatusCode, truncateStr(string(body), 500))
+		return LLMResult{}, apiResponseError(resp.StatusCode, resp.Header, body)
 	}
 
 	var content strings.Builder
@@ -668,6 +928,7 @@ func callOpenAICompatibleStream(ctx context.Context, url string, cfg config.Conf
 	toolBuilders := make(map[int]*toolCallBuilder)
 	var usage TokenUsage
 	var partialErr error
+	var finishReason string
 	maxResponseBytes := maxLLMResponseBytes(cfg)
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -695,6 +956,9 @@ func callOpenAICompatibleStream(ctx context.Context, url string, cfg config.Conf
 			continue
 		}
 		choice := chunk.Choices[0]
+		if choice.FinishReason != "" {
+			finishReason = choice.FinishReason
+		}
 		if choice.Delta.ReasoningContent != "" {
 			reasoningContent.WriteString(choice.Delta.ReasoningContent)
 		}
@@ -714,7 +978,7 @@ func callOpenAICompatibleStream(ctx context.Context, url string, cfg config.Conf
 			toolBytes += builder.id.Len() + builder.name.Len() + builder.args.Len()
 		}
 		if int64(content.Len()+reasoningContent.Len()+len(delta)+toolBytes) > maxResponseBytes {
-			return LLMResult{}, fmt.Errorf("LLM 流式响应超过上限 %d 字节", maxResponseBytes)
+			return LLMResult{Usage: usage}, fmt.Errorf("LLM 流式响应超过上限 %d 字节", maxResponseBytes)
 		}
 		if delta != "" {
 			content.WriteString(delta)
@@ -747,10 +1011,28 @@ func callOpenAICompatibleStream(ctx context.Context, url string, cfg config.Conf
 		result.ToolCallName = calls[0].Name
 		result.ToolCallArgs = calls[0].Arguments
 	}
+	if partialErr == nil {
+		partialErr = finishReasonError(finishReason, result)
+	}
 	if partialErr != nil {
 		return result, &PartialStreamError{Result: result, Err: partialErr}
 	}
 	return result, nil
+}
+
+func finishReasonError(reason string, result LLMResult) error {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "length":
+		return &PartialStreamError{Result: result, Err: errors.New("模型输出达到长度上限（finish_reason=length）")}
+	case "content_filter":
+		return &PartialStreamError{Result: result, Err: errors.New("模型输出被内容过滤（finish_reason=content_filter）")}
+	case "insufficient_system_resource":
+		return &PartialStreamError{Result: result, Err: errors.New("DeepSeek 后端推理资源不足（finish_reason=insufficient_system_resource）")}
+	case "aborted":
+		return &PartialStreamError{Result: result, Err: errors.New("模型生成被中断（finish_reason=aborted）")}
+	default:
+		return nil
+	}
 }
 
 type anthropicRequest struct {
@@ -759,10 +1041,28 @@ type anthropicRequest struct {
 	System       string                 `json:"system,omitempty"`
 	Messages     []anthropicMessage     `json:"messages"`
 	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+	Metadata     *anthropicMetadata     `json:"metadata,omitempty"`
+	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+	Temperature  *float64               `json:"temperature,omitempty"`
+	Tools        []anthropicTool        `json:"tools,omitempty"`
 }
 
 type anthropicOutputConfig struct {
 	Effort string `json:"effort,omitempty"`
+}
+
+type anthropicMetadata struct {
+	UserID string `json:"user_id,omitempty"`
+}
+
+type anthropicThinking struct {
+	Type string `json:"type"`
+}
+
+type anthropicTool struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description,omitempty"`
+	InputSchema map[string]interface{} `json:"input_schema"`
 }
 
 type anthropicMessage struct {
@@ -771,9 +1071,15 @@ type anthropicMessage struct {
 }
 
 type anthropicContentBlock struct {
-	Type   string                `json:"type"`
-	Text   string                `json:"text,omitempty"`
-	Source *anthropicImageSource `json:"source,omitempty"`
+	Type      string                `json:"type"`
+	Text      string                `json:"text,omitempty"`
+	Thinking  string                `json:"thinking,omitempty"`
+	Source    *anthropicImageSource `json:"source,omitempty"`
+	ID        string                `json:"id,omitempty"`
+	Name      string                `json:"name,omitempty"`
+	Input     json.RawMessage       `json:"input,omitempty"`
+	ToolUseID string                `json:"tool_use_id,omitempty"`
+	Content   interface{}           `json:"content,omitempty"`
 }
 
 type anthropicImageSource struct {
@@ -784,21 +1090,26 @@ type anthropicImageSource struct {
 
 type anthropicResponse struct {
 	Content []struct {
-		Type     string `json:"type"`
-		Text     string `json:"text"`
-		Thinking string `json:"thinking,omitempty"`
+		Type     string          `json:"type"`
+		Text     string          `json:"text"`
+		Thinking string          `json:"thinking,omitempty"`
+		ID       string          `json:"id"`
+		Name     string          `json:"name"`
+		Input    json.RawMessage `json:"input"`
 	} `json:"content"`
 	StopReason string `json:"stop_reason,omitempty"`
 	Error      *struct {
 		Message string `json:"message"`
 	} `json:"error"`
 	Usage struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	} `json:"usage"`
 }
 
-func callAnthropic(ctx context.Context, cfg config.Config, messages []Message) (LLMResult, error) {
+func callAnthropic(ctx context.Context, cfg config.Config, messages []Message, useNativeTools bool) (LLMResult, error) {
 	url := config.NormalizeAPIURL(cfg.ApiURL, config.ProtocolAnthropicMessages)
 	var system strings.Builder
 	var msgs []anthropicMessage
@@ -808,13 +1119,12 @@ func callAnthropic(ctx context.Context, cfg config.Config, messages []Message) (
 			system.WriteString(m.Content)
 			system.WriteString("\n")
 		case "user", "assistant":
-			content := m.Content
-			if len(m.ToolCalls) > 0 {
-				var calls []string
-				for _, call := range m.ToolCalls {
-					calls = append(calls, fmt.Sprintf("%s(%s)", call.Function.Name, call.Function.Arguments))
-				}
-				content = "Tool calls requested: " + strings.Join(calls, ", ")
+			blocks := make([]anthropicContentBlock, 0, 1+len(m.Attachments)+len(m.ToolCalls))
+			if m.Role == "assistant" && strings.TrimSpace(m.ReasoningContent) != "" {
+				blocks = append(blocks, anthropicContentBlock{Type: "thinking", Thinking: m.ReasoningContent})
+			}
+			if strings.TrimSpace(m.Content) != "" {
+				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: m.Content})
 			}
 			if len(m.Attachments) > 0 {
 				if m.Role != "user" {
@@ -824,22 +1134,32 @@ func callAnthropic(ctx context.Context, cfg config.Config, messages []Message) (
 				if err != nil {
 					return LLMResult{}, err
 				}
-				if strings.TrimSpace(content) == "" {
-					content = "请分析所附图片，并结合当前任务继续。"
+				if len(blocks) == 0 {
+					blocks = append(blocks, anthropicContentBlock{Type: "text", Text: "请分析所附图片，并结合当前任务继续。"})
 				}
-				blocks := []anthropicContentBlock{{Type: "text", Text: content}}
 				for _, image := range images {
 					blocks = append(blocks, anthropicContentBlock{Type: "image", Source: &anthropicImageSource{
 						Type: "base64", MediaType: image.Attachment.MediaType,
 						Data: base64.StdEncoding.EncodeToString(image.Data),
 					}})
 				}
+			}
+			for _, call := range m.ToolCalls {
+				input := json.RawMessage(call.Function.Arguments)
+				if !json.Valid(input) {
+					input = json.RawMessage("{}")
+				}
+				blocks = append(blocks, anthropicContentBlock{
+					Type: "tool_use", ID: call.ID, Name: call.Function.Name, Input: input,
+				})
+			}
+			if len(blocks) > 0 {
 				msgs = append(msgs, anthropicMessage{Role: m.Role, Content: blocks})
-			} else if strings.TrimSpace(content) != "" {
-				msgs = append(msgs, anthropicMessage{Role: m.Role, Content: content})
 			}
 		case "tool":
-			msgs = append(msgs, anthropicMessage{Role: "user", Content: fmt.Sprintf("Tool result [%s, call_id=%s]:\n%s", m.Name, m.ToolCallID, m.Content)})
+			msgs = append(msgs, anthropicMessage{Role: "user", Content: []anthropicContentBlock{{
+				Type: "tool_result", ToolUseID: m.ToolCallID, Content: m.Content,
+			}}})
 		}
 	}
 	if len(msgs) == 0 {
@@ -852,8 +1172,34 @@ func callAnthropic(ctx context.Context, cfg config.Config, messages []Message) (
 		System:    strings.TrimSpace(system.String()),
 		Messages:  msgs,
 	}
-	if effort := anthropicEffort(cfg.ModelName); effort != "" {
+	if cfg.IsDeepSeek() {
+		reqBody.MaxTokens = cfg.EffectiveModelCapabilities().ReservedOutputTokens
+		if userID := strings.TrimSpace(cfg.UserID); userID != "" {
+			reqBody.Metadata = &anthropicMetadata{UserID: userID}
+		}
+		if cfg.EffectiveThinkingMode() == "enabled" {
+			reqBody.Thinking = &anthropicThinking{Type: "enabled"}
+			if effort := cfg.EffectiveReasoningEffort(); effort != "" {
+				reqBody.OutputConfig = &anthropicOutputConfig{Effort: effort}
+			}
+		} else {
+			reqBody.Thinking = &anthropicThinking{Type: "disabled"}
+			reqBody.OutputConfig = &anthropicOutputConfig{Effort: "none"}
+			temp := effectiveTemperature(cfg)
+			reqBody.Temperature = &temp
+		}
+	} else if effort := anthropicEffort(cfg.ModelName); effort != "" {
 		reqBody.OutputConfig = &anthropicOutputConfig{Effort: effort}
+	}
+	if useNativeTools {
+		definitions := nativeToolDefinitionsForRequest(cfg, messages)
+		reqBody.Tools = make([]anthropicTool, 0, len(definitions))
+		for _, definition := range definitions {
+			reqBody.Tools = append(reqBody.Tools, anthropicTool{
+				Name: definition.Function.Name, Description: definition.Function.Description,
+				InputSchema: definition.Function.Parameters,
+			})
+		}
 	}
 
 	raw, err := json.Marshal(reqBody)
@@ -880,23 +1226,46 @@ func callAnthropic(ctx context.Context, cfg config.Config, messages []Message) (
 		return LLMResult{}, err
 	}
 	if resp.StatusCode != 200 {
-		return LLMResult{}, fmt.Errorf("调用 Anthropic API 失败 %d: %s", resp.StatusCode, truncateStr(string(body), 500))
+		return LLMResult{}, apiResponseError(resp.StatusCode, resp.Header, body)
 	}
 
 	var ar anthropicResponse
 	if err := json.Unmarshal(body, &ar); err != nil {
 		return LLMResult{}, err
 	}
+	usage := TokenUsage{
+		PromptTokens:     ar.Usage.InputTokens + ar.Usage.CacheReadInputTokens + ar.Usage.CacheCreationInputTokens,
+		CompletionTokens: ar.Usage.OutputTokens,
+		TotalTokens:      ar.Usage.InputTokens + ar.Usage.OutputTokens + ar.Usage.CacheReadInputTokens + ar.Usage.CacheCreationInputTokens,
+		CacheReadTokens:  ar.Usage.CacheReadInputTokens,
+		CacheWriteTokens: ar.Usage.CacheCreationInputTokens,
+	}
+	var rawUsage struct {
+		Usage map[string]json.RawMessage `json:"usage"`
+	}
+	_ = json.Unmarshal(body, &rawUsage)
+	for _, key := range []string{"cache_read_input_tokens", "cache_creation_input_tokens"} {
+		if raw, ok := rawUsage.Usage[key]; ok && string(raw) != "null" {
+			usage.CacheUsageReported = true
+		}
+	}
 	if ar.Error != nil {
-		return LLMResult{}, errors.New(ar.Error.Message)
+		return LLMResult{Usage: usage}, errors.New(ar.Error.Message)
 	}
 	var text, thinking strings.Builder
+	var calls []LLMToolCall
 	for _, c := range ar.Content {
 		switch c.Type {
 		case "text":
 			text.WriteString(c.Text)
 		case "thinking":
 			thinking.WriteString(c.Thinking)
+		case "tool_use":
+			args := strings.TrimSpace(string(c.Input))
+			if args == "" || args == "null" {
+				args = "{}"
+			}
+			calls = append(calls, LLMToolCall{ID: c.ID, Name: c.Name, Arguments: args})
 		}
 	}
 	if strings.EqualFold(ar.StopReason, "refusal") {
@@ -904,14 +1273,21 @@ func callAnthropic(ctx context.Context, cfg config.Config, messages []Message) (
 		if msg == "" {
 			msg = "模型拒绝回答"
 		}
-		return LLMResult{}, fmt.Errorf("Anthropic 拒绝回答: %s", msg)
+		return LLMResult{Usage: usage}, fmt.Errorf("Anthropic 拒绝回答: %s", msg)
 	}
-	usage := TokenUsage{
-		PromptTokens:     ar.Usage.InputTokens,
-		CompletionTokens: ar.Usage.OutputTokens,
-		TotalTokens:      ar.Usage.InputTokens + ar.Usage.OutputTokens,
+	result := LLMResult{Content: text.String(), ReasoningContent: thinking.String(), ToolCalls: calls, Usage: usage}
+	if len(calls) > 0 {
+		result.ToolCallID = calls[0].ID
+		result.ToolCallName = calls[0].Name
+		result.ToolCallArgs = calls[0].Arguments
 	}
-	return LLMResult{Content: text.String(), ReasoningContent: thinking.String(), Usage: usage}, nil
+	if strings.EqualFold(ar.StopReason, "max_tokens") {
+		return result, &PartialStreamError{Result: result, Err: errors.New("Anthropic 响应达到 max_tokens 上限")}
+	}
+	if text.Len() == 0 && len(calls) == 0 {
+		return result, errors.New("Anthropic 返回空内容")
+	}
+	return result, nil
 }
 
 // anthropicMaxTokens reserves room for Claude 5 adaptive thinking, which shares
@@ -952,6 +1328,30 @@ func recentToolSelectionContext(messages []Message, maxBytes int) string {
 	if maxBytes <= 0 {
 		maxBytes = 12000
 	}
+	// Retrieval follows user requirements, not the vocabulary of a large log
+	// or webpage. Successful/discovered functions are pinned separately. This
+	// keeps irrelevant output from churning schemas or hiding the actual goal.
+	var userParts []string
+	userBytes := 0
+	for i := len(messages) - 1; i >= 0 && userBytes < maxBytes; i-- {
+		if messages[i].Role != "user" {
+			continue
+		}
+		content := strings.TrimSpace(messages[i].Content)
+		if content == "" {
+			continue
+		}
+		content = truncateStr(content, maxBytes-userBytes)
+		userParts = append(userParts, content)
+		userBytes += len(content)
+	}
+	if len(userParts) > 0 {
+		for i, j := 0, len(userParts)-1; i < j; i, j = i+1, j-1 {
+			userParts[i], userParts[j] = userParts[j], userParts[i]
+		}
+		return strings.Join(userParts, "\n")
+	}
+	// Compatibility callers may supply only a summary or tool result.
 	var parts []string
 	used := 0
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -977,14 +1377,17 @@ func recentToolSelectionContext(messages []Message, maxBytes int) string {
 	return strings.Join(parts, "\n")
 }
 
-func doHTTPPost(ctx context.Context, url string, cfg config.Config, payload interface{}) ([]byte, int, error) {
+func doHTTPPostReply(ctx context.Context, url string, cfg config.Config, payload interface{}) ([]byte, int, http.Header, error) {
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
+	}
+	if cfg.IsDeepSeek() && len(jsonData) > maxDeepSeekRequestBodyBytes {
+		return nil, 0, nil, fmt.Errorf("DeepSeek 请求体超过 48 MiB（当前 %.1f MiB），请减少图片或历史文本", float64(len(jsonData))/(1<<20))
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if cfg.ApiKey != "" && cfg.ApiKey != "none" {
@@ -993,14 +1396,14 @@ func doHTTPPost(ctx context.Context, url string, cfg config.Config, payload inte
 	client := config.HTTPClient(time.Duration(cfg.EffectiveLLMTimeout()) * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	defer resp.Body.Close()
 	body, err := readLimitedResponseBody(resp.Body, maxLLMResponseBytes(cfg))
 	if err != nil {
-		return nil, resp.StatusCode, err
+		return nil, resp.StatusCode, resp.Header, err
 	}
-	return body, resp.StatusCode, nil
+	return body, resp.StatusCode, resp.Header, nil
 }
 
 func maxLLMResponseBytes(cfg config.Config) int64 {
@@ -1135,6 +1538,27 @@ func isGPT6ReasoningModel(model string) bool {
 // parameters at non-none effort. Keep other models' temperature behavior.
 func (r ChatRequest) MarshalJSON() ([]byte, error) {
 	type plain ChatRequest
+	if r.deepSeekThinking {
+		// DeepSeek ignores temperature in thinking mode. Omitting it keeps the
+		// request honest and avoids teaching the model that the value matters.
+		if r.preparedTools != nil {
+			return json.Marshal(struct {
+				plain
+				Temperature *float64        `json:"temperature,omitempty"`
+				Tools       json.RawMessage `json:"tools,omitempty"`
+			}{plain: plain(r), Tools: r.preparedTools})
+		}
+		return json.Marshal(struct {
+			plain
+			Temperature *float64 `json:"temperature,omitempty"`
+		}{plain: plain(r)})
+	}
+	if r.preparedTools != nil && !isGPT6ReasoningModel(r.Model) {
+		return json.Marshal(struct {
+			plain
+			Tools json.RawMessage `json:"tools,omitempty"`
+		}{plain: plain(r), Tools: r.preparedTools})
+	}
 	if !isGPT6ReasoningModel(r.Model) {
 		return json.Marshal(plain(r))
 	}

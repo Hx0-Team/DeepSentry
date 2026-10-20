@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +47,11 @@ type NetworkDeviceReporter interface {
 }
 
 type TelnetExecutor struct {
+	iacPending     bool
+	negotiation    byte
+	subnegotiation bool
+	subIAC         bool
+	subData        []byte
 	conn           net.Conn
 	reader         *bufio.Reader
 	promptSpec     string
@@ -63,7 +69,9 @@ type TelnetExecutor struct {
 func newTelnetExecutor(cfg config.Config) (*TelnetExecutor, error) {
 	host := normalizeHostPort(cfg.TelnetHost, "23")
 	connectTimeout := secondsOrDefault(cfg.TelnetConnectTimeoutSec, 10)
-	conn, err := config.ControllerDialTimeout("tcp", host, connectTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancel()
+	conn, err := config.ControllerDialContextForProxy(ctx, "tcp", host, cfg.ControllerProxy)
 	if err != nil {
 		return nil, fmt.Errorf("建立 Telnet TCP 连接失败 (%s, timeout=%s): %w", host, connectTimeout, err)
 	}
@@ -71,7 +79,7 @@ func newTelnetExecutor(cfg config.Config) (*TelnetExecutor, error) {
 		conn: conn, reader: bufio.NewReader(conn), promptSpec: strings.TrimSpace(cfg.TelnetPrompt),
 		deviceType: normalizeDeviceType(cfg.TelnetDeviceType), enablePassword: cfg.TelnetEnablePassword,
 		loginTimeout:   secondsOrDefault(cfg.TelnetLoginTimeoutSec, 20),
-		commandTimeout: secondsOrDefault(cfg.TelnetCommandTimeoutSec, max(config.GlobalConfig.EffectiveSSHTimeout(), 30)),
+		commandTimeout: secondsOrDefault(cfg.TelnetCommandTimeoutSec, max(cfg.EffectiveSSHTimeout(), 30)),
 	}
 	if t.promptSpec != "" {
 		t.promptRE, err = compilePromptSpec(t.promptSpec)
@@ -262,6 +270,10 @@ func (t *TelnetExecutor) login(user, pass string) error {
 }
 
 func (t *TelnetExecutor) writeLine(value string) error {
+	if strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("Telnet 只接受单行命令/认证值")
+	}
+	_ = t.conn.SetWriteDeadline(time.Now().Add(t.commandTimeout))
 	_, err := io.WriteString(t.conn, value+"\r\n")
 	return err
 }
@@ -488,42 +500,92 @@ func (t *TelnetExecutor) readDataByte() (byte, error) {
 		if err != nil {
 			return 0, err
 		}
-		if value != telnetIAC {
-			return value, nil
-		}
-		command, err := t.reader.ReadByte()
-		if err != nil {
-			return 0, err
-		}
-		switch command {
-		case telnetIAC:
-			return telnetIAC, nil
-		case telnetDO, telnetDONT, telnetWILL, telnetWONT:
-			option, readErr := t.reader.ReadByte()
-			if readErr != nil {
-				return 0, readErr
-			}
-			reply := telnetWONT
-			if command == telnetWILL || command == telnetWONT {
-				reply = telnetDONT
-			}
-			_, _ = t.conn.Write([]byte{telnetIAC, reply, option})
-		case telnetSB:
-			previous := byte(0)
-			for {
-				current, readErr := t.reader.ReadByte()
-				if readErr != nil {
-					return 0, readErr
+		if t.subnegotiation {
+			if t.subIAC {
+				t.subIAC = false
+				if value == telnetSE {
+					t.subnegotiation = false
+					if err := t.finishSubnegotiation(); err != nil {
+						return 0, err
+					}
+					continue
 				}
-				if previous == telnetIAC && current == telnetSE {
-					break
+				if value != telnetIAC {
+					continue
 				}
-				previous = current
 			}
-		default:
-			// Single-byte Telnet control command; consume it and continue.
+			if value == telnetIAC {
+				t.subIAC = true
+				continue
+			}
+			t.subData = append(t.subData, value)
+			if len(t.subData) > 1024 {
+				return 0, fmt.Errorf("Telnet 子协商超过1024字节")
+			}
+			continue
+		}
+		if t.negotiation != 0 {
+			command := t.negotiation
+			t.negotiation = 0
+			if err := t.replyNegotiation(command, value); err != nil {
+				return 0, err
+			}
+			continue
+		}
+		if t.iacPending {
+			t.iacPending = false
+			switch value {
+			case telnetIAC:
+				return telnetIAC, nil
+			case telnetDO, telnetDONT, telnetWILL, telnetWONT:
+				t.negotiation = value
+			case telnetSB:
+				t.subnegotiation = true
+				t.subIAC = false
+				t.subData = nil
+			}
+			continue
+		}
+		if value == telnetIAC {
+			t.iacPending = true
+			continue
+		}
+		return value, nil
+	}
+}
+func (t *TelnetExecutor) writeNegotiation(data []byte) error {
+	_ = t.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, err := t.conn.Write(data)
+	return err
+}
+func (t *TelnetExecutor) replyNegotiation(command, option byte) error {
+	// Refusal acknowledgements are terminal; replying again causes negotiation loops.
+	if command == telnetDONT || command == telnetWONT {
+		return nil
+	}
+	response := telnetWONT
+	if command == telnetWILL {
+		response = telnetDONT
+		if option == 1 || option == 3 {
+			response = telnetDO
 		}
 	}
+	if command == telnetDO && (option == 3 || option == 24 || option == 31) {
+		response = telnetWILL
+	}
+	if err := t.writeNegotiation([]byte{telnetIAC, response, option}); err != nil {
+		return err
+	}
+	if command == telnetDO && option == 31 {
+		return t.writeNegotiation([]byte{telnetIAC, telnetSB, 31, 0, 120, 0, 30, telnetIAC, telnetSE})
+	}
+	return nil
+}
+func (t *TelnetExecutor) finishSubnegotiation() error {
+	if len(t.subData) >= 2 && t.subData[0] == 24 && t.subData[1] == 1 {
+		return t.writeNegotiation(append([]byte{telnetIAC, telnetSB, 24, 0}, append([]byte("xterm"), telnetIAC, telnetSE)...))
+	}
+	return nil
 }
 
 func minTime(a, b time.Time) time.Time {

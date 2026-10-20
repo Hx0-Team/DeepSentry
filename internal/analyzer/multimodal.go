@@ -175,18 +175,3 @@ func buildOpenAIChatMessages(messages []Message) ([]openAIChatMessage, error) {
 	}
 	return out, nil
 }
-
-func attachmentSummary(attachments []ImageAttachment) string {
-	if len(attachments) == 0 {
-		return ""
-	}
-	names := make([]string, 0, len(attachments))
-	for _, attachment := range attachments {
-		name := strings.TrimSpace(attachment.Name)
-		if name == "" {
-			name = filepath.Base(attachment.Path)
-		}
-		names = append(names, name)
-	}
-	return fmt.Sprintf("[图片附件 %d 张: %s]", len(attachments), strings.Join(names, ", "))
-}

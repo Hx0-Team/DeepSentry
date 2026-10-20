@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🛡️ DeepSentry v2.0.5 Ultimate — 深海哨兵
+# 🛡️ DeepSentry v2.0.6 Ultimate — 深海哨兵
 
 <h3>"让 AI 成为你的红蓝对抗伙伴与安全运维专家。"</h3>
 
@@ -10,10 +10,10 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Team-Hx0-red?style=flat-square" alt="Team">
-  <img src="https://img.shields.io/badge/Version-v2.0.5%20Ultimate-2f81f7?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-v2.0.6%20Ultimate-2f81f7?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/Status-Released-brightgreen?style=flat-square" alt="Released">
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-gray?style=flat-square&logo=linux&logoColor=white" alt="Platform">
-  <img src="https://img.shields.io/badge/Go-1.26.8+-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go">
+  <img src="https://img.shields.io/badge/Go-1.26.9+-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go">
   <img src="https://img.shields.io/badge/AI-Multi--Provider-blueviolet?style=flat-square" alt="AI">
 </p>
 
@@ -23,18 +23,33 @@
 
 DeepSentry 是一个跑在你自己电脑或服务器上的 **AI 安全应急 / 智能运维 Agent**。用中文说清目标，它会规划步骤、调用工具、连本地或远程主机，并留下可审计的报告。
 
-v2.0.4 起也可以：
+v2.0.6 起也可以：
 
 1. 在 **微信、QQ、企业微信、飞书、钉钉** 里私聊指挥（验证码回原任务，高危操作当场确认）。
 2. 对设备 **Web 控制台做网页巡检**，保留真实截图，一句话生成带封面的 **Word / Markdown**。
+3. 用 DeepSeek 官方 Search 补充实时网页证据；`/thinking` 控制思考模式、强度和输出预算，`/search` 控制联网开关。
 
-<img width="1672" height="941" alt="DeepSentry v2.0.5 Ultimate 宣传图" src="https://github.com/user-attachments/assets/9b24d5ec-a9b8-4a06-a144-2c43de202be1" />
+<img width="1672" height="941" alt="DeepSentry v2.0.6 Ultimate 宣传图" src="assets/DeepSentry-v2.0.6-poster.png" />
 
 > **授权范围**：只允许在你拥有或已获得明确书面授权的系统上使用。禁止未授权扫描、入侵、破坏、绕过访问控制或任何违法用途。
 
 > **数据会出本机**：任务描述、必要上下文和工具结果会发给你配置的大模型服务。涉密环境请改用受控本地模型，公开报告和截图前先脱敏。漏洞请走 [Security Advisories](SECURITY.md)，不要开公开 Issue。
 
 ---
+
+## v2.0.6 更新（2026-10-20）
+
+本版围绕 Agent 执行效率、DeepSeek 适配、文档交付和远程连接完善日常安全与运维流程。原有聊天接入、定时巡检、多 Agent 协作和审计证据能力继续提供。
+
+- **执行与上下文：** 按任务发现工具和加载指导，复用同一步的工具定义；独立只读 I/O 有界并发，存在依赖或修改的操作保持顺序。精简重复提示和无关历史，工作历史默认预算 48K、子 Agent 默认 16K，均可配置。
+- **DeepSeek 搜索与思考：** 新增内置 `web_search`，`/search on|off` 控制联网；`/thinking on|off|low|high|max` 与 `/thinking budget 96k` 调整思考模式和输出预算。Chat、Responses、Anthropic 三种协议统一接入原生工具调用。详见 [DeepSeek 深度适配](docs/DeepSeek-适配.md) 与 [联网搜索](docs/DeepSeek-Search.md)。
+- **用量与余额：** `/cost` 查看服务商返回的实际 token 和缓存明细，`/context` 在本地估算请求组成；TUI 右上角展示支持厂商的账户余额，`/balance` 查看详情。余额查询不调用模型。
+- **Office / PDF：** 解析 Word、Excel、PPT、PDF 附件，新增真实 DOCX/XLSX/PPTX/PDF 文件生成与结构回读，支持报告、资产表、多工作表公式和演示备注。复杂模板、扫描件 OCR 和图片理解需专用工具。详见 [文档能力](docs/文档能力-2.0.6.md)。
+- **远程连接与配置：** 新增 SFTP-only，完善旧 SSH2 兼容、FTP 传输取消、Telnet 分片协商与代理转发；自然语言配置支持检索、预览、事务更新和失败恢复，局部更新保留未修改的认证字段。详见 [远程连接](docs/Remote-Connections.md) 与 [操作手册](docs/操作手册.md)。
+- **桌面与终端：** 增加按文字和角色查询前台窗口控件，强化观察 ID 与操作目标绑定；保留蓝色主题，修复长行显示、窄屏布局和代码复制中的装饰字符。
+- **HawkEye：** 对齐扩展 1.0.7 / MCP Server 1.0.14 的 53 个工具，补充书签、脚本管理与研究并发，保留分页和图片证据。详见 [鹰眼适配](docs/HawkEye-MCP-深度适配.md)。
+
+测试范围、复验方法与平台限制见 [2.0.6 验证说明](docs/Verification-2.0.6.md)。实际模型用量和耗时随任务、服务商与缓存变化。
 
 ## v2.0.5（2026-09-24）
 
@@ -82,6 +97,7 @@ Windows/Linux 真实桌面与完整视觉操作链仍需真机验收；Linux 桌
 | 想用手机指挥 | [聊天机器人接入](#聊天机器人接入) |
 | 要网页截图和 Word | [网页巡检与 Word 报告](#网页巡检与-word-报告) |
 | 接鹰眼 / FofaMap | [鹰眼 MCP 深度适配](docs/HawkEye-MCP-深度适配.md)、[FofaMap MCP 适配](docs/FofaMap-MCP-适配.md) |
+| 用 DeepSeek Search / 思考模式 | [DeepSeek 深度适配](docs/DeepSeek-适配.md)、[DeepSeek 联网搜索](docs/DeepSeek-Search.md) |
 | 查完整参数 / 排错 | [操作手册](docs/操作手册.md)、[常见问题](#常见问题) |
 | 报告漏洞 | [SECURITY.md](SECURITY.md) |
 
@@ -109,7 +125,7 @@ Windows/Linux 真实桌面与完整视觉操作链仍需真机验收；Linux 桌
 2. **一台你有权检查的机器或网页控制台**。默认先查本机。
 3. （可选）**聊天软件**，以及 Hx0 的 **鹰眼 / FofaMap**。前者用来手机指挥；鹰眼负责真实浏览器巡检截图，FofaMap 负责互联网资产测绘。都不是第一步的必需品。
 
-核心能力：中文全屏终端、本地 / SSH / Telnet / FTP / 多主机、77 个内置工具、会话恢复、定时任务、聊天机器人、网页巡检 Word、对 **Hx0 鹰眼 MCP** 与 **FofaMap MCP** 的深度适配。
+核心能力：中文全屏终端、本地 / SSH / Telnet / FTP / 多主机、79 个内置工具、DeepSeek 联网搜索与三协议思考模式适配、会话恢复、定时任务、聊天机器人、Office/PDF 结构化阅读与生成、对 **Hx0 鹰眼 MCP** 与 **FofaMap MCP** 的深度适配。
 
 ---
 
@@ -122,7 +138,7 @@ Windows/Linux 真实桌面与完整视觉操作链仍需真机验收；Linux 桌
 # 若你是从源码编译： ./build/deepsentry --version
 ```
 
-应看到 `DeepSentry v2.0.5 Ultimate (build 日期)`。日期随你下载或自行编译的包变化。
+应看到 `DeepSentry v2.0.6 Ultimate (build 日期)`。日期随你下载或自行编译的包变化。
 
 | 你能直接用到的 | 说明 |
 | --- | --- |
@@ -134,9 +150,10 @@ Windows/Linux 真实桌面与完整视觉操作链仍需真机验收；Linux 桌
 | 网页巡检出 Word | 接上鹰眼后打开设备后台，说「生成报告」即可。不用写 JSON，不用安装 pandoc |
 | Word 版式 | 封面 + 先结论再细节和建议，截图跟在对应章节后面 |
 | 每天自动巡 | 无验证码的固定检查可定时跑；要人眼看验证码的，请从聊天里触发 |
-| 鹰眼 MCP 深度适配 | [Hx0 鹰眼](https://hx0studio.com/) 是我们做的浏览器自动化。DeepSentry 按 MCP 1.0.12 的 51 个工具做了点对点适配（登录、截图、验证码辅助、长页续读），不是通用转发 |
+| 鹰眼 MCP 深度适配 | [Hx0 鹰眼](https://hx0studio.com/) 是我们做的浏览器自动化。DeepSentry 按 扩展 1.0.7 / MCP Server 1.0.14 的 53 个工具做了点对点适配（登录、截图、验证码辅助、长页续读），不是通用转发 |
 | FofaMap MCP 深度适配 | [FofaMap](https://hx0studio.com/) 是我们做的 FOFA 资产测绘客户端。DeepSentry 按 v2.0.1 的 15 个工具做了点对点适配（账户、规则、搜索、翻页、导出），密钥仍留在 FofaMap 里 |
 | 视觉模型 | 常见多模态型号会自动识别截图；纯文本模型不会被硬塞图片 |
+| DeepSeek 搜索与思考 | 官方 Search API 按需加载；`/search on\|off` 切换联网；`/thinking on\|off\|low\|high\|max` 与 `/thinking budget 96k` 控制思考模式、强度和输出预算 |
 
 分步说明：[聊天机器人接入](docs/聊天机器人接入.md)、[终端接入与每日巡检](docs/终端接入与每日巡检.md)。鹰眼和 FofaMap 都是 **Hx0 自家产品**，通过 MCP 接到 DeepSentry；详细契约见 [鹰眼适配](docs/HawkEye-MCP-深度适配.md) 与 [FofaMap 适配](docs/FofaMap-MCP-适配.md)。
 
@@ -552,8 +569,17 @@ api_url: https://api.deepseek.com
 api_key: YOUR_API_KEY
 model_name: deepseek-flash
 vision_mode: auto
+thinking_mode: auto       # auto|enabled|disabled；DeepSeek 默认开启
+reasoning_effort: auto    # auto|low|high|max；也兼容 minimal/medium/xhigh/ultra
+user_id: ""               # 可选：DeepSeek 账号内用户隔离
+search:
+  enabled: true
+  count: 8
+  need_content: false
 agent_runtime: v3
 ```
+
+向导还会询问 DeepSeek 思考模式（默认开启/effort high，可选 max 或关闭）以及是否启用 DeepSeek Search。
 
 `vision_mode: auto` 使用精确模型目录判断图片能力。当前内置的多模态模型包括 `deepseek-flash`、`deepseek-v4-flash-vision-exp`、`glm-5.3-flash`、`MiniMax-M3`、`mimo-v2.6-pro`、`gpt-6-astra`、`gpt-6-sol`、`gpt-6-luna`、`grok-4.7`、`gpt-5.6`、`claude-opus-5-5`、`claude-fable-5-1`、`claude-sonnet-5`、`gemini-3.8-flash` 和 `qwen3.8-max`；选择这些模型无需手动开启图片输入。相近的纯文本型号仍保持关闭，避免把 MCP 截图错误发给不支持图片的接口。
 
@@ -770,6 +796,9 @@ benchmark_token: "YOUR_BENCHMARK_TOKEN"
 | `reserved_output_tokens` | 否 | 输出预留/上限；0 自动，不兼容 `max_tokens` 的网关会自动重试 |
 | `native_tool_limit` | 否 | 每轮直接暴露的内置工具数；0 自动，未暴露工具仍可经 `tool_catalog` 发现 |
 | `vision_mode` | 否 | `auto` 优先读取精确模型能力目录；自定义网关可显式设为 `enabled` 或 `disabled` |
+| `thinking_mode` | 否 | DeepSeek 思考模式：`auto`/`enabled` 保持默认开启，`disabled` 关闭思考 |
+| `reasoning_effort` | 否 | DeepSeek 推理强度：`low`/`high`/`max`；兼容 `minimal`/`medium`/`xhigh`/`ultra` 映射，`auto` 使用服务端默认 high |
+| `user_id` | 否 | 可选的 DeepSeek 账号内用户隔离标识，格式 `[A-Za-z0-9_-]{1,512}`，同时用于 KV Cache 与调度隔离 |
 | `llm_timeout_sec` | 否 | 单次 LLM 超时时间，建议 120 |
 | `llm_retries` | 否 | LLM 重试次数，建议 3 |
 
@@ -799,7 +828,7 @@ custom / qianfan-code-latest · ctx≈131.1K[安全默认]
 
 | provider | Base URL | 默认模型 | 自动图片能力 | 上下文目录值 |
 | --- | --- | --- | --- | --- |
-| `deepseek` | `https://api.deepseek.com` | `deepseek-flash` | 是 | 1,000,000 tokens |
+| `deepseek` | `https://api.deepseek.com` | `deepseek-flash` | 是 | 1,048,576 tokens |
 | `glm` | `https://open.bigmodel.cn/api/paas/v4` | `glm-5.3-flash` | 是 | 1,000,000 tokens |
 | `minimax` | `https://api.minimax.cn/v1` | `MiniMax-M3` | 是 | 1,000,000 tokens |
 | `mimo` | `https://token-plan-cn.xiaomimimo.com/v1` | `mimo-v2.6-pro` | 是 | 1,000,000 tokens |
@@ -809,6 +838,25 @@ custom / qianfan-code-latest · ctx≈131.1K[安全默认]
 | `anthropic` | `https://api.anthropic.com/v1` | `claude-opus-5-5` | 是 | 1,000,000 tokens |
 | `google` | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-3.8-flash` | 是 | 1,048,576 tokens |
 | `xai` | `https://api.x.ai/v1` | `grok-4.7` | 是 | 500,000 tokens |
+
+### DeepSeek 深度适配
+
+DeepSentry 按 DeepSeek 最新文档分别处理 Chat Completions、Responses API 和 Anthropic Messages API，不再只按通用 OpenAI 兼容接口猜测参数。
+
+| 能力 | 当前实现 |
+| --- | --- |
+| 思考模式 | `thinking_mode: auto/enabled/disabled`；Chat 发送 `thinking.type`，Responses 发送 `reasoning.effort`，Anthropic 发送 `thinking` + `output_config.effort` |
+| 推理强度 | `reasoning_effort: low/high/max`；`minimal→low`、`medium/xhigh→high`、`ultra→max`，`auto` 交给服务端默认 high |
+| 输出预算 | `deepseek-flash`/`deepseek-v4-pro` 默认思考 64K、max effort 128K、非思考 16K；上限 393,216 tokens。显式 `reserved_output_tokens` 优先 |
+| 上下文 | 按官方 `/models` 元数据使用 1,048,576 tokens；`deepseek-flash` 支持图片，`deepseek-v4-pro` 仅文本 |
+| 原生工具 | Chat、Responses、Anthropic 三种协议都发送真实函数 schema，并解析 `tool_calls` / `function_call` / `tool_use`；不再只依赖 JSON 动作兜底 |
+| 推理回传 | 工具调用链中的 `reasoning_content` / `reasoning` item / `thinking` block 会随历史回传，避免思考模式下的 400 |
+| 用户隔离 | `user_id` 映射到 Chat 顶层 `user_id`、Responses `user`、Anthropic `metadata.user_id` |
+| 端点 | Chat `https://api.deepseek.com/chat/completions`；Responses `https://api.deepseek.com/responses`；Anthropic `https://api.deepseek.com/anthropic/v1/messages`，可从裸 `api_url` 自动补全 |
+| 结束原因 | 识别 `length`、`content_filter`、`insufficient_system_resource`、`aborted`，保留已返回内容与 usage，避免把截断响应当成成功 |
+| 图片限制 | 单张 20 MiB、单条 40 MiB 原始图片；DeepSeek 的 48 MiB 请求体会在发送前按 base64 后的实际大小检查并直接拒绝 |
+
+`/thinking` 可查看或切换思考模式、推理强度和输出预算：`/thinking off` 关闭思考，`/thinking max` 开启并提升到 max，`/thinking budget 96k` 显式设置单次输出预算，`/thinking budget auto` 恢复按文档默认（思考 64K、max 128K、非思考 16K）。切换会写入 `config.yaml` 并立即影响后续请求。详细字段、协议差异和已验证行为见 [DeepSeek 深度适配](docs/DeepSeek-适配.md)。
 
 OpenAI 新配置默认 `gpt-6-astra`，模型候选另有 `gpt-6-sol` 与 `gpt-6-luna`，均走 Responses API。Claude 走官方 Messages 接口（`https://api.anthropic.com/v1/messages`，`anthropic-version: 2023-06-01`）。`claude-opus-5-5` / `claude-fable-5-1` / `claude-sonnet-5` 使用 adaptive thinking，DeepSentry 默认预留 64K `max_tokens` 并解析 `thinking` 块；Opus 5.5 使用 `medium` effort，其他上述 Claude 5 模型使用 `high`。`claude-haiku-4-5` 仍按普通输出额度。Gemini 继续用官方 OpenAI 兼容端点 `.../v1beta/openai`。千问默认已切到旗舰 `qwen3.8-max`。
 
@@ -871,6 +919,7 @@ sglang, localai, custom
 | --- | --- | --- |
 | 本地 | `target_protocol: local` | 所有命令在控制端本机执行 |
 | SSH | `target_protocol: ssh`、`ssh_host`、`ssh_user` | 推荐模式，支持 Shell 和文件读写 |
+| SFTP | `target_protocol: sftp`，使用 `ssh_host/ssh_user/ssh_key_path` 等 SSH 认证字段 | 仅文件服务，不需要远程 Shell；支持目录属性、读取、上传与完整下载 |
 | Telnet | `target_protocol: telnet`、`telnet_host` | 支持 Huawei VRP、H3C Comware、Ruijie RGOS、Cisco IOS 和 Linux Telnet；认证与命令 Prompt 分离、自动识别分页 |
 | FTP/FTPS | `target_protocol: ftp`、`ftp_host` | 仅文件/目录能力；支持显式/隐式 TLS 和主动/被动数据通道，无 Shell |
 | Fleet | `targets[]` | 多台目标批量运维 |
@@ -890,7 +939,7 @@ sglang, localai, custom
 | `archive_max_total_bytes` | 单次归档解压后的最大总字节数，用于限制解压炸弹 |
 | `ssh_host_key_policy` | SSH 主机密钥策略：`strict`、`accept-new` 或 `insecure`；生产环境推荐前两种 |
 | `ssh_known_hosts_path` | 自定义 SSH `known_hosts` 文件路径 |
-| `ssh_legacy_compat` | 默认 `true`。兼容老 OpenSSH / 交换机 / 防火墙的 `ssh-rsa`、DH-SHA1、CBC；仅现代算法时设 `false` |
+| `ssh_legacy_compat` | 默认 `true`。兼容旧 SSH2 的 RSA/DSA、DH-SHA1/GEX、AES-128/192/256-CBC、3DES、HMAC-MD5/MD5-96；现代优先。仅现代算法时设 `false` |
 | `ssh_connect_timeout_sec` | SSH 握手超时，默认 25 秒，老设备可加大 |
 | `ssh_key_passphrase` | 加密私钥口令；未加密私钥可留空 |
 | `telnet_prompt` | 老设备 Telnet 命令提示符；自动识别不稳定时显式配置 |
@@ -908,7 +957,7 @@ sglang, localai, custom
 
 ### 浏览器级网页能力
 
-已连接 HawkEye MCP 1.0.12 时，打开/播放真实网页（尤其 B 站、倍速、全屏）走 HawkEye，**不要**用内置 `browser_browse`。B 站播放任务先 `load_skill("bilibili-play")`：按 URL 导航、合集用 `?p=N`、倍速设 `video.playbackRate`、全屏 `press_key f`、黑屏截图改用 canvas 抓帧。大页面续读只传 `page_token`；验证码走 `browser_captcha_assist`。详见 [DeepSentry × Hx0 HawkEye MCP 深度适配](docs/HawkEye-MCP-深度适配.md)。
+已连接 HawkEye 扩展 1.0.7 / MCP Server 1.0.14 时，打开/播放真实网页（尤其 B 站、倍速、全屏）走 HawkEye，**不要**用内置 `browser_browse`。B 站播放任务先 `load_skill("bilibili-play")`：按 URL 导航、合集用 `?p=N`、倍速设 `video.playbackRate`、全屏 `press_key f`、黑屏截图改用 canvas 抓帧。大页面续读只传 `page_token`；验证码走 `browser_captcha_assist`。详见 [DeepSentry × Hx0 HawkEye MCP 深度适配](docs/HawkEye-MCP-深度适配.md)。
 
 未连接 HawkEye 时，Agent 才优先调用 `browser_browse`，创建一个可持续复用的隔离浏览器会话：
 
@@ -936,7 +985,12 @@ DeepSentry 内置 `config_manage` 工具，Agent 可以在用户明确要求时�
 | 需求 | 工具动作 |
 | --- | --- |
 | 查看当前配置摘要 | `action=status`；兼容 `view/show/list/overview` |
-| 读取指定配置项 | `action=get`，参数 `key` |
+| 读取指定配置项/SSH 摘要 | `action=get`，参数 `key`；SSH 使用 `key=ssh`，模型链可传 `model_id` |
+| 查看字段和分组 | `action=describe`，可传 `key=ssh/balance_query/execution_budget/models` |
+| 一次局部修改关联字段 | `action=patch`，参数 `changes` JSON 对象；模型链用 `model_id=primary` 或 ID |
+| 只校验预览修改 | 在修改动作上加 `dry_run=true`，不写入、不备份、不重载 |
+| 验证保存的 SSH 认证 | `action=probe_ssh`；可指定 Fleet `name`，不执行命令、不切换当前连接 |
+| 测试候选控制端代理 | `action=probe_proxy`，参数 `value`；HEAD 只验证路由，不发送 API key |
 | 校验 YAML 是否可读 | `action=validate` |
 | 手动创建备份 | `action=backup` |
 | 添加外部 Skill 目录 | `action=add_skill_source`，参数 `source`，也兼容 `path/dir` 表示 Skill 目录 |
@@ -949,7 +1003,7 @@ DeepSentry 内置 `config_manage` 工具，Agent 可以在用户明确要求时�
 | 仅启用一个 Skill | TUI 使用 `/skill only <name>`；该命令会打开全局 Skill 开关、启用指定 Skill，并禁用其余已发现 Skill |
 | 添加/更新 Fleet 目标 | `action=add_target`，参数 `protocol/host/user/password/key_path/tags` |
 | 将已有单台配置转为 Fleet | `action=enable_fleet`，会把当前单台目标纳入 `targets` 并切到控制端模式 |
-| 设置单台 SSH 目标 | `action=set_ssh`，参数 `host/user/password/key_path` |
+| 设置/局部修改单台 SSH | `action=set_ssh`；首次提供 `host/user/password/key_path`，同主机可只传 `port` 并保留未指定字段 |
 | 修改允许的单值字段 | `action=set`，参数 `key/value` |
 | 修复并替换整份配置 | `action=replace_yaml`，参数 `content` |
 
@@ -965,7 +1019,9 @@ DeepSentry 内置 `config_manage` 工具，Agent 可以在用户明确要求时�
 
 工具输出会隐藏密码、Token、Secret 等敏感值，但配置文件本身仍可能包含凭据，请保护好 `config.yaml` 和备份目录。
 
-如果 `config.yaml` 已经损坏到无法解析，Agent 可以读取原文件、生成修复后的完整 YAML，再用 `replace_yaml` 校验并替换；替换前仍会保留旧文件备份。
+常规更新使用 `set/patch`，保留其他配置和注释。若 `config.yaml` 已损坏，依据用户提供的有效配置使用 `replace_yaml` 校验并替换，替换前保留旧文件备份；不能绕过保护用 Shell/文件工具读取密钥或重写配置。
+
+保存 SSH 目标不会自动切换已有连接，工具明确报告保存值和当前连接的区别；主模型/代理设置供后续新请求读取，初始化的 MCP/主题等需重启。配置与连接的验证范围见 [验证说明](docs/Verification-2.0.6.md)。
 
 ### 不想把密钥写进 config.yaml？
 
@@ -1179,6 +1235,10 @@ TUI 是默认模式：
 | `/clear` | 清屏 |
 | `/status` | 查看状态 |
 | `/cost` | 查看 token 使用量 |
+| `/balance` | 查看当前账户余额；`/balance refresh` 手动刷新 |
+| `/search [on\|off\|status]` | 开启/关闭 DeepSeek 联网搜索并写入配置；默认按需加载，关闭后 `web_search` 不进入工具目录 |
+| `/thinking [status\|on\|off\|low\|high\|max\|auto\|budget <tokens\|64k\|auto>]` | 查看或切换 DeepSeek 思考模式、推理强度与单次输出预算；切换写入 `config.yaml` 并立即生效 |
+| `/copy` | 复制原始命令（无边框、时间戳和屏幕折行）；`/copy code` 复制最新报告代码块 |
 | `/model` | 查看当前模型 |
 | `/image [路径]` | 附加图片；省略路径读取系统图片剪贴板，可连续附加后输入问题并发送 |
 | `/compact` | 压缩长上下文提示 |
@@ -1208,10 +1268,10 @@ TUI 是默认模式：
 
 - `task_wait`：可中止的程序内等待，支持延时、文件存在、预期大小/校验和验证；不以文件暂时停止增长冒充下载完成。
 - `task_context`：保存长任务目标、进度、下一步、等待条件和已执行操作，随 checkpoint 恢复。
-- `computer_use`：本机桌面截图和鼠标键盘，支持 Windows、macOS（配套 helper）、Linux X11（xdotool + ImageMagick）；视觉模型闭环、会话独占、防重复执行。平台准备与限制见 [电脑操作说明](docs/Computer-Use.md)。
+- `computer_use`：本机桌面截图和鼠标键盘，macOS/Windows 支持按文字或角色 query 定向查找与 AX/UIA 元素操作，Linux X11 使用 xdotool + ImageMagick；视觉模型闭环、会话独占、防重复执行。平台准备与限制见 [电脑操作说明](docs/Computer-Use.md)。
 
 
-当前版本注册 77 个内置工具。它们由 Go 原生实现或统一调度，Agent 会按需发现和调用，不会每轮把全部工具塞进 prompt。
+当前版本注册 79 个内置工具。它们由 Go 原生实现或统一调度，Agent 会按需发现和调用，不会每轮把全部工具塞进 prompt。
 
 ### 按场景分类
 
@@ -1223,10 +1283,11 @@ TUI 是默认模式：
 | 系统应急 | `mem_info`、`process_list`、`target_health_summary`、`disk_usage`、`file_tail`、`login_audit`、`service_units`、`file_hash` |
 | 确定性工作流 | `host_incident_baseline`、`webshell_hunt`、`competition_answer_check` |
 | 取证分析 | `file_ident`、`file_strings`、`read_gzip`、`read_log`、`pcap_analyze`、`sqlite_inspect`、`zip_password_recover` |
-| 文档解析 | `document_parse` |
+| 文档解析与生成 | `document_parse`、`document_create` |
 | 聊天文件 | `chat_send_file` |
 | 端口和内网 | `nmap_scan`、`cidr_scan`、`netcat_probe`、`service_fingerprint` |
 | HTTP / Web | `http_probe`、`http_fetch`、`web_snapshot`、`headless_browser`、`browser_browse`、`browser_interact` |
+| 联网搜索 | `web_search`（DeepSeek Search API，按需加载） |
 | 抓包和流量 | `flow_snapshot`、`packet_capture` |
 | 进程与连接关联 | `proc_socket_map` |
 | 数据库探测 | `redis_probe`、`mysql_probe`、`postgres_probe`、`oracle_probe` |
@@ -1280,6 +1341,26 @@ enabled_tools:
   - read_log
   - secret_scan
 ```
+
+### DeepSeek 联网搜索
+
+`web_search` 封装 DeepSeek 官方 Search API（`POST https://api.deepseek.com/v1/tools/search`），用于补充实时网页、新闻、版本发布和漏洞公告证据。它不在固定 schema 中，只有任务需要联网检索时才通过 `tool_catalog` 发现并加载；普通单页读取仍优先 `http_fetch`。
+
+```yaml
+search:
+  enabled: true          # DeepSeek 主模型默认开启
+  base_url: ""           # 留空使用 https://api.deepseek.com
+  api_key: ""            # 留空复用 DeepSeek 主模型 api_key
+  count: 8               # 1-50
+  need_content: false    # 需要核对原文时再开启
+  timeout_sec: 20
+```
+
+TUI 输入 `/search` 查看状态，`/search on` 或 `/search off` 热切换并写回 `config.yaml`；初始化向导也会询问一次。关闭后 `web_search` 从工具目录和原生 schema 中消失，Agent 无法再发起搜索。
+
+Search 按成功请求计费（5 元/1000 次，`count` 不影响单价），查询词会发送到 DeepSeek。主模型不是 DeepSeek 时，必须显式配置 `search.api_key`，不会把其它厂商的 Key 发给 DeepSeek。支持 `site:`、`-site:`、`-词`、`"精确短语"`、`lang:`、`after:`、`before:` 等检索语法；返回结果必须保留 URL 作为来源。
+
+字段、错误码、限速和验证方法见 [DeepSeek 联网搜索](docs/DeepSeek-Search.md)。
 
 ---
 
@@ -1659,7 +1740,7 @@ mcp_servers:
 
 Agent 会协商 MCP 协议并分页读取 Tools、Resources、Resource Templates 与 Prompts；`list_changed` 会原子热刷新能力。MCP Tools 使用 Server 提供的 JSON Schema 作为一等原生函数暴露；紧凑 profile 会把有限 schema 预算分给与当前任务最相关及已经调用过的 MCP 工具，其余工具仍可通过 `agent_action` 按需调用。工具使用 `<server>__<tool>` 规范名，只有不冲突时才提供短别名，避免多个 Server 同名工具互相覆盖。
 
-HawkEye MCP 会启用 1.0.12 全部 51 工具的本地能力契约，而不只是通用 MCP 转发：紧凑模型会按当前意图选中抓包、拦截、Research、真实手势、视觉、播放、验证码或审计工具链；默认超时按工具提升到 100/130/205 秒。HawkEye 已连通时覆盖内置 `browser_browse`。B 站播放先加载 `bilibili-play`：倍速用 `video.playbackRate`，全屏用 `press_key f`，合集用 `?p=N`，全屏黑屏用 canvas 抓帧。常规浏览、标签页新建/选中、点击输入、trusted input、播放校验 JS、抓包启停以及拦截启停不再打断 Agent 弹确认；仅 Scope 变更、Replay/Fuzz、请求放行/丢弃、上传和任意 JS 等真正高风险动作保留强确认。需 `userActivation` 时明确使用 `clickMode/inputMode=trusted`，大页面把 `next_page_token` 作为 `page_token` 单独续读（1.0.12 拒绝数字 `cursor`）；拦截任务必须 `disable` 收尾，连接关闭时还有最后的防挂起清理。HawkEye 或其他 MCP 返回的图片会保存到 `reports/mcp-artifacts/`（可用 `DEEPSENTRY_MCP_ARTIFACT_DIR` 覆盖），校验哈希后作为下一轮视觉输入。安装、工具矩阵、工作流和 Firefox 真实输入排障见 [DeepSentry × Hx0 HawkEye MCP 深度适配](docs/HawkEye-MCP-深度适配.md)。
+HawkEye MCP 会启用 MCP Server 1.0.14 全部 53 工具的本地能力契约，而不只是通用 MCP 转发：最新上游服务文件的 `TOOLS` schema 已逐字节核对，53/53 工具同名同 schema；唯一上游差异是公开文件不含 DeepSentry 的 `DEEPSENTRY_MCP_PARENT_PID` 生命周期补丁，本仓库保留该补丁。紧凑模型会按当前意图选中抓包、拦截、Research、真实手势、视觉、播放、验证码或审计工具链；默认超时按工具提升到 100/130/205 秒，文件上传下载和 Codec 使用 130 秒，表单/题目/历史/主动请求/脚本/扫描使用 100 秒。HawkEye 已连通时覆盖内置 `browser_browse`。B 站播放先加载 `bilibili-play`：倍速用 `video.playbackRate`，全屏用 `press_key f`，合集用 `?p=N`，全屏黑屏用 canvas 抓帧。常规浏览、标签页新建/选中、点击输入、trusted input、播放校验 JS、抓包启停以及拦截启停不再打断 Agent 弹确认；`browser_fill_form submit=true` 和 `browser_handle_dialog accept` 会确认副作用；Scope 变更、Replay/Fuzz、请求放行/丢弃、上传和任意 JS 等真正高风险动作保留强确认。需 `userActivation` 时明确使用 `clickMode/inputMode=trusted`，大页面把 `next_page_token` 作为 `page_token` 单独续读（1.0.14 拒绝数字 `cursor`）；拦截任务必须 `disable` 收尾，连接关闭时还有最后的防挂起清理。HawkEye 或其他 MCP 返回的图片会保存到 `reports/mcp-artifacts/`（可用 `DEEPSENTRY_MCP_ARTIFACT_DIR` 覆盖），校验哈希后作为下一轮视觉输入。安装、工具矩阵、工作流和 Firefox 真实输入排障见 [DeepSentry × Hx0 HawkEye MCP 深度适配](docs/HawkEye-MCP-深度适配.md)。
 
 FofaMap MCP 会启用 v2.0.1 全部 15 个工具的本地契约：资产查询先检查账户/字段，产品规则使用 `fofa_rules` 返回的 `app=`，查询先 `fofa_validate_query` 再 `fofa_search`，翻页原样传递 `next_cursor`（也接受该字段作为 `cursor` 别名）。`fofa_export`/`nuclei_plan` 的嵌套 `request` 可由扁平 `query`/`targets` 自动包装。只有用户明确授权主动扫描时才走 `nuclei_plan → 人工确认 → nuclei_execute`；查询类低风险、导出/计划中风险、执行扫描高风险。连接后先 `load_skill("fofamap")`。安装、密钥边界、stdio/HTTP 配置和完整工具矩阵见 [DeepSentry × FofaMap MCP 适配](docs/FofaMap-MCP-适配.md)。
 
@@ -1847,7 +1928,7 @@ email_from: "deepsentry@example.com"
 
 ### 环境要求
 
-- Go 1.26.8 或更高版本。
+- Go 1.26.9 或更高版本。
 - macOS、Linux 或 Windows。
 - 如需远程模式，需要目标 SSH/Telnet/FTP 可达。
 
@@ -2082,7 +2163,7 @@ internal/security/      命令风险评估
 docs/操作手册.md          详细中文操作手册
 docs/聊天机器人接入.md    通讯工具绑定与指令
 docs/终端接入与每日巡检.md  无桌面绑定与巡检流程
-hawkeye-mcp-server.mjs   随附的 Hx0 鹰眼 MCP Server 1.0.12
+hawkeye-mcp-server.mjs   随附的 Hx0 鹰眼 MCP Server 1.0.14（扩展1.0.7）
 inspection.example.yaml  巡检设备清单（聊天 + 可选固定采集）
 config.example.yaml      配置模板
 build.sh                 一键交叉编译脚本
@@ -2098,11 +2179,14 @@ build.sh                 一键交叉编译脚本
 
 ## Credits
 
-DeepSentry v2.0.5 Ultimate is developed by [Hx0 Studio](https://hx0studio.com/).
+DeepSentry v2.0.6 Ultimate is developed by [Hx0 Studio](https://hx0studio.com/).
 
 同一工作室的配套产品：
 
-- [鹰眼 HawkEye](https://hx0studio.com/)：浏览器自动化，DeepSentry 已深度适配其 MCP 1.0.12
+- [鹰眼 HawkEye](https://hx0studio.com/)：浏览器自动化，DeepSentry 已深度适配其扩展1.0.7 / MCP 1.0.14
 - [FofaMap](https://hx0studio.com/)：FOFA 资产测绘客户端，DeepSentry 已深度适配其 MCP v2.0.1
 
 Author: asaotomo
+
+
+远程连接支持 SSH/SFTP、FTP/FTPS、Telnet 与代理转发；协议兼容、主机密钥策略和传输限制见 [远程连接说明](docs/Remote-Connections.md)。

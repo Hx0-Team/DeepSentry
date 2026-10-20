@@ -10,7 +10,7 @@ import (
 )
 
 func SQLiteInspect(rt Runtime, path string) (string, error) {
-	data, err := readTargetLimited(path, 8<<20)
+	data, err := rt.readTargetLimited(path, 8<<20)
 	if err != nil {
 		return "", err
 	}
@@ -52,11 +52,11 @@ func AppConfigDiscover(rt Runtime, roots, query string, limit int) (string, erro
 		if root == "" {
 			continue
 		}
-		walkTarget(root, 0, 3, limit, func(path string, isDir bool) bool {
+		rt.walkTarget(root, 0, 3, limit, func(path string, isDir bool) bool {
 			if isDir || !looksConfigFile(path, patterns) {
 				return true
 			}
-			data, err := readTargetLimited(path, 512*1024)
+			data, err := rt.readTargetLimited(path, 512*1024)
 			if err != nil {
 				return true
 			}
@@ -88,7 +88,7 @@ func DBConfigAudit(rt Runtime, dbType, paths string) (string, error) {
 	b.WriteString(fmt.Sprintf("%s 数据库配置审计 type=%s\n", rt.tag(), emptyDefault(dbType, "auto")))
 	found := 0
 	for _, path := range candidates {
-		data, err := readTargetLimited(path, 1024*1024)
+		data, err := rt.readTargetLimited(path, 1024*1024)
 		if err != nil {
 			continue
 		}
@@ -130,11 +130,11 @@ func SecretScan(rt Runtime, root, pattern string, limit int) (string, error) {
 		rules = map[string]*regexp.Regexp{"custom": re}
 	}
 	var hits []string
-	walkTarget(root, 0, 3, limit, func(path string, isDir bool) bool {
+	rt.walkTarget(root, 0, 3, limit, func(path string, isDir bool) bool {
 		if isDir || isLikelyBinaryName(path) {
 			return true
 		}
-		data, err := readTargetLimited(path, 512*1024)
+		data, err := rt.readTargetLimited(path, 512*1024)
 		if err != nil {
 			return true
 		}
@@ -167,11 +167,11 @@ func ServiceUnitAudit(rt Runtime, query string, limit int) (string, error) {
 	roots := []string{"/etc/systemd/system", "/lib/systemd/system", "/usr/lib/systemd/system", "/etc/init.d", "/etc/cron.d"}
 	var hits []string
 	for _, root := range roots {
-		if !walkTarget(root, 0, 2, limit, func(path string, isDir bool) bool {
+		if !rt.walkTarget(root, 0, 2, limit, func(path string, isDir bool) bool {
 			if isDir {
 				return true
 			}
-			data, err := readTargetLimited(path, 512*1024)
+			data, err := rt.readTargetLimited(path, 512*1024)
 			if err != nil {
 				return true
 			}
@@ -209,7 +209,7 @@ func ContainerInventory(rt Runtime) (string, error) {
 	paths := []string{"/proc/1/cgroup", "/proc/self/mountinfo", "/.dockerenv", "/run/.containerenv"}
 	found := false
 	for _, path := range paths {
-		data, err := readTargetLimited(path, 256*1024)
+		data, err := rt.readTargetLimited(path, 256*1024)
 		if err != nil {
 			continue
 		}
@@ -241,11 +241,11 @@ func extractSQLiteSchemaStrings(data []byte) []string {
 	return out
 }
 
-func walkTarget(root string, depth, maxDepth, maxHits int, visit func(path string, isDir bool) bool) bool {
+func (rt Runtime) walkTarget(root string, depth, maxDepth, maxHits int, visit func(path string, isDir bool) bool) bool {
 	if depth > maxDepth {
 		return true
 	}
-	entries, err := listTarget(root)
+	entries, err := rt.listTarget(root)
 	if err != nil {
 		return true
 	}
@@ -254,12 +254,12 @@ func walkTarget(root string, depth, maxDepth, maxHits int, visit func(path strin
 			continue
 		}
 		full := filepath.Join(root, name)
-		isDir := isTargetDir(full)
+		isDir := rt.isTargetDir(full)
 		if !visit(full, isDir) {
 			return false
 		}
 		if isDir && depth < maxDepth && !skipWalkDir(name) {
-			if !walkTarget(full, depth+1, maxDepth, maxHits, visit) {
+			if !rt.walkTarget(full, depth+1, maxDepth, maxHits, visit) {
 				return false
 			}
 		}

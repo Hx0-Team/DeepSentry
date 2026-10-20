@@ -4,8 +4,12 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
+
+	"ai-edr/internal/harness"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -14,10 +18,11 @@ func (m *AgentModel) mouseToContentCoord(x, y int) (row, col int, ok bool) {
 	if bodyH <= 0 {
 		bodyH = max(4, m.height-6)
 	}
-	if y < 1 || y > bodyH {
+	top := m.frameLayout().headerHeight
+	if y < top || y >= top+bodyH {
 		return 0, 0, false
 	}
-	row = m.viewport.YOffset + (y - 1)
+	row = m.viewport.YOffset + (y - top)
 	col = x - 1
 	if col < 0 {
 		col = 0
@@ -34,6 +39,73 @@ func (m *AgentModel) mouseToContentCoord(x, y int) (row, col int, ok bool) {
 		col = lineW - 1
 	}
 	return row, col, true
+}
+
+func (m *AgentModel) noteCopyCommand(action *harness.AgentAction) {
+	if action == nil || strings.TrimSpace(action.Command) == "" || len(m.lines) == 0 {
+		return
+	}
+	redacted := harness.RedactedAction(*action)
+	m.lines[len(m.lines)-1].copyCommand = sanitizeCopyPayload(redacted.Command)
+}
+
+func (m AgentModel) lastCopyPayload(kind string) string {
+	if kind != "code" {
+		for i := len(m.lines) - 1; i >= 0; i-- {
+			if m.lines[i].copyCommand != "" {
+				return m.lines[i].copyCommand
+			}
+		}
+		if kind == "command" {
+			return ""
+		}
+	}
+	for i := len(m.lines) - 1; i >= 0; i-- {
+		if m.lines[i].kind != "success" && m.lines[i].kind != "ask" {
+			continue
+		}
+		text := m.lines[i].raw
+		if text == "" {
+			text = m.lines[i].content
+		}
+		if code := lastFencedCode(text); code != "" {
+			return code
+		}
+	}
+	return ""
+}
+
+func lastFencedCode(text string) string {
+	var code []string
+	last := ""
+	inFence := false
+	for _, line := range strings.Split(sanitizeCopyPayload(text), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			if inFence {
+				last = strings.Join(code, "\n")
+			}
+			inFence = !inFence
+			code = nil
+			continue
+		}
+		if inFence {
+			code = append(code, line)
+		}
+	}
+	return last
+}
+
+func sanitizeCopyPayload(text string) string {
+	text = strings.ReplaceAll(ansi.Strip(text), "\r\n", "\n")
+	var out strings.Builder
+	for _, r := range text {
+		// Tabs are source indentation. Rendering expands them to cells, but
+		// original-copy must not change them into spaces or add UI padding.
+		if r == '\n' || r == '\t' || (!unicode.IsControl(r) && r != 0x7f && !isUnsafeFormatRune(r)) {
+			out.WriteRune(r)
+		}
+	}
+	return out.String()
 }
 
 func (m *AgentModel) hasCopySelection() bool {

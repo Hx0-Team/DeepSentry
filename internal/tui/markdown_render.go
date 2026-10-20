@@ -13,16 +13,18 @@ import (
 )
 
 var (
-	mdH1Style      = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	mdH2Style      = lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
-	mdH3Style      = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
-	mdBoldStyle    = lipgloss.NewStyle().Bold(true).Foreground(colorText)
-	mdCodeStyle    = lipgloss.NewStyle().Foreground(colorYellow).Background(colorSurface)
-	mdMutedStyle   = lipgloss.NewStyle().Foreground(colorMuted)
-	mdTableBorder  = lipgloss.NewStyle().Foreground(colorBorder)
-	mdTableHeader  = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	mdListMarker   = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	mdNumberedList = regexp.MustCompile(`^\s*(\d+)[.)]\s+(.+)$`)
+	mdH1Style          = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	mdH2Style          = lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
+	mdH3Style          = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
+	mdBoldStyle        = lipgloss.NewStyle().Bold(true).Foreground(colorText)
+	mdCodeStyle        = lipgloss.NewStyle().Foreground(colorYellow).Background(colorSurface)
+	mdCodeBodyStyle    = lipgloss.NewStyle().Foreground(colorText)
+	mdCodeCommentStyle = lipgloss.NewStyle().Foreground(colorMuted)
+	mdMutedStyle       = lipgloss.NewStyle().Foreground(colorMuted)
+	mdTableBorder      = lipgloss.NewStyle().Foreground(colorBorder)
+	mdTableHeader      = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	mdListMarker       = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	mdNumberedList     = regexp.MustCompile(`^\s*(\d+)[.)]\s+(.+)$`)
 )
 
 func renderMarkdownReport(markdown string, width int) string {
@@ -54,7 +56,7 @@ func renderMarkdownConfirm(markdown, timestamp string, width int) string {
 		width = 80
 	}
 	innerW := max(1, width-styleConfirmBox.GetHorizontalFrameSize())
-	header := mdH2Style.Render(sanitizeTUIText(timestamp) + "⚠ 需要确认")
+	header := styleWarning.Render(sanitizeTUIText(timestamp) + "⚠ 需要确认")
 	body := renderMarkdownBlocks(markdown, innerW)
 	footer := mdBoldStyle.Render("Y 本次 · A 会话同类 · S 本次会话允许所有高危操作") + "\n" +
 		mdBoldStyle.Render("N/Esc 拒绝 · Enter 拒绝")
@@ -80,13 +82,14 @@ func renderMarkdownBlocks(markdown string, width int) string {
 		}
 
 		if strings.HasPrefix(trimmed, "```") {
+			language := strings.TrimSpace(strings.TrimPrefix(trimmed, "```"))
 			code := make([]string, 0)
 			i++
 			for i < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[i]), "```") {
 				code = append(code, lines[i])
 				i++
 			}
-			out = append(out, renderCodeBlock(code, width))
+			out = append(out, renderCodeBlockLanguage(code, width, language))
 			continue
 		}
 
@@ -115,12 +118,7 @@ func renderMarkdownBlocks(markdown string, width int) string {
 			continue
 		}
 
-		plain := markdownInlinePlain(trimmed)
-		if displayWidth(plain) <= width {
-			out = append(out, renderInlineMarkdown(trimmed))
-			continue
-		}
-		out = append(out, strings.Split(wrapDisplay(plain, width), "\n")...)
+		out = append(out, strings.Split(wrapDisplay(renderInlineMarkdown(trimmed), max(1, width)), "\n")...)
 	}
 	return strings.TrimRight(strings.Join(out, "\n"), "\n")
 }
@@ -144,16 +142,13 @@ func renderMarkdownHeading(level int, text string, width int) string {
 	switch {
 	case level <= 1:
 		marker := "=="
-		label := truncateDisplay(text, max(4, width-displayWidth(marker)-1), "…")
-		return mdH1Style.Render(marker + " " + label)
+		return wrapDisplay(mdH1Style.Render(marker+" "+text), max(1, width))
 	case level == 2:
 		marker := "--"
-		label := truncateDisplay(text, max(4, width-displayWidth(marker)-1), "…")
-		return mdH2Style.Render(marker + " " + label)
+		return wrapDisplay(mdH2Style.Render(marker+" "+text), max(1, width))
 	default:
 		marker := ">"
-		label := truncateDisplay(text, max(4, width-displayWidth(marker)-1), "…")
-		return mdH3Style.Render(marker + " " + label)
+		return wrapDisplay(mdH3Style.Render(marker+" "+text), max(1, width))
 	}
 }
 
@@ -200,28 +195,30 @@ func parseMarkdownList(line string) (string, string, bool) {
 }
 
 func renderMarkdownListItem(marker, text string, width int) string {
-	markerW := displayWidth(marker) + 2
-	bodyW := max(8, width-markerW)
-	wrapped := strings.Split(wrapDisplay(markdownInlinePlain(text), bodyW), "\n")
+	markerW := displayWidth(marker) + 1
+	if width <= markerW {
+		return wrapDisplay(renderInlineMarkdown(marker+" "+text), max(1, width))
+	}
+	bodyW := max(1, width-markerW)
+	wrapped := strings.Split(wrapDisplay(renderInlineMarkdown(text), bodyW), "\n")
 	for i, line := range wrapped {
 		if i == 0 {
-			wrapped[i] = mdListMarker.Render(marker) + " " + renderInlineMarkdown(line)
+			wrapped[i] = mdListMarker.Render(marker) + " " + line
 		} else {
-			wrapped[i] = strings.Repeat(" ", markerW) + renderInlineMarkdown(line)
+			wrapped[i] = strings.Repeat(" ", markerW) + line
 		}
 	}
 	return strings.Join(wrapped, "\n")
 }
 
 func renderInlineMarkdown(line string) string {
-	line = normalizeEmojiSpacing(line)
 	var b strings.Builder
 	for len(line) > 0 {
 		codeStart := strings.Index(line, "`")
 		boldStart := strings.Index(line, "**")
 		switch {
 		case codeStart >= 0 && (boldStart < 0 || codeStart < boldStart):
-			b.WriteString(line[:codeStart])
+			b.WriteString(normalizeEmojiSpacing(line[:codeStart]))
 			rest := line[codeStart+1:]
 			if end := strings.Index(rest, "`"); end >= 0 {
 				b.WriteString(mdCodeStyle.Render(rest[:end]))
@@ -231,17 +228,17 @@ func renderInlineMarkdown(line string) string {
 				line = ""
 			}
 		case boldStart >= 0:
-			b.WriteString(line[:boldStart])
+			b.WriteString(normalizeEmojiSpacing(line[:boldStart]))
 			rest := line[boldStart+2:]
 			if end := strings.Index(rest, "**"); end >= 0 {
-				b.WriteString(mdBoldStyle.Render(rest[:end]))
+				b.WriteString(mdBoldStyle.Render(normalizeEmojiSpacing(rest[:end])))
 				line = rest[end+2:]
 			} else {
 				b.WriteString("**" + rest)
 				line = ""
 			}
 		default:
-			b.WriteString(line)
+			b.WriteString(normalizeEmojiSpacing(line))
 			line = ""
 		}
 	}
@@ -249,23 +246,7 @@ func renderInlineMarkdown(line string) string {
 }
 
 func markdownInlinePlain(line string) string {
-	line = strings.ReplaceAll(line, "**", "")
-	line = strings.ReplaceAll(line, "`", "")
-	return normalizeEmojiSpacing(ui.TerminalText(line))
-}
-
-func renderCodeBlock(lines []string, width int) string {
-	if len(lines) == 0 {
-		return ""
-	}
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		wrapped := strings.Split(wrapDisplay(sanitizeTUIText(line), max(1, width)), "\n")
-		for _, part := range wrapped {
-			out = append(out, mdCodeStyle.Render(part))
-		}
-	}
-	return strings.Join(out, "\n")
+	return stripANSI(renderInlineMarkdown(ui.TerminalText(line)))
 }
 
 func isMarkdownTableStart(lines []string, i int) bool {

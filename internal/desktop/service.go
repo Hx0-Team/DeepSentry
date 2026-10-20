@@ -36,54 +36,84 @@ type State struct {
 // Element is one accessibility node from the focused window. Path is the
 // helper's private child index and is never sent to the model.
 type Element struct {
-	Index    int    `json:"index"`
-	Role     string `json:"role"`
-	Name     string `json:"name,omitempty"`
-	Press    bool   `json:"press,omitempty"`
-	Settable bool   `json:"settable,omitempty"`
-	X        int    `json:"x"`
-	Y        int    `json:"y"`
-	W        int    `json:"w"`
-	H        int    `json:"h"`
-	Path     string `json:"-"`
+	Index       int    `json:"index"`
+	Role        string `json:"role"`
+	Name        string `json:"name,omitempty"`
+	Press       bool   `json:"press,omitempty"`
+	Settable    bool   `json:"settable,omitempty"`
+	Value       string `json:"value,omitempty"`
+	Identity    string `json:"-"`
+	Description string `json:"-"`
+	Enabled     *bool  `json:"enabled,omitempty"`
+	Focused     bool   `json:"focused,omitempty"`
+	Secure      bool   `json:"secure,omitempty"`
+	X           int    `json:"x"`
+	Y           int    `json:"y"`
+	W           int    `json:"w"`
+	H           int    `json:"h"`
+	Path        string `json:"-"`
+	frame       [4]int
 }
 
 func (e *Element) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Index    int    `json:"index"`
-		Role     string `json:"role"`
-		Name     string `json:"name"`
-		Press    bool   `json:"press"`
-		Settable bool   `json:"settable"`
-		X        int    `json:"x"`
-		Y        int    `json:"y"`
-		W        int    `json:"w"`
-		H        int    `json:"h"`
-		Path     string `json:"path"`
+		Index       int    `json:"index"`
+		Role        string `json:"role"`
+		Name        string `json:"name"`
+		Press       bool   `json:"press"`
+		Settable    bool   `json:"settable"`
+		Value       string `json:"value"`
+		Identity    string `json:"identity"`
+		Description string `json:"description"`
+		Enabled     *bool  `json:"enabled"`
+		Focused     bool   `json:"focused"`
+		Secure      bool   `json:"secure"`
+		X           int    `json:"x"`
+		Y           int    `json:"y"`
+		W           int    `json:"w"`
+		H           int    `json:"h"`
+		Path        string `json:"path"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	*e = Element{Index: raw.Index, Role: raw.Role, Name: raw.Name, Press: raw.Press, Settable: raw.Settable, X: raw.X, Y: raw.Y, W: raw.W, H: raw.H, Path: raw.Path}
+	e.Value, e.Identity, e.Enabled, e.Focused, e.Secure = raw.Value, raw.Identity, raw.Enabled, raw.Focused, raw.Secure
+	e.Description = raw.Description
+	e.frame = [4]int{raw.X, raw.Y, raw.W, raw.H}
+	if e.Secure {
+		e.Value = ""
+		e.Settable = false
+	}
 	return nil
 }
 
 type Request struct {
-	Action       string `json:"action"`
-	X            int    `json:"x,omitempty"`
-	Y            int    `json:"y,omitempty"`
-	ToX          int    `json:"to_x,omitempty"`
-	ToY          int    `json:"to_y,omitempty"`
-	Button       string `json:"button,omitempty"`
-	Text         string `json:"text,omitempty"`
-	Key          string `json:"key,omitempty"`
-	Amount       int    `json:"amount,omitempty"`
-	Path         string `json:"path,omitempty"`
-	HasPoint     bool   `json:"has_point,omitempty"`
-	ElementIndex int    `json:"element_index,omitempty"`
-	ElementPath  string `json:"element_path,omitempty"`
-	ExpectRole   string `json:"expect_role,omitempty"`
-	ExpectName   string `json:"expect_name,omitempty"`
+	Action            string `json:"action"`
+	X                 int    `json:"x,omitempty"`
+	Y                 int    `json:"y,omitempty"`
+	ToX               int    `json:"to_x,omitempty"`
+	ToY               int    `json:"to_y,omitempty"`
+	Button            string `json:"button,omitempty"`
+	Text              string `json:"text,omitempty"`
+	Key               string `json:"key,omitempty"`
+	Amount            int    `json:"amount,omitempty"`
+	Path              string `json:"path,omitempty"`
+	HasPoint          bool   `json:"has_point,omitempty"`
+	ElementIndex      int    `json:"element_index,omitempty"`
+	ElementPath       string `json:"element_path,omitempty"`
+	ExpectRole        string `json:"expect_role,omitempty"`
+	ExpectName        string `json:"expect_name,omitempty"`
+	ExpectValue       string `json:"expect_value,omitempty"`
+	ExpectIdentity    string `json:"expect_identity,omitempty"`
+	ExpectDescription string `json:"expect_description,omitempty"`
+	ExpectFrame       [4]int `json:"expect_frame"`
+	ExpectAppID       string `json:"expect_app_id,omitempty"`
+	ExpectWindowID    string `json:"expect_window_id,omitempty"`
+	Role              string `json:"role,omitempty"`
+	MatchMode         string `json:"match_mode,omitempty"`
+	Limit             int    `json:"limit,omitempty"`
+	MaxNodes          int    `json:"max_nodes,omitempty"`
 }
 type Backend interface {
 	Status(context.Context) (State, error)
@@ -93,17 +123,18 @@ type Backend interface {
 	Release(context.Context) error
 }
 type Observation struct {
-	ID              string    `json:"id"`
-	Path            string    `json:"path"`
-	SHA256          string    `json:"sha256"`
-	Width           int       `json:"width"`
-	Height          int       `json:"height"`
-	CoordinateSpace string    `json:"coordinate_space"`
-	Grounding       string    `json:"grounding,omitempty"`
-	GroundingNote   string    `json:"grounding_note,omitempty"`
-	Elements        []Element `json:"elements,omitempty"`
-	At              time.Time `json:"at"`
-	State           State     `json:"desktop"`
+	ID              string              `json:"id"`
+	Path            string              `json:"path"`
+	SHA256          string              `json:"sha256"`
+	Width           int                 `json:"width"`
+	Height          int                 `json:"height"`
+	CoordinateSpace string              `json:"coordinate_space"`
+	Grounding       string              `json:"grounding,omitempty"`
+	GroundingNote   string              `json:"grounding_note,omitempty"`
+	Elements        []Element           `json:"elements,omitempty"`
+	At              time.Time           `json:"at"`
+	State           State               `json:"desktop"`
+	Query           *ElementQueryResult `json:"query,omitempty"`
 }
 type Result struct {
 	OK                bool         `json:"ok"`
@@ -112,6 +143,7 @@ type Result struct {
 	State             *State       `json:"desktop,omitempty"`
 	Observation       *Observation `json:"observation,omitempty"`
 	InputDispatched   bool         `json:"input_dispatched"`
+	InputMethod       string       `json:"input_method,omitempty"`
 	OutcomeVerified   bool         `json:"outcome_verified"`
 	DeliveryUncertain bool         `json:"delivery_uncertain"`
 	RetrySafe         bool         `json:"retry_safe"`
@@ -202,7 +234,7 @@ func (s *Service) SelfCheck(ctx context.Context) Result {
 }
 
 func ReadOnly(action string) bool {
-	return action == "status" || action == "observe" || action == "stop" || action == "release" || action == "wait"
+	return action == "status" || action == "observe" || action == "query" || action == "stop" || action == "release" || action == "wait"
 }
 
 type callError struct {
@@ -299,6 +331,7 @@ func (s *Service) attachElements(ctx context.Context, obs *Observation) {
 	}
 	obs.Grounding = "element"
 	obs.Elements = scaled
+	obs.GroundingNote = "bounded accessibility tree; missing controls may require a targeted query or screenshot coordinates"
 }
 
 func scaleElements(elements []Element, state State, shotW, shotH int) []Element {
@@ -307,6 +340,12 @@ func scaleElements(elements []Element, state State, shotW, shotH int) []Element 
 	}
 	out := make([]Element, 0, len(elements))
 	for _, el := range elements {
+		if el.Secure {
+			el.Value, el.Settable = "", false
+		}
+		if el.frame == [4]int{} {
+			el.frame = [4]int{el.X, el.Y, el.W, el.H}
+		}
 		el.X = scaleDelta(el.X-state.X, shotW, state.Width)
 		el.Y = scaleDelta(el.Y-state.Y, shotH, state.Height)
 		el.W = scaleDelta(el.W, shotW, state.Width)
@@ -343,11 +382,11 @@ func scaleDelta(delta, shot, desktop int) int {
 func classifyGrounding(elements []Element) string {
 	named := 0
 	for _, el := range elements {
-		if strings.TrimSpace(el.Name) != "" {
+		if strings.TrimSpace(el.Name) != "" || strings.TrimSpace(el.Value) != "" {
 			named++
 		}
 	}
-	if named < 3 {
+	if named == 0 {
 		return "vision"
 	}
 	return "element"
@@ -375,12 +414,22 @@ func bindElement(req *Request, obs *Observation) *callError {
 	if !found || el.Path == "" {
 		return &callError{"stale_element", "element_index 不属于当前截图，请重新 observe"}
 	}
+	if el.Enabled != nil && !*el.Enabled {
+		return &callError{"element_disabled", "element is disabled; observe/query again after it becomes available"}
+	}
+	if el.Secure {
+		return &callError{"secure_element", "authentication controls must be handled by the user"}
+	}
 	if req.Action == "set_value" && !el.Settable {
 		return &callError{"not_settable", "该元素不能设值，请改用 click_element 或截图像素"}
 	}
 	req.ElementPath = el.Path
 	req.ExpectRole = el.Role
 	req.ExpectName = el.Name
+	req.ExpectValue = el.Value
+	req.ExpectIdentity = el.Identity
+	req.ExpectDescription = el.Description
+	req.ExpectFrame = el.frame
 	if req.Action == "click_element" {
 		req.X = el.X
 		req.Y = el.Y
@@ -402,7 +451,7 @@ func bindElement(req *Request, obs *Observation) *callError {
 		if req.Y < 0 {
 			req.Y = 0
 		}
-		if el.Press {
+		if el.Press && req.Button == "left" {
 			req.Action = "press_element"
 		}
 	}
@@ -506,6 +555,9 @@ func (s *Service) Call(parent context.Context, session string, args map[string]s
 		}
 		return res
 	}
+	if action == "query" {
+		return s.query(ctx, session, args)
+	}
 	req, err := parseRequest(args)
 	if err != nil {
 		return failure("invalid_arguments", err)
@@ -552,6 +604,10 @@ func (s *Service) Call(parent context.Context, session string, args map[string]s
 	if bindErr := bindElement(&req, obs); bindErr != nil {
 		return failure(bindErr.category, bindErr)
 	}
+	if obs.Path == "" && req.Action != "click_element" && req.Action != "press_element" && req.Action != "set_value" {
+		return failure("screenshot_required", fmt.Errorf("query provides element targets only; observe before coordinate, keyboard or scroll input"))
+	}
+	req.ExpectAppID, req.ExpectWindowID = obs.State.AppID, obs.State.WindowID
 	if err = mapCoordinates(&req, *obs); err != nil {
 		return failure("out_of_bounds", err)
 	}
@@ -590,6 +646,14 @@ func (s *Service) Call(parent context.Context, session string, args map[string]s
 		}
 		res = s.observe(ctx)
 		res.InputDispatched = true
+		switch req.Action {
+		case "press_element", "set_value":
+			res.InputMethod = "accessibility"
+		case "type", "key":
+			res.InputMethod = "keyboard"
+		default:
+			res.InputMethod = "pointer"
+		}
 		res.RetrySafe = false
 		if !res.OK {
 			res.Category = "post_observation_failed"
@@ -689,12 +753,21 @@ func (s *Service) observe(ctx context.Context) Result {
 	hash := sha256.Sum256(raw)
 	obs := &Observation{ID: id, Path: path, SHA256: hex.EncodeToString(hash[:]), Width: cfg.Width, Height: cfg.Height, CoordinateSpace: "screenshot_pixels", At: s.now(), State: after}
 	s.attachElements(ctx, obs)
+	// Tree collection can be slow or switch windows. Do not bind new-window
+	// elements to a screenshot of the old window.
+	final, err := s.backend.Status(ctx)
+	if err != nil {
+		return failure("unavailable", err)
+	}
+	if !sameDesktop(after, final) {
+		return failure("desktop_changed", fmt.Errorf("desktop changed during element collection; observe again"))
+	}
 	s.observation = obs
 	keep = true
 	return Result{OK: true, Observation: obs, RetrySafe: true}
 }
 func parseRequest(args map[string]string) (Request, error) {
-	r := Request{Action: args["action"], Button: args["button"], Text: args["text"], Key: args["key"]}
+	r := Request{Action: strings.ToLower(strings.TrimSpace(args["action"])), Button: args["button"], Text: args["text"], Key: args["key"]}
 	if r.Button == "" {
 		r.Button = "left"
 	}

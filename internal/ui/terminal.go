@@ -58,6 +58,7 @@ func sttySaneArgs(goos string) []string {
 
 // Exit 在退出前恢复终端（os.Exit 不会执行 defer）。
 func Exit(code int) {
+	RestoreTerminalWindowTitle()
 	ResetTerminalState()
 	os.Exit(code)
 }

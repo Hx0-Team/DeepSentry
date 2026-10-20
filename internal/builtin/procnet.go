@@ -115,16 +115,16 @@ func formatSocket(e socketEntry) string {
 		fmt.Sprintf("%s:%d", e.RemoteIP, e.RemotePort), e.State, e.Inode)
 }
 
-func readProcNetTCP() ([]socketEntry, error) {
-	data, err := readTarget("/proc/net/tcp")
+func (rt Runtime) readProcNetTCP() ([]socketEntry, error) {
+	data, err := rt.readTarget("/proc/net/tcp")
 	if err != nil {
 		return nil, err
 	}
 	return parseProcNet(string(data), "tcp")
 }
 
-func readProcNetUDP() ([]socketEntry, error) {
-	data, err := readTarget("/proc/net/udp")
+func (rt Runtime) readProcNetUDP() ([]socketEntry, error) {
+	data, err := rt.readTarget("/proc/net/udp")
 	if err != nil {
 		return nil, err
 	}
@@ -138,9 +138,9 @@ func readProcNetUDP() ([]socketEntry, error) {
 	return entries, nil
 }
 
-func readAllSockets() ([]socketEntry, error) {
-	tcp, err1 := readProcNetTCP()
-	udp, err2 := readProcNetUDP()
+func (rt Runtime) readAllSockets() ([]socketEntry, error) {
+	tcp, err1 := rt.readProcNetTCP()
+	udp, err2 := rt.readProcNetUDP()
 	if err1 != nil && err2 != nil {
 		return nil, fmt.Errorf("无法读取 /proc/net: tcp=%v udp=%v", err1, err2)
 	}

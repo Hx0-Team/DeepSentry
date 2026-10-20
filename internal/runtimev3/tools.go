@@ -143,7 +143,7 @@ func (a LegacyToolAdapter) Invoke(ctx context.Context, arguments json.RawMessage
 	}
 	done := make(chan response, 1)
 	go func() {
-		output, _, err := legacytools.RunWithExecutor(a.Name, args, a.IsWindows, a.Executor)
+		output, _, err := legacytools.RunWithExecutorContext(invokeCtx, a.Name, args, a.IsWindows, a.Executor)
 		done <- response{output: output, err: err}
 	}()
 	select {

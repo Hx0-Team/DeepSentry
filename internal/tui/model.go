@@ -2,6 +2,7 @@ package tui
 
 import (
 	"ai-edr/internal/analyzer"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -34,17 +35,18 @@ import (
 type chatSetupResultMsg struct{ err error }
 
 type logLine struct {
-	kind      string
-	content   string
-	raw       string
-	step      int
-	complete  bool
-	settled   bool
-	collapsed bool
-	group     int
-	groupHead bool
-	id        int
-	at        time.Time
+	kind        string
+	content     string
+	raw         string
+	copyCommand string
+	step        int
+	complete    bool
+	settled     bool
+	collapsed   bool
+	group       int
+	groupHead   bool
+	id          int
+	at          time.Time
 }
 
 type confirmState struct {
@@ -80,6 +82,10 @@ type tokenStats struct {
 	CompletionTokens int
 	TotalTokens      int
 	Calls            int
+	CacheReadTokens  int
+	CacheWriteTokens int
+	ReasoningTokens  int
+	CacheCalls       int
 }
 
 // bubbles/textinput is single-line and rewrites newlines to spaces. A private
@@ -100,7 +106,12 @@ var slashCommands = []slashCommand{
 	{Name: "restart", Description: "等同 /new，重新开始一个会话"},
 	{Name: "clear", Description: "清空当前屏幕日志"},
 	{Name: "status", Description: "显示运行状态、步骤和连接"},
-	{Name: "cost", Description: "显示会话轮次、消息数和估算 token"},
+	{Name: "cost", Description: "显示 API 实际 token、缓存读写和调用次数"},
+	{Name: "balance", Description: "显示账户余额；/balance refresh 手动刷新（不调用模型）"},
+	{Name: "search", Description: "联网搜索：/search on|off|status 开关 DeepSeek Search（按需调用）"},
+	{Name: "thinking", Description: "DeepSeek 思考模式/强度/预算：/thinking on|off|low|high|max|budget 96k|status"},
+	{Name: "copy", Description: "复制原始命令；/copy code 复制最新报告代码块，无边框和折行"},
+	{Name: "context", Description: "显示最近请求的上下文组成与历史预算（本地估算，不调用模型）"},
 	{Name: "model", Description: "显示当前模型"},
 	{Name: "image", Description: "附加图片：/image [路径]；省略路径读取剪贴板"},
 	{Name: "compact", Description: "折叠长输出并整理上下文"},
@@ -163,6 +174,8 @@ type inputDraftPart struct {
 type AgentModel struct {
 	mouseInput mouseInputFilter
 	ctrl       *SessionController
+	balance    balanceView
+	balanceCtx context.Context
 
 	width, height    int
 	viewport         viewport.Model
@@ -224,6 +237,7 @@ type AgentModel struct {
 	selActive     bool
 	copyToast     string
 	tokenUsage    tokenStats
+	contextUsage  *analyzer.ContextUsage
 	trimmedLines  int
 }
 
@@ -321,7 +335,7 @@ func NewAgentModel(ctrl *SessionController, title, status string, maxSteps int, 
 func (m AgentModel) Init() tea.Cmd {
 	// Explicitly restore paste framing even if a previous child process left
 	// the terminal mode altered.
-	cmds := []tea.Cmd{m.spinner.Tick, tea.EnableBracketedPaste, m.schedulePollCmd(0)}
+	cmds := []tea.Cmd{m.spinner.Tick, tea.EnableBracketedPaste, m.schedulePollCmd(0), balancePulseCmd(0)}
 	m.scheduleInputCursorAnchor()
 	if m.autoStart && m.ctrl != nil && m.ctrl.beginRun() {
 		cmds = append(cmds, agentStartCmd(false))
@@ -373,6 +387,18 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+	case balancePulseMsg:
+		if m.quitting {
+			return m, nil
+		}
+		cmd := m.refreshBalance(time.Time(msg), false)
+		return m, tea.Batch(balancePulseCmd(5*time.Second), cmd)
+	case balanceResultMsg:
+		if m.quitting {
+			return m, nil
+		}
+		cmd := m.applyBalanceResult(msg, time.Now())
+		return m, cmd
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -1548,6 +1574,24 @@ func (m *AgentModel) handleSlashCommand(text string) tea.Cmd {
 		m.appendLine("info", fmt.Sprintf("状态: running=%v step=%d/%d target=%s connection=%s · %s", m.running, m.currentStep, m.maxSteps, target, m.statusLine, m.sessionStatsText(false)), "status")
 	case cmd == "cost":
 		m.appendLine("info", m.sessionStatsText(true), "cost")
+	case cmd == "balance":
+		query := m.refreshBalance(time.Now(), arg == "refresh" || arg == "刷新")
+		m.appendLine("info", m.balanceDetails(), "balance")
+		m.refreshViewport()
+		return query
+	case cmd == "search":
+		m.handleSearchSlash(arg)
+	case cmd == "thinking":
+		m.handleThinkingSlash(arg)
+	case cmd == "copy":
+		text := m.lastCopyPayload(arg)
+		if text == "" {
+			m.appendLine("info", "没有可复制的原始命令或代码块。", "copy")
+			break
+		}
+		return m.copyTextCmd(text)
+	case cmd == "context":
+		m.appendLine("info", m.contextStatsText(), "context")
 	case cmd == "model":
 		m.appendLine("info", "模型: "+m.title, "model")
 	case cmd == "compact":
@@ -1830,6 +1874,7 @@ func (m *AgentModel) resumeSessionSlash(arg string) tea.Cmd {
 	m.currentTarget = ""
 	m.copyToast = ""
 	m.tokenUsage = tokenStats{}
+	m.contextUsage = nil
 	m.trimmedLines = 0
 	m.startupInfo.SessionID = sessionID
 	m.startupInfo.AwaitGoal = false
@@ -2641,6 +2686,7 @@ func (m *AgentModel) startNewSession(goal string) tea.Cmd {
 	m.currentTarget = ""
 	m.copyToast = ""
 	m.tokenUsage = tokenStats{}
+	m.contextUsage = nil
 	m.trimmedLines = 0
 	m.startupInfo.SessionID = sessionID
 	m.startupInfo.AwaitGoal = !hasGoal
@@ -3225,6 +3271,11 @@ func (m *AgentModel) applyEvent(e harness.UIEvent) {
 		m.appendThoughtLine(e.Message)
 	case harness.EventTokenUsage:
 		m.recordTokenUsage(e)
+	case harness.EventContextUsage:
+		if e.ContextUsage != nil {
+			copy := *e.ContextUsage
+			m.contextUsage = &copy
+		}
 	case harness.EventAction:
 		if e.Action != nil && e.Action.Type == harness.ActionTodo {
 			line := harness.FormatTodoList(e.Action.Todos)
@@ -3248,6 +3299,7 @@ func (m *AgentModel) applyEvent(e harness.UIEvent) {
 		}
 		if line != "" {
 			m.appendLine(kind, line, line)
+			m.noteCopyCommand(e.Action)
 		}
 	case harness.EventSubAgentStart:
 		m.noteTarget(e)
@@ -3278,6 +3330,7 @@ func (m *AgentModel) applyEvent(e harness.UIEvent) {
 			line = e.Message
 		}
 		m.appendLine("tool", "Sub-agent · "+line+tuiTargetSuffix(e), line)
+		m.noteCopyCommand(action)
 	case harness.EventSubAgentResult:
 		m.noteTarget(e)
 		m.appendLine("subagent_result", truncateLines(e.Detail, 3), e.Detail)
@@ -3334,6 +3387,12 @@ func (m *AgentModel) recordTokenUsage(e harness.UIEvent) {
 	m.tokenUsage.CompletionTokens += e.CompletionTokens
 	m.tokenUsage.TotalTokens += total
 	m.tokenUsage.Calls++
+	m.tokenUsage.CacheReadTokens += e.CacheReadTokens
+	m.tokenUsage.CacheWriteTokens += e.CacheWriteTokens
+	m.tokenUsage.ReasoningTokens += e.ReasoningTokens
+	if e.CacheUsageReported {
+		m.tokenUsage.CacheCalls++
+	}
 }
 
 func (m *AgentModel) noteTarget(e harness.UIEvent) {
@@ -3996,11 +4055,25 @@ func (m AgentModel) renderHeader(w int) string {
 }
 
 func (m AgentModel) headerStatsText(maxWidth int) string {
+	label := m.balanceLabel()
 	if m.ctrl == nil {
-		return ""
+		if maxWidth <= 0 {
+			return label
+		}
+		return truncateDisplay(label, maxWidth, "…")
 	}
 	stats := m.ctrl.Stats()
-	return formatHeaderStats(stats, m.running || stats.Running, m.tokenUsageLabel(stats), maxWidth)
+	if label == "" {
+		return formatHeaderStats(stats, m.running || stats.Running, m.tokenUsageLabel(stats), maxWidth)
+	}
+	if maxWidth <= 0 {
+		return formatHeaderStats(stats, m.running || stats.Running, m.tokenUsageLabel(stats), 0) + " · " + label
+	}
+	available := maxWidth - displayWidth(label) - 3
+	if available < 12 {
+		return truncateDisplay(label, maxWidth, "…")
+	}
+	return formatHeaderStats(stats, m.running || stats.Running, m.tokenUsageLabel(stats), available) + " · " + label
 }
 
 func formatHeaderStats(stats SessionStats, running bool, tokenLabel string, maxWidth int) string {
@@ -4038,7 +4111,7 @@ func (m AgentModel) sessionStatsText(verbose bool) string {
 		return fmt.Sprintf("会话=%s · 轮次=%d · 消息=%d · %s", shortSessionID(stats.SessionID), stats.Turns, stats.Messages, m.tokenUsageLabel(stats))
 	}
 	if m.tokenUsage.TotalTokens > 0 {
-		return fmt.Sprintf("会话: %s · 用户轮次: %d · 历史消息: %d · 真实 token: %s total（prompt %s / completion %s / calls %d）",
+		return fmt.Sprintf("会话: %s · 用户轮次: %d · 历史消息: %d · 真实 token: %s total（prompt %s / completion %s / calls %d）%s",
 			firstNonEmpty(stats.SessionID, "-"),
 			stats.Turns,
 			stats.Messages,
@@ -4046,6 +4119,7 @@ func (m AgentModel) sessionStatsText(verbose bool) string {
 			formatApproxTokens(m.tokenUsage.PromptTokens),
 			formatApproxTokens(m.tokenUsage.CompletionTokens),
 			m.tokenUsage.Calls,
+			m.cacheUsageText(),
 		)
 	}
 	return fmt.Sprintf("会话: %s · 用户轮次: %d · 历史消息: %d · 上下文估算: ~%s tok（当前模型响应未返回 usage，按本地历史粗略估算）",
@@ -4150,10 +4224,6 @@ func (m AgentModel) View() string {
 	bodyH := layout.bodyHeight
 
 	header := m.renderHeader(renderW)
-	stepInfo := ""
-	if m.running && m.currentStep > 0 {
-		stepInfo = fmt.Sprintf("Step %d/%d", m.currentStep, m.maxSteps)
-	}
 	var help string
 	if m.copyToast != "" {
 		help = m.copyToast
@@ -4164,21 +4234,8 @@ func (m AgentModel) View() string {
 	} else {
 		help = m.footerHelpText()
 	}
-	statusW := max(1, renderW-styleStatusBar.GetHorizontalFrameSize())
-	statusParts := []string{m.statusLine, m.statusContextText()}
-	if sched := strings.TrimSpace(m.scheduleStatus); sched != "" {
-		statusParts = append(statusParts, sched)
-	}
-	if stepInfo != "" {
-		statusParts = append(statusParts, stepInfo)
-	}
-	if scroll := m.scrollPositionText(); scroll != "" {
-		statusParts = append(statusParts, scroll)
-	}
-	statusParts = append(statusParts, time.Now().Format("15:04:05"))
-	statusText := strings.Join(statusParts, "  │  ")
 	footerMarker := encodeFooterFrameMarker(m.footerVersion)
-	status := tagRenderedLines(styleStatusBar.Width(renderW).Render(runewidth.Truncate(sanitizeTUIText(statusText), statusW, "…")), footerMarker)
+	status := tagRenderedLines(m.renderStatusLine(renderW, time.Now()), footerMarker)
 	body := ""
 	if bodyH > 0 {
 		// recalcLayout already applies this height. Assigning it on this local
@@ -4193,7 +4250,7 @@ func (m AgentModel) View() string {
 	}
 	inputLine := tagRenderedLines(lipgloss.NewStyle().PaddingLeft(inputLinePaddingLeft).Render(m.renderInputLine()), footerMarker)
 	helpW := max(1, renderW-2)
-	helpText := runewidth.Truncate(help, helpW, "…")
+	helpText := m.fitFooterHelp(help, helpW)
 	var helpLine string
 	if m.copyToast != "" {
 		helpLine = lipgloss.NewStyle().PaddingLeft(1).Foreground(colorAccent).Render(" " + helpText)
@@ -4357,7 +4414,7 @@ func (m AgentModel) footerHelpText() string {
 	if m.running {
 		return "Tab 输入新指令并 Enter 可中途打断 · Esc 停止 · ↑↓/jk 滚动 · g/Home 顶部 · G 底部 · e 全展/全折 · Y/N 确认"
 	}
-	return "Tab 输入 · 鼠标拖选 · Ctrl+C 复制 · ↑↓/jk 滚动 · g/Home 顶部 · G 底部 · e 全展/全折 · q 退出 · /help"
+	return "Tab 输入 · 鼠标拖选 · Ctrl+C 复制 · /copy 原文 · ↑↓/jk 滚动 · g/Home 顶部 · G 底部 · e 全展/全折 · q 退出 · /help"
 }
 
 func (m AgentModel) inputHintText() string {

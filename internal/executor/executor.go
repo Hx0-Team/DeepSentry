@@ -256,6 +256,13 @@ func Init(cfg config.Config) error {
 		}
 		Current = e
 		emitModeSwitch("🔌 [模式切换] 已连接至远程主机 (SSH): %s@%s\n", cfg.SSHUser, cfg.SSHHost)
+	case "sftp":
+		e, err := newSFTPExecutor(cfg)
+		if err != nil {
+			return err
+		}
+		Current = e
+		emitModeSwitch("已连接 SFTP 文件服务: %s@%s\n", cfg.SSHUser, cfg.SSHHost)
 	case "telnet":
 		e, err := newTelnetExecutor(cfg)
 		if err != nil {
@@ -853,13 +860,18 @@ func createPrivateOutputFile(path string) (*os.File, error) {
 // ==========================================
 
 type SSHExecutor struct {
-	client         *ssh.Client
-	session        *ssh.Session
-	sftpClient     *sftp.Client
-	stdin          io.WriteCloser
-	stdout         *bufio.Reader
-	commandTimeout time.Duration
-	mu             sync.Mutex
+	sftpMu           sync.Mutex
+	sftpAttempted    bool
+	sftpInitErr      error
+	sftpSession      *ssh.Session
+	connectionConfig *config.Config // private snapshot; never serialize credentials
+	client           *ssh.Client
+	session          *ssh.Session
+	sftpClient       *sftp.Client
+	stdin            io.WriteCloser
+	stdout           *bufio.Reader
+	commandTimeout   time.Duration
+	mu               sync.Mutex
 }
 
 var knownHostsMu sync.Mutex
@@ -1244,35 +1256,28 @@ func newSSHExecutor(cfg config.Config) (Executor, error) {
 		return network, nil
 	}
 
-	// SFTP is a strong Linux/server signal, but it is optional. Many network
-	// appliances and minimal hosts intentionally do not expose the subsystem.
-	sftpClient, sftpErr := sftp.NewClient(client)
-	if deviceType == "auto" && sftpErr != nil {
-		if network, networkErr := newSSHNetworkExecutor(client, cfg); networkErr == nil {
-			return network, nil
-		}
-	}
-
-	linux, linuxErr := newLinuxSSHExecutor(client, sftpClient, cfg)
+	// A working shell is checked first: missing SFTP is not a network-device signal.
+	linux, linuxErr := newLinuxSSHExecutor(client, nil, cfg)
 	if linuxErr == nil {
 		return linux, nil
 	}
-	if sftpClient != nil {
-		_ = sftpClient.Close()
-	}
 	if deviceType == "auto" {
-		if network, networkErr := newSSHNetworkExecutor(client, cfg); networkErr == nil {
+		if network, err := newSSHNetworkExecutor(client, cfg); err == nil {
 			return network, nil
-		} else {
-			_ = client.Close()
-			return nil, fmt.Errorf("SSH 目标既无法启动 Linux shell，也无法建立网络设备 CLI: shell=%v; cli=%v", linuxErr, networkErr)
+		}
+		if files, err := openSFTPChannel(client, sshConnectTimeout(cfg)); err == nil {
+			return &SFTPExecutor{ssh: client, files: files, timeout: secondsOrDefault(cfg.SSHCommandTimeoutSec, 90)}, nil
 		}
 	}
 	_ = client.Close()
-	return nil, linuxErr
+	return nil, fmt.Errorf("SSH 认证成功，但远程 Shell 不可用: %w；只提供文件服务的账号可配置 target_protocol=sftp", linuxErr)
 }
 
 func dialSSHClient(cfg config.Config) (*ssh.Client, error) {
+	return dialSSHClientContext(context.Background(), cfg)
+}
+
+func dialSSHClientContext(ctx context.Context, cfg config.Config) (*ssh.Client, error) {
 	hostKeyCallback, err := sshHostKeyCallback(cfg)
 	if err != nil {
 		return nil, err
@@ -1283,15 +1288,20 @@ func dialSSHClient(cfg config.Config) (*ssh.Client, error) {
 	}
 
 	addr := normalizeSSHHost(cfg.SSHHost)
-	rawConn, err := config.ControllerDialTimeout("tcp", addr, sshConfig.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, sshConfig.Timeout)
+	defer cancel()
+	rawConn, err := config.ControllerDialContextForProxy(ctx, "tcp", addr, cfg.ControllerProxy)
 	if err != nil {
 		return nil, fmt.Errorf("SSH连接失败: %v", err)
 	}
-	_ = rawConn.SetDeadline(time.Now().Add(sshConfig.Timeout))
+	deadline, _ := ctx.Deadline()
+	_ = rawConn.SetDeadline(deadline)
+	stopClose := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
+	defer stopClose()
 	clientConn, channels, requests, err := ssh.NewClientConn(rawConn, addr, sshConfig)
 	if err != nil {
 		_ = rawConn.Close()
-		return nil, formatSSHHandshakeError(addr, err)
+		return nil, formatSSHHandshakeErrorForConfig(addr, err, cfg)
 	}
 	_ = rawConn.SetDeadline(time.Time{})
 	client := ssh.NewClient(clientConn, channels, requests)
@@ -1308,12 +1318,13 @@ func newLinuxSSHExecutor(client *ssh.Client, sftpClient *sftp.Client, cfg config
 	}
 
 	exe := &SSHExecutor{
-		client:         client,
-		session:        session,
-		sftpClient:     sftpClient,
-		stdin:          stdin,
-		stdout:         bufio.NewReader(stdout),
-		commandTimeout: 5 * time.Second,
+		connectionConfig: &cfg,
+		client:           client,
+		session:          session,
+		sftpClient:       sftpClient,
+		stdin:            stdin,
+		stdout:           bufio.NewReader(stdout),
+		commandTimeout:   5 * time.Second,
 	}
 
 	if _, err := exe.run("export TERM=xterm; export LANG=en_US.UTF-8", false, nil, nil); err != nil {
@@ -1484,65 +1495,42 @@ func isSSHConnectionError(err error) bool {
 }
 
 func reconnectSSHExecutor(s *SSHExecutor) error {
+	cfg, err := sshReconnectConfig(s)
+	if err != nil {
+		return err
+	}
 	if s != nil {
 		s.Close()
 	}
 	if Current == s {
 		Current = nil
 	}
-	return Init(config.GlobalConfig)
+	return Init(cfg)
+}
+
+func sshReconnectConfig(s *SSHExecutor) (config.Config, error) {
+	if s == nil || s.connectionConfig == nil {
+		return config.Config{}, fmt.Errorf("SSH 缺少原连接配置快照；请明确重新建立连接")
+	}
+	cfg := *s.connectionConfig
+	// Proxy changes apply to future connections, but saving a new target must
+	// never redirect a retry of a command intended for the old target.
+	cfg.ControllerProxy = config.GlobalConfig.ControllerProxy
+	cfg.TargetProtocol = "ssh"
+	return cfg, nil
 }
 
 func (s *SSHExecutor) uploadFile(localPath, remotePath string) (string, error) {
-	localPath = expandLocalPath(localPath)
-
-	srcFile, err := os.Open(localPath)
-	if err != nil {
-		return "", fmt.Errorf("无法打开本地文件: %v", err)
+	if err := s.ensureSFTP(); err != nil {
+		return "", err
 	}
-	defer srcFile.Close()
-
-	if err := s.sftpClient.MkdirAll(filepath.Dir(remotePath)); err != nil {
-		return "", fmt.Errorf("创建远程目录失败: %v", err)
-	}
-
-	dstFile, err := s.sftpClient.Create(remotePath)
-	if err != nil {
-		return "", fmt.Errorf("无法创建远程文件: %v", err)
-	}
-	defer dstFile.Close()
-
-	n, err := io.Copy(dstFile, srcFile)
-	if err != nil {
-		return "", fmt.Errorf("上传传输失败: %v", err)
-	}
-	return fmt.Sprintf("%s上传成功 (Bytes: %d): %s -> %s", ui.Prefix("✅", "[OK]"), n, localPath, remotePath), nil
+	return s.sftpAdapter().transfer("upload", localPath, remotePath)
 }
-
 func (s *SSHExecutor) downloadFile(remotePath, localPath string) (string, error) {
-	localPath = expandLocalPath(localPath)
-
-	srcFile, err := s.sftpClient.Open(remotePath)
-	if err != nil {
-		return "", fmt.Errorf("无法打开远程文件: %v", err)
+	if err := s.ensureSFTP(); err != nil {
+		return "", err
 	}
-	defer srcFile.Close()
-
-	if err := os.MkdirAll(filepath.Dir(localPath), 0o700); err != nil {
-		return "", fmt.Errorf("创建本地目录失败: %v", err)
-	}
-
-	dstFile, err := createPrivateOutputFile(localPath)
-	if err != nil {
-		return "", fmt.Errorf("无法创建本地文件: %v", err)
-	}
-	defer dstFile.Close()
-
-	n, err := io.Copy(dstFile, srcFile)
-	if err != nil {
-		return "", fmt.Errorf("下载传输失败: %v", err)
-	}
-	return fmt.Sprintf("%s下载成功 (Bytes: %d): %s -> %s", ui.Prefix("✅", "[OK]"), n, remotePath, localPath), nil
+	return s.sftpAdapter().transfer("download", remotePath, localPath)
 }
 
 func (s *SSHExecutor) IsRemote() bool { return true }
@@ -1552,13 +1540,9 @@ func (s *SSHExecutor) ReadTargetFile(path string) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	_ = s.ensureSFTP()
 	if s.sftpClient != nil {
-		f, err := s.sftpClient.Open(path)
-		if err == nil {
-			defer f.Close()
-			const maxSize = 2 << 20 // 2MB
-			return io.ReadAll(io.LimitReader(f, maxSize))
-		}
+		return s.sftpAdapter().ReadTargetFile(path)
 	}
 	// 极简系统 fallback: busybox cat
 	out, err := s.runLocked(fmt.Sprintf("cat %s 2>/dev/null", shellQuotePath(path)))
@@ -1572,6 +1556,7 @@ func (s *SSHExecutor) ListTargetDir(path string) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	_ = s.ensureSFTP()
 	if s.sftpClient != nil {
 		entries, err := s.sftpClient.ReadDir(path)
 		if err == nil {
@@ -1622,6 +1607,14 @@ func shellQuotePath(path string) string {
 }
 
 func (s *SSHExecutor) Close() {
+	if s.client != nil {
+		_ = s.client.Close()
+	}
+	s.sftpMu.Lock()
+	defer s.sftpMu.Unlock()
+	if s.sftpSession != nil {
+		_ = s.sftpSession.Close()
+	}
 	if s.sftpClient != nil {
 		s.sftpClient.Close()
 	}

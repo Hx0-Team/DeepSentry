@@ -87,7 +87,7 @@ func TestResponsesAndAnthropicSerializeImagesUsingNativeBlockShapes(t *testing.T
 			_, _ = w.Write([]byte(`{"output_text":"ok"}`))
 		}))
 		defer server.Close()
-		if _, err := callOpenAIResponses(context.Background(), config.Config{ApiURL: server.URL + "/responses", ModelName: "gpt-vision", ApiKey: "none"}, []Message{message}); err != nil {
+		if _, err := callOpenAIResponses(context.Background(), config.Config{ApiURL: server.URL + "/responses", ModelName: "gpt-vision", ApiKey: "none"}, []Message{message}, false); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -111,7 +111,7 @@ func TestResponsesAndAnthropicSerializeImagesUsingNativeBlockShapes(t *testing.T
 			_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}]}`))
 		}))
 		defer server.Close()
-		if _, err := callAnthropic(context.Background(), config.Config{ApiURL: server.URL + "/v1/messages", APIProtocol: config.ProtocolAnthropicMessages, ModelName: "claude-vision", ApiKey: "test"}, []Message{message}); err != nil {
+		if _, err := callAnthropic(context.Background(), config.Config{ApiURL: server.URL + "/v1/messages", APIProtocol: config.ProtocolAnthropicMessages, ModelName: "claude-vision", ApiKey: "test"}, []Message{message}, false); err != nil {
 			t.Fatal(err)
 		}
 	})
