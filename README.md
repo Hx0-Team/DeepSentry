@@ -29,7 +29,8 @@ v2.0.6 起也可以：
 2. 对设备 **Web 控制台做网页巡检**，保留真实截图，一句话生成带封面的 **Word / Markdown**。
 3. 用 DeepSeek 官方 Search 补充实时网页证据；`/thinking` 控制思考模式、强度和输出预算，`/search` 控制联网开关。
 
-<img width="1672" height="941" alt="DeepSentry v2.0.6 Ultimate 宣传图" src="assets/DeepSentry-v2.0.6-poster.png" />
+<img width="1206" height="2622" alt="e6457a74784255a11b7b7235a52d192f" src="https://github.com/user-attachments/assets/e3daff84-4458-43ef-9bbb-2f229a8c30b3" />
+
 
 > **授权范围**：只允许在你拥有或已获得明确书面授权的系统上使用。禁止未授权扫描、入侵、破坏、绕过访问控制或任何违法用途。
 
